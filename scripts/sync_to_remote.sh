@@ -83,7 +83,7 @@ ssh "$REMOTE_HOST" "bash -s" <<REMOTE
 set -euo pipefail
 cd "$REMOTE_REPO_DIR"
 
-git fetch "$REMOTE_BUNDLE_PATH" main:refs/remotes/bundle/main 2>&1 | tail -3
+git fetch "$REMOTE_BUNDLE_PATH" +main:refs/remotes/bundle/main 2>&1 | tail -3
 
 BEFORE=\$(git rev-parse HEAD)
 git reset --hard bundle/main
