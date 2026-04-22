@@ -1,0 +1,78 @@
+﻿# PDK Cell Name Mapping (PC-side guard config)
+#
+# The PC NEVER holds real foundry cell names. The real name -> alias
+# mapping lives ONLY on the remote side in ~/.virtuoso/pdk_map_private.il
+# (deployed separately, never committed to this repo).
+#
+# This file declares:
+#   - generic_cell_name : fallback when remote host returns a non-generic name
+#   - valid_aliases     : the generic names remote host may legitimately return;
+#                         anything else reaching PC is replaced with
+#                         generic_cell_name and logged.
+#   - model_info_keys   : BSIM4 params to strip from simulation output
+#   - allowed_params    : design parameters the user may modify
+
+generic_cell_name: "GENERIC_DEVICE"
+
+valid_aliases:
+  # NMOS variants
+  - NMOS
+  - NMOS_SVT
+  - NMOS_LVT
+  - NMOS_ULVT
+  - NMOS_HVT
+  - NMOS_25
+  - NMOS_18
+  # PMOS variants
+  - PMOS
+  - PMOS_SVT
+  - PMOS_LVT
+  - PMOS_ULVT
+  - PMOS_HVT
+  - PMOS_25
+  - PMOS_18
+  # Passive devices
+  - MIM_CAP
+  - IDEAL_CAP      # analogLib/cap — ideal capacitor symbol (concept schematics)
+  - RESISTOR       # umbrella alias for rppoly / rppolywo / rnwell / etc.
+  - POLY_RES
+  - POLY_RES_L
+  - IND            # inductor (spiralind and similar)
+  - VARCAP         # MOS varactor (LC-VCO tuning element)
+  # Sources / ground (testbench stimuli; DUT never contains these)
+  - VSRC           # vdc / vsin / vpulse collapsed to one generic
+  - ISRC           # idc / ipulse collapsed to one generic
+  - GND_SYM        # gnd! / vss! symbols
+
+# BSIM4 model info keys to filter from simulation results.
+model_info_keys:
+  - toxe
+  - u0
+  - vth0
+  - k1
+  - k2
+  - pclm
+  - dvt0
+  - dvt1
+  - nfactor
+  - cdsc
+  - eta0
+  - dsub
+
+# Allowed design parameters (whitelist).
+# Stage 1 rev 1 (2026-04-18): extended per config/LC_VCO_spec.md §4.
+# nfin/fingers = FinFET fin/finger count, idc/vdc = DC bias source props.
+# Layer-2 blocked-word regex in safe_bridge.py still applies to non-core names.
+allowed_params:
+  - w
+  - l
+  - nf
+  - m
+  - multi
+  - wf
+  - r
+  - c
+  - nfin
+  - fingers
+  - idc
+  - vdc

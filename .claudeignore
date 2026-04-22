@@ -1,0 +1,40 @@
+# Files that Claude Code and other AI assistants must not read.
+# Blocks even local file-read tools on the PC side. This is a second
+# line of defense on top of .gitignore (which only blocks commits).
+
+# Quarantined audit / review artifacts (may contain foundry cell names).
+.quarantine/
+
+# Generated review/audit Markdown reports.
+logs/*.md
+
+# Runtime logs (may contain paths / library names from stack traces).
+logs/*.log
+
+# Secrets
+config/.env
+*.key
+*.pem
+.ssh/
+
+# Python build artifacts (may contain compiled foundry-name constants
+# from earlier, pre-rename builds).
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment (third-party packages may incidentally contain
+# banned tokens as substrings of unrelated identifiers).
+.venv/
+venv/
+
+# Git internal objects (pack files and blob store may still contain
+# banned-token history from pre-rename commits).
+.git/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

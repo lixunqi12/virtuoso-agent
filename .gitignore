@@ -1,0 +1,63 @@
+# =========================================================================
+# Sensitive / personal artifacts — public repo, keep tight
+# =========================================================================
+
+# Claude / LLM chat history (may contain secrets, paths, conversation)
+.chat_recent.jsonl
+
+# Agent run artifacts
+logs/*.log
+logs/*.jsonl
+logs/*.md
+logs/*.sh
+logs/*.il
+logs/*.py
+logs/*.pid
+!logs/.gitkeep
+
+# Quarantined foundry-audit artifacts (strict — never commit)
+.quarantine/
+
+# In-progress / scratch (may contain private PDK maps, etc.)
+tmp/
+
+# Historical draft-review doc (contains real usernames and host)
+docs/stage0_draft_review.md
+
+# Deployment guide with real SSH config / username
+docs/remote_deployment/
+
+# Team review deliverables (per-incident artifacts)
+reviews/
+
+# Debug / probe SKILL scripts (hardcoded personal paths in comments)
+skill/rev*.il
+skill/stage0_*.il
+skill/stage1_*.il
+skill/psf_dump_worker.ocn
+
+# =========================================================================
+# Secrets
+# =========================================================================
+config/.env
+*.key
+*.pem
+.ssh/
+
+# =========================================================================
+# Python
+# =========================================================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# =========================================================================
+# IDE / OS
+# =========================================================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

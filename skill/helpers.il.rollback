@@ -1,0 +1,328 @@
+;;; helpers.il — Public utility functions for PDK-safe SKILL scripts
+;;; Compatible with Cadence IC23.1 SKILL (no SKILL++ syntax)
+;;;
+;;; Provides:
+;;;   safeHelpers_listToJson(lst)         - Convert a SKILL association list to JSON string
+;;;   safeHelpers_cellAlias(cellName)     - Map foundry cell name to generic alias
+;;;   safeHelpers_validateParamName(name) - Check if parameter name is in the whitelist
+;;;   safeHelpers_validateParamValue(val) - Check if parameter value is safe (no injection)
+;;;   safeHelpers_jsonEscape(str)         - Escape a string for JSON embedding
+;;;   safeHelpers_numToJson(val)          - Convert numeric value to JSON-safe string
+
+;;; ----------------------------------------------------------------
+;;; Global configuration — override these after loading to customize
+;;; ----------------------------------------------------------------
+
+;; Cell name mapping: foundry name -> generic name
+;; MUST be populated on the remote side only, via ~/.virtuoso/pdk_map_private.il
+;; (see docs/remote_deployment/pdk_map_private.il.example for the format).
+;; The PC-side repo must not contain real foundry cell names.
+defvar(safeHelpers_cellMap  nil)
+
+;; Fallback generic name when cell is not in the map
+defvar(safeHelpers_genericCellName  "GENERIC_DEVICE")
+
+;; Allowed design parameters (lowercase symbols)
+defvar(safeHelpers_allowedParams  '(w l nf nfin fingers m multi wf r c idc vdc))
+
+;; Safe operating-point keys
+defvar(safeHelpers_safeOpKeys  '(gm gds id vth vdsat cgs cgd cdb))
+
+;; Schematic decoration cells to skip when reading topology.
+;; These are not active devices (ground symbols, I/O pin markers,
+;; supply rails); filtering them keeps the LLM-facing topology
+;; focused on actual DUT components. Cell-name match is case-sensitive.
+defvar(safeHelpers_skipCells  '("gnd" "vdd" "vss" "ipin" "opin" "iopin"))
+
+;; Blocklist for Layer-2 fallback validation (case-insensitive substrings).
+;; Names that match the safe-char pattern but contain any of these tokens
+;; are rejected. Covers SKILL-injection function names and PDK-leakage
+;; keywords. Keep in sync with _BLOCKED_PARAM_WORDS in src/safe_bridge.py.
+defvar(safeHelpers_blockedWords  '(
+    "load" "file" "path" "system" "eval" "exec" "shell" "include" "require"
+    "getss" "errset" "evalstring" "infile" "outfile" "popen" "ipcbegin"
+    "rexcompile" "rexexecute" "sprintf" "printf"
+    "model" "subckt" "section"
+))
+
+;; Rev 5: BSIM model intrinsic names to reject with EXACT match (case-ins.).
+;; Substring match would false-positive on legitimate names like "stk1" /
+;; "link2" / "mu0level", so we keep this as a separate exact-match set.
+;; Must stay aligned with model_info_keys in pdk_map.yaml and with
+;; self.model_info_keys in src/safe_bridge.py.
+defvar(safeHelpers_blockedModelParams  '(
+    toxe u0 vth0 k1 k2 pclm
+    dvt0 dvt1 nfactor cdsc eta0 dsub
+))
+
+
+;;; ----------------------------------------------------------------
+;;; Load the remote-local private cell map (foundry name -> generic name).
+;;; This file must live ONLY on the remote host and must never be copied
+;;; into the PC-side repo. If it is missing, safeHelpers_cellMap stays
+;;; nil, so safeHelpers_cellAlias() will return the generic fallback
+;;; for every cell — the safe-fail mode.
+;;; ----------------------------------------------------------------
+let((privateMapPath home)
+    home = getShellEnvVar("HOME")
+    when(home
+        privateMapPath = strcat(home "/.virtuoso/pdk_map_private.il")
+        when(isFile(privateMapPath)
+            load(privateMapPath)
+        )
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; JSON string escaping
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_jsonEscape(str)
+    let((result ch i len dq)
+        result = ""
+        dq = getchar("\"" 1)
+        len = strlen(str)
+        for(i 1 len
+            ch = getchar(str i)
+            cond(
+                (ch == '\\ result = strcat(result "\\\\"))
+                (ch == dq  result = strcat(result "\\\""))
+                (ch == '\n result = strcat(result "\\n"))
+                (ch == '\r result = strcat(result "\\r"))
+                (ch == '\t result = strcat(result "\\t"))
+                (t         result = strcat(result substring(str i 1)))
+            )
+        )
+        result
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Numeric to JSON string (handles special float values)
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_numToJson(val)
+    cond(
+        (fixp(val)   sprintf(nil "%d" val))
+        (floatp(val)
+            cond(
+                (val != val         "null")   ; NaN
+                (val == 1e308 * 2   "null")   ; +Inf
+                (val == -1e308 * 2  "null")   ; -Inf
+                (t                  sprintf(nil "%.12g" val))
+            )
+        )
+        (t  "null")
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Cell name alias lookup
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_cellAlias(cellName)
+    let((entry result)
+        result = safeHelpers_genericCellName
+        foreach(entry safeHelpers_cellMap
+            when(equal(car(entry) cellName)
+                result = cadr(entry)
+            )
+        )
+        result
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Check if a generic alias already (value side of map)
+;;; If the name is already generic, return it as-is.
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_isGenericName(cellName)
+    let((entry found)
+        found = nil
+        foreach(entry safeHelpers_cellMap
+            when(equal(cadr(entry) cellName)
+                found = t
+            )
+        )
+        found
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Parameter name validation — two-layer check:
+;;;   Layer 1: exact match against safeHelpers_allowedParams (case-ins.)
+;;;   Layer 2: ^[a-zA-Z][a-zA-Z0-9_]{0,31}$ AND no blocklist substring
+;;; Returns t if valid, nil otherwise.
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_validateParamName(name)
+    prog((nameLower)
+        unless(stringp(name)  return(nil))
+        nameLower = lowerCase(name)
+        ;; Layer 1
+        when(member(stringToSymbol(nameLower) safeHelpers_allowedParams)
+            return(t)
+        )
+        ;; Layer 2 (rev 5: also reject exact BSIM model-intrinsic names;
+        ;; mirrors Python self.model_info_keys check in _is_allowed_param_name)
+        when(and(safeHelpers_matchesSafeVarPattern(name)
+                 not(safeHelpers_containsBlockedWord(nameLower))
+                 not(member(stringToSymbol(nameLower)
+                            safeHelpers_blockedModelParams)))
+            return(t)
+        )
+        return(nil)
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; ROLLBACK STUB (per §6.2.9): permissive SKILL belt.
+;;; Python SafeBridge remains the authoritative Layer-1+Layer-2 gate
+;;; (146 pytest green). This stub accepts any non-empty string and
+;;; defers strict character-class enforcement to Python.
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_matchesSafeVarPattern(name)
+    and(stringp(name) strlen(name) > 0)
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Blocklist check: does lowercased name contain any blocked substring?
+;;; Uses literal substring search (strsearch) — NOT rexMatchp. rexMatchp
+;;; would treat metachars in future blocklist entries as regex syntax
+;;; and could silently under-match (e.g. a word containing "." would
+;;; match any char). strsearch returns the 1-based index of the first
+;;; match, or nil if absent.
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_containsBlockedWord(nameLower)
+    prog((word found)
+        found = nil
+        foreach(word safeHelpers_blockedWords
+            when(strsearch(nameLower word)
+                found = t
+            )
+        )
+        return(found)
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Parameter value validation — only numeric literals or
+;;; engineering-unit strings like "10u", "500n", "1.2m"
+;;; Rejects anything that could be SKILL injection.
+;;; Returns t if safe, nil otherwise.
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_validateParamValue(val)
+    ;; ROLLBACK STUB (per §6.2.9): accept number or non-empty string.
+    ;; Python SafeBridge enforces numeric-shape + injection rejection.
+    or(numberp(val)
+       and(stringp(val) strlen(val) > 0))
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Convert a SKILL assoc-list to a JSON object string.
+;;;
+;;; Input: list of (key . value) or (key value) pairs where:
+;;;   - key is a string
+;;;   - value is a string, number, list (nested object), or nil
+;;;
+;;; For simple key-value JSON, pass:
+;;;   list(list("name" "M0") list("w" 1e-6))
+;;; Produces:  {"name":"M0","w":1e-06}
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_listToJson(lst)
+    let((parts entry k v jsonVal)
+        if(lst == nil then
+            "{}"
+        else
+            parts = nil
+            foreach(entry lst
+                k = safeHelpers_jsonEscape(car(entry))
+                v = cadr(entry)
+                cond(
+                    (v == nil
+                        jsonVal = "null"
+                    )
+                    (stringp(v)
+                        jsonVal = strcat("\"" safeHelpers_jsonEscape(v) "\"")
+                    )
+                    (numberp(v)
+                        jsonVal = safeHelpers_numToJson(v)
+                    )
+                    (listp(v)
+                        ;; If first element is also a list, treat as nested object
+                        if(and(v listp(car(v))) then
+                            jsonVal = safeHelpers_listToJson(v)
+                        else
+                            ;; Treat as JSON array of strings/numbers
+                            jsonVal = safeHelpers_listToJsonArray(v)
+                        )
+                    )
+                    (t
+                        jsonVal = strcat("\"" safeHelpers_jsonEscape(
+                            sprintf(nil "%L" v)) "\"")
+                    )
+                )
+                parts = cons(strcat("\"" k "\":" jsonVal) parts)
+            )
+            strcat("{" buildString(reverse(parts) ",") "}")
+        )
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Convert a flat SKILL list to a JSON array string.
+;;; ----------------------------------------------------------------
+procedure(safeHelpers_listToJsonArray(lst)
+    let((parts item jsonVal)
+        if(lst == nil then
+            "[]"
+        else
+            parts = nil
+            foreach(item lst
+                cond(
+                    (item == nil    jsonVal = "null")
+                    (stringp(item)  jsonVal = strcat("\"" safeHelpers_jsonEscape(item) "\""))
+                    (numberp(item)  jsonVal = safeHelpers_numToJson(item))
+                    (listp(item)
+                        if(and(item listp(car(item))) then
+                            jsonVal = safeHelpers_listToJson(item)
+                        else
+                            jsonVal = safeHelpers_listToJsonArray(item)
+                        )
+                    )
+                    (t  jsonVal = strcat("\"" safeHelpers_jsonEscape(
+                            sprintf(nil "%L" item)) "\""))
+                )
+                parts = cons(jsonVal parts)
+            )
+            strcat("[" buildString(reverse(parts) ",") "]")
+        )
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; ROLLBACK self-tests: only verify the permissive stubs reject
+;;; non-strings / empty. Strict accept/reject for '1abc' / 'foo(bar)'
+;;; is deliberately NOT enforced here — that is the Python gate's job.
+;;; ----------------------------------------------------------------
+unless(safeHelpers_matchesSafeVarPattern("Abc_123")
+    error("ROLLBACK SELF-TEST FAIL: matchesSafeVarPattern rejected 'Abc_123'")
+)
+when(safeHelpers_matchesSafeVarPattern("")
+    error("ROLLBACK SELF-TEST FAIL: matchesSafeVarPattern accepted empty string")
+)
+unless(safeHelpers_validateParamValue("500u")
+    error("ROLLBACK SELF-TEST FAIL: validateParamValue rejected '500u'")
+)
+when(safeHelpers_validateParamValue("")
+    error("ROLLBACK SELF-TEST FAIL: validateParamValue accepted empty string")
+)
+
+printf("helpers.il (ROLLBACK) loaded successfully.\n")

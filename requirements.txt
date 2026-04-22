@@ -1,0 +1,9 @@
+virtuoso-bridge @ git+https://github.com/Arcadia-1/virtuoso-bridge-lite.git
+psf-parser
+numpy
+control
+anthropic
+google-generativeai
+openai
+pyyaml
+python-dotenv
