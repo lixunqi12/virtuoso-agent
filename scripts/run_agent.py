@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm",
-        choices=["claude", "gemini", "kimi", "ollama"],
+        choices=["claude", "gemini", "kimi", "minimax", "ollama"],
         default=None,
         help=(
             "LLM provider. If omitted, falls back to DEFAULT_LLM in .env "

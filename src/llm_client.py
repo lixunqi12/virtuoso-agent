@@ -1,7 +1,8 @@
 ﻿"""LLM API abstraction layer.
 
-Supports Claude (Anthropic), Gemini (Google), and Ollama (local).
-API keys are read from environment variables and never hardcoded.
+Supports Claude (Anthropic), Gemini (Google), Kimi (Moonshot),
+MiniMax (domestic China endpoint), and Ollama (local). API keys are
+read from environment variables and never hardcoded.
 """
 
 from __future__ import annotations
@@ -258,6 +259,90 @@ class KimiClient(LLMClient):
         return self.chat([{"role": "user", "content": prompt}])
 
 
+class MinimaxClient(LLMClient):
+    """MiniMax (China domestic endpoint) via OpenAI-compatible API.
+
+    Default base_url points at ``api.minimaxi.com`` (domestic China);
+    override MINIMAX_BASE_URL for the overseas endpoint. Default model
+    is ``MiniMax-M2``; override via MINIMAX_MODEL env or ``--model``.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        max_retries: int = 5,
+    ):
+        from openai import OpenAI
+
+        self.client = OpenAI(
+            api_key=api_key or os.environ.get("MINIMAX_API_KEY", ""),
+            base_url=base_url or os.environ.get(
+                "MINIMAX_BASE_URL", "https://api.minimaxi.com/v1"
+            ),
+            max_retries=max_retries,
+        )
+        self.model = model or os.environ.get("MINIMAX_MODEL", "MiniMax-M2")
+
+    def chat(self, messages: list[dict[str, str]]) -> str:
+        import openai
+
+        full_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *messages,
+        ]
+        last_exc: Exception | None = None
+        response = None
+        for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=full_messages,
+                    max_tokens=16384,
+                )
+                break
+            except openai.RateLimitError as exc:
+                last_exc = exc
+                if attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
+                    logger.error(
+                        "MiniMax 429: exhausted %d outer retries; raising.",
+                        _LLM_MAX_RATE_LIMIT_RETRIES,
+                    )
+                    raise
+                sleep_s = _LLM_RATE_LIMIT_BACKOFF_S[
+                    min(attempt, len(_LLM_RATE_LIMIT_BACKOFF_S) - 1)
+                ]
+                logger.warning(
+                    "MiniMax 429 (attempt %d/%d); sleeping %ds before retry.",
+                    attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES + 1, sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
+        if response is None:
+            raise RuntimeError("MiniMax chat: no response") from last_exc
+        choice = response.choices[0]
+        msg = choice.message
+        content = (msg.content or "").strip()
+        if not content:
+            # MiniMax-M2 is a reasoning model and may return the full
+            # reply in `reasoning_content` when the visible content is
+            # consumed by thinking tokens.
+            reasoning = getattr(msg, "reasoning_content", None) or ""
+            reasoning = reasoning.strip()
+            if reasoning:
+                return reasoning
+            raise RuntimeError(
+                f"MiniMax returned empty content and no reasoning_content "
+                f"(finish_reason={choice.finish_reason!r}). Likely "
+                f"max_tokens exhausted before model produced output."
+            )
+        return content
+
+    def ask(self, prompt: str) -> str:
+        return self.chat([{"role": "user", "content": prompt}])
+
+
 class OllamaClient(LLMClient):
     """Ollama local LLM client using the chat API."""
 
@@ -324,6 +409,7 @@ def create_llm_client(provider: str = "claude", **kwargs) -> LLMClient:
         "claude": ClaudeClient,
         "gemini": GeminiClient,
         "kimi": KimiClient,
+        "minimax": MinimaxClient,
         "ollama": OllamaClient,
     }
     cls = clients.get(provider.lower())

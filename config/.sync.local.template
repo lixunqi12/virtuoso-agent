@@ -1,0 +1,14 @@
+# Local sync config for scripts/sync_to_remote.sh. Copy to
+# config/.sync.local (gitignored) and fill real values.
+#
+# This file must NOT be committed — it contains real SSH host,
+# username, and absolute path on the deploy machine.
+
+# SSH target: user@host. SSH key auth assumed.
+REMOTE_HOST=user@your-remote-host.example.edu
+
+# Absolute path of the git-managed checkout on the remote.
+REMOTE_REPO_DIR=/remote/path/to/virtuoso-agent
+
+# Where on the remote to drop the bundle during sync. Default is fine.
+# REMOTE_BUNDLE_PATH=/tmp/virtuoso-agent.bundle

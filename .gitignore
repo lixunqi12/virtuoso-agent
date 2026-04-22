@@ -40,6 +40,7 @@ skill/psf_dump_worker.ocn
 # Secrets
 # =========================================================================
 config/.env
+config/.sync.local
 *.key
 *.pem
 .ssh/
