@@ -21,6 +21,10 @@ logs/*.pid
 # In-progress / scratch (may contain private PDK maps, etc.)
 tmp/
 
+# Local working output dirs (schematic dumps, spec scaffolds, misc runs).
+out/
+specs_work/
+
 # Historical draft-review doc (contains real usernames and host)
 docs/stage0_draft_review.md
 
@@ -34,7 +38,6 @@ reviews/
 skill/rev*.il
 skill/stage0_*.il
 skill/stage1_*.il
-skill/psf_dump_worker.ocn
 
 # =========================================================================
 # Secrets
