@@ -39,6 +39,9 @@ skill/rev*.il
 skill/stage0_*.il
 skill/stage1_*.il
 
+# Manual rollback snapshots — git history IS the rollback mechanism.
+*.rollback
+
 # =========================================================================
 # Secrets
 # =========================================================================
