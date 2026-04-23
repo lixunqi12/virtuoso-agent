@@ -1,0 +1,23 @@
+# Pre-commit hooks for virtuoso-agent.
+#
+# Install:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually on the whole tree:
+#   pre-commit run --all-files
+#
+# The PDK token gate (scripts/check_p0_gate.ps1) requires PowerShell 7
+# (pwsh) on PATH. On Windows it is the native shell; on Linux/macOS
+# install from https://aka.ms/powershell.
+
+repos:
+  - repo: local
+    hooks:
+      - id: pdk-token-gate
+        name: PDK banned-token gate (scripts/check_p0_gate.ps1)
+        entry: pwsh -NoProfile -File scripts/check_p0_gate.ps1
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
