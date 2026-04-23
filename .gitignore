@@ -29,7 +29,7 @@ specs_work/
 docs/stage0_draft_review.md
 
 # Deployment guide with real SSH config / username
-docs/remote_deployment/
+docs/*_deployment/
 
 # Team review deliverables (per-incident artifacts)
 reviews/
