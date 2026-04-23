@@ -1,0 +1,30 @@
+# Default: auto-detect text, normalize to LF in the repo.
+# Working tree line endings follow core.autocrlf / core.eol.
+* text=auto eol=lf
+
+# Scripts intended for Unix shells / OCEAN / Cadence SKILL:
+# keep LF in the working tree too (remote side is Linux).
+*.sh   text eol=lf
+*.csh  text eol=lf
+*.il   text eol=lf
+*.ocn  text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+
+# PowerShell: Windows-native, needs CRLF.
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Known binaries: never touch.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
