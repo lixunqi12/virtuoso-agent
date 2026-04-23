@@ -49,15 +49,51 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Safe Analog Design Agent - LLM-driven circuit optimization"
     )
-    parser.add_argument("--lib", required=True, help="Virtuoso library name")
-    parser.add_argument("--cell", required=True, help="Cell name to optimize")
+    parser.add_argument(
+        "--sim-backend",
+        choices=["spectre", "hspice"],
+        default="spectre",
+        help=(
+            "Simulation backend. 'spectre' (default) drives OCEAN / Maestro "
+            "via SafeBridge + SKILL and runs the CircuitAgent LLM loop. "
+            "'hspice' runs HSpice directly over ssh against a remote .sp "
+            "netlist, parses the .mt<k> tables through parse_mt0, and reports "
+            "pass/fail via evaluate_hspice — single-shot (no LLM iteration), "
+            "intended for regression runs and smoke coverage on circuits "
+            "that have an HSpice testbench authored alongside the Maestro one."
+        ),
+    )
+    parser.add_argument(
+        "--netlist",
+        default=None,
+        help=(
+            "Remote POSIX path to the HSpice .sp netlist. REQUIRED when "
+            "--sim-backend=hspice; ignored otherwise. The file lives on "
+            "the same host as the hspice binary; the worker executes it "
+            "in-place (cd into dirname, hspice ./<basename>.sp)."
+        ),
+    )
+    parser.add_argument(
+        "--lib",
+        required=False,
+        default=None,
+        help="Virtuoso library name (required for --sim-backend=spectre)",
+    )
+    parser.add_argument(
+        "--cell",
+        required=False,
+        default=None,
+        help="Cell name to optimize (required for --sim-backend=spectre)",
+    )
     parser.add_argument(
         "--tb-cell",
-        required=True,
+        required=False,
+        default=None,
         help=(
-            "Maestro testbench cell name (e.g. LC_VCO_tb). Must be a cell "
-            "in the same library as --cell with a pre-configured Maestro "
-            "session; OCEAN drives it via safeOceanRun."
+            "Maestro testbench cell name (e.g. LC_VCO_tb) — required for "
+            "--sim-backend=spectre. Must be a cell in the same library as "
+            "--cell with a pre-configured Maestro session; OCEAN drives it "
+            "via safeOceanRun."
         ),
     )
     parser.add_argument(
@@ -161,11 +197,162 @@ def parse_args() -> argparse.Namespace:
     # `MSYS_NO_PATHCONV=1` every invocation. Only activates on the known
     # mangled prefix; legit Windows paths are untouched.
     _MSYS_PREFIX = "C:/msys64"
-    for _attr in ("scs_path", "remote_skill_dir"):
+    for _attr in ("scs_path", "remote_skill_dir", "netlist"):
         _val = getattr(args, _attr, None)
         if isinstance(_val, str) and _val.startswith(_MSYS_PREFIX + "/"):
             setattr(args, _attr, _val[len(_MSYS_PREFIX):])
+
+    # Backend-gated required-args validation. We can't use argparse's
+    # ``required=True`` because the requirement depends on another flag.
+    if args.sim_backend == "spectre":
+        missing = [
+            n for n, v in (
+                ("--lib", args.lib),
+                ("--cell", args.cell),
+                ("--tb-cell", args.tb_cell),
+            ) if not v
+        ]
+        if missing:
+            parser.error(
+                f"--sim-backend=spectre requires: {', '.join(missing)}"
+            )
+    elif args.sim_backend == "hspice":
+        if not args.netlist:
+            parser.error("--sim-backend=hspice requires --netlist")
     return args
+
+
+def _run_hspice(
+    args: argparse.Namespace,
+    spec_block: dict | None,
+    logger: logging.Logger,
+) -> int:
+    """Single-shot HSpice flow.
+
+    Returns:
+        0  — every metric PASS
+        1  — spec / config error (no YAML block, missing metrics)
+        2  — HspiceWorker transport or script error
+        3  — metric-name lookup failed (spec author or netlist bug)
+        4  — simulation ran and parsed but at least one metric FAIL /
+             UNMEASURABLE
+    """
+    # Imported lazily so the spectre code path (which dominates CI)
+    # doesn't pay the cost of importing the HSpice modules on every
+    # invocation, and so tests can monkey-patch ``worker_from_env`` on
+    # the ``src.hspice_worker`` module namespace.
+    from src import hspice_resolver, hspice_worker
+
+    if spec_block is None:
+        logger.error(
+            "--sim-backend=hspice requires a ```yaml signals/windows/"
+            "metrics``` block in the spec; none was found. JSON specs "
+            "are not supported for the HSpice backend."
+        )
+        return 1
+
+    metrics = spec_block.get("metrics") or []
+    if not metrics:
+        logger.error("Spec YAML block has no 'metrics' entries; nothing to check.")
+        return 1
+
+    try:
+        worker = hspice_worker.worker_from_env()
+    except hspice_worker.HspiceWorkerError as exc:
+        logger.error("HspiceWorker config error: %s", exc)
+        return 1
+    logger.info(
+        "HspiceWorker ready (host=%s, hspice_bin=%s, budget=%.0fs)",
+        worker.cfg.remote_host,
+        worker.cfg.hspice_bin,
+        worker.cfg.wall_timeout_s,
+    )
+    # Log only the basename — the full path may contain injection-probe
+    # strings (leading-dash options, shell metachars) that T3's path
+    # validation in ``HspiceWorker.run`` will reject. We don't want to
+    # echo those verbatim into run logs before the ValueError fires.
+    logger.info(
+        "Running HSpice on remote netlist (basename=%s)",
+        Path(args.netlist).name,
+    )
+
+    try:
+        run_result = worker.run(args.netlist)
+    except ValueError:
+        # T3 path defense: shlex-unsafe or shape-invalid ``--netlist``
+        # raises ``ValueError`` *before* any remote spawn. Treat as a
+        # user-input config error (rc=1), not a worker transport issue.
+        # Do NOT re-raise — that would leak a bare traceback to the
+        # top-level run_agent caller and confuse the operator.
+        #
+        # Privacy: ``HspiceWorker`` embeds the offending path into the
+        # exception message (e.g. ``...got '/tmp/secret/-evil.sp'``),
+        # which defeats the basename-only log policy we apply on the
+        # happy path. Drop the payload and log a category-only message
+        # — the operator still knows *what* went wrong; the raw path
+        # (which may itself be the injection probe) does not hit logs.
+        logger.error(
+            "Invalid --netlist argument: must be an absolute POSIX .sp "
+            "path accepted by HspiceWorker (see T3 path validation rules)."
+        )
+        return 1
+    except hspice_worker.HspiceWorkerTimeout as exc:
+        logger.error("HSpice timeout: %s", exc)
+        return 2
+    except hspice_worker.HspiceWorkerSpawnError as exc:
+        logger.error("HSpice spawn/transport error: %s", exc)
+        return 2
+    except hspice_worker.HspiceWorkerScriptError as exc:
+        logger.error("HSpice script error: %s", exc)
+        return 2
+
+    logger.info(
+        "HSpice rc=%d; parsed %d .mt<k> table(s) from %s",
+        run_result.returncode,
+        len(run_result.mt_files),
+        run_result.run_dir_remote,
+    )
+
+    try:
+        evaluation = hspice_resolver.evaluate_hspice(
+            run_result.mt_files, metrics,
+        )
+    except hspice_resolver.HspiceMetricNotFoundError as exc:
+        # Privacy: T4 designed ``HspiceMetricNotFoundError.__str__`` to
+        # report only the count of available columns, not their names
+        # (column names can leak node identifiers from a customer's
+        # netlist). Keep that contract here — log the metric name and
+        # the count, never ``exc.available``.
+        logger.error(
+            "Metric %r not found in any .mt<k> column (%d distinct "
+            "columns seen across tables). Fix the spec metric name "
+            "or the netlist .measure directive.",
+            exc.metric_name,
+            len(exc.available),
+        )
+        return 3
+
+    print("\n" + "=" * 60)
+    print("HSPICE RESULTS")
+    print("=" * 60)
+    print(f"  netlist          : {args.netlist}")
+    print(f"  run_dir          : {run_result.run_dir_remote}")
+    print(f"  hspice_rc        : {run_result.returncode}")
+    print(f"  mt_tables        : {sorted(run_result.mt_files.keys())}")
+    print()
+    print("Measurements (list per metric across alters/rows):")
+    for name, values in evaluation.measurements.items():
+        print(f"  {name}: {values}")
+    print()
+    print("Pass/Fail:")
+    for name, verdict in evaluation.pass_fail.items():
+        print(f"  {name}: {verdict}")
+    all_pass = bool(evaluation.pass_fail) and all(
+        v == "PASS" for v in evaluation.pass_fail.values()
+    )
+    print()
+    print(f"  overall          : {'PASS' if all_pass else 'FAIL'}")
+    return 0 if all_pass else 4
 
 
 def main() -> int:
@@ -225,6 +412,7 @@ def main() -> int:
     # *before* any Virtuoso connection or OCEAN round-trip. Catches the
     # ptp-vs-amplitude / unreachable-threshold class of bugs that used
     # to only manifest as "No crossing found" during the loop.
+    _spec_block = None
     if isinstance(spec, str):
         try:
             _spec_block = spec_evaluator.extract_eval_block(spec)
@@ -243,6 +431,15 @@ def main() -> int:
                     "before any OCEAN round-trip.", _n_issues,
                 )
                 return 1
+
+    # Backend dispatch. The hspice path is single-shot: it does not run
+    # the LLM loop, CircuitAgent, or any OCEAN/Virtuoso plumbing. It
+    # simulates the supplied .sp once, parses the .mt<k> tables (T3
+    # already scrubs + parses them inside HspiceWorker), resolves the
+    # spec metrics against those tables (T4 evaluate_hspice), and
+    # prints a pass/fail report.
+    if args.sim_backend == "hspice":
+        return _run_hspice(args, _spec_block, logger)
 
     pdk_map_path = Path(args.pdk_map)
     if not pdk_map_path.exists():
