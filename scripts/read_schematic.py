@@ -36,6 +36,27 @@ from virtuoso_bridge import VirtuosoClient
 from src.agent import CircuitAgent
 from src.safe_bridge import SafeBridge
 
+# Must match the SKILL-side hard cap in safeReadSchematicDeep. Keep in
+# sync with skill/safe_read_schematic.il (clamped to [1, 50]).
+_DEPTH_AUTO_MAX = 50
+
+
+def _parse_depth(raw: str) -> int:
+    """argparse type for --depth: accepts a positive int or 'auto'/'all'.
+
+    'auto' and 'all' both expand to the SKILL-side hard cap so BFS runs
+    until the tree is exhausted. Traversal terminates when the queue
+    empties, so on a 2-level design 'auto' costs the same as --depth 2.
+    """
+    if isinstance(raw, str) and raw.lower() in ("auto", "all"):
+        return _DEPTH_AUTO_MAX
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"--depth must be a positive int or 'auto' (got {raw!r})"
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -46,6 +67,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lib", required=True, help="Virtuoso library name")
     parser.add_argument("--cell", required=True, help="Cell name to read")
+    parser.add_argument(
+        "--depth",
+        type=_parse_depth,
+        default=1,
+        metavar="N|auto",
+        help=(
+            "Hierarchy depth. 1 (default) = flat read, identical to the "
+            "legacy single-cellview output — keeps the agent payload "
+            "byte-for-byte stable. 2+ walks same-library subcell masters "
+            "and emits an additional 'subcells' section in both Markdown "
+            "and JSON. 'auto' (alias 'all') expands to the hard cap "
+            f"({_DEPTH_AUTO_MAX}); BFS stops when the tree is exhausted, "
+            "so on a shallow design 'auto' costs the same as a matching "
+            "integer depth. Clamped SKILL-side to [1, 50]."
+        ),
+    )
     parser.add_argument(
         "--format",
         choices=["markdown", "json", "both"],
@@ -125,6 +162,39 @@ def _render_summary(circuit: dict) -> str:
     return "\n\n### Summary\n" + ", ".join(parts)
 
 
+def _render_hierarchical_markdown(hier: dict) -> str:
+    """Format a hierarchical schematic payload as Markdown.
+
+    Emits the root cellview using the same topology formatter the flat
+    path uses, followed by one `## Subcell <handle>` section per
+    deduplicated same-library subcell. Intended for human review /
+    audit; the agent still consumes the flat `read_circuit` output.
+    """
+    parts: list[str] = []
+    depth_limit_hit = hier.get("depth_limit_hit")
+    parts.append(
+        f"# Hierarchical schematic: {hier.get('lib')}/{hier.get('cell')}"
+    )
+    parts.append(
+        f"Depth reached: {hier.get('max_depth_reached', 0)} "
+        f"(cap: {hier.get('max_depth', 0)}"
+        + (", LIMIT HIT" if depth_limit_hit else "")
+        + ")"
+    )
+    parts.append("")
+    root = hier.get("root") or {}
+    parts.append(f"## Root (ROOT, depth=0)")
+    parts.append(CircuitAgent._format_topology(root))
+    for sub in hier.get("subcells") or []:
+        handle = sub.get("handle", "?")
+        cell = sub.get("cell", "?")
+        depth = sub.get("depth", "?")
+        parts.append("")
+        parts.append(f"## Subcell {handle} — {cell} (depth={depth})")
+        parts.append(CircuitAgent._format_topology(sub))
+    return "\n".join(parts)
+
+
 def _write(out_path: Path, text: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
@@ -177,16 +247,34 @@ def main() -> int:
     bridge.set_scope(args.lib, args.cell)
     logger.info("Scope bound: %s/%s", args.lib, args.cell)
 
-    logger.info("Reading circuit (sanitized)...")
-    circuit = bridge.read_circuit(args.lib, args.cell)
+    if args.depth < 1:
+        logger.error("--depth must be >= 1 (got %d)", args.depth)
+        return 2
 
-    # Default Markdown: EXACTLY what agent.run() sends to the LLM.
-    # Summary is human-only and strictly opt-in via --with-summary.
-    md_text = _render_markdown(circuit)
-    if args.with_summary:
-        md_text += _render_summary(circuit)
-    md_text += "\n"
-    json_text = json.dumps(circuit, indent=2, ensure_ascii=False) + "\n"
+    if args.depth == 1:
+        # Flat read — byte-for-byte identical to pre-H1 behavior so
+        # everyone downstream (agent, scaffold, specs) keeps working.
+        logger.info("Reading circuit (sanitized, depth=1 flat)...")
+        circuit = bridge.read_circuit(args.lib, args.cell)
+        md_text = _render_markdown(circuit)
+        if args.with_summary:
+            md_text += _render_summary(circuit)
+        md_text += "\n"
+        json_text = json.dumps(circuit, indent=2, ensure_ascii=False) + "\n"
+    else:
+        # Hierarchical read. --depth N means "visit N levels including
+        # the root", so the SKILL-side max_depth is N-1.
+        max_depth = args.depth - 1
+        logger.info(
+            "Reading circuit hierarchically (sanitized, cli_depth=%d, "
+            "skill_max_depth=%d)...",
+            args.depth, max_depth,
+        )
+        hier = bridge.read_circuit_hierarchical(
+            args.lib, args.cell, max_depth=max_depth,
+        )
+        md_text = _render_hierarchical_markdown(hier) + "\n"
+        json_text = json.dumps(hier, indent=2, ensure_ascii=False) + "\n"
 
     fmt = args.format
     out = args.output

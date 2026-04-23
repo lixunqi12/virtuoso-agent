@@ -1867,6 +1867,379 @@ class TestGenerateSpecScaffold:
         assert '"safe_spec_scaffold.il"' in bridge_source
 
 
+class TestReadCircuitHierarchical:
+    """SafeBridge.read_circuit_hierarchical wrapper contract (Task H1)."""
+
+    def _payload_root_plus_one_subcell(self) -> dict:
+        """Shape SKILL emits for a 2-level tree: root with 2 insts, one
+        of which references SUBCELL_0 (a same-lib user subcell); the
+        subcell itself is a primitive-only leaf schematic."""
+        return {
+            "ok": True,
+            "max_depth": 5,
+            "max_depth_reached": 1,
+            "depth_limit_hit": False,
+            "root": {
+                "handle": "ROOT",
+                "depth": 0,
+                "lib": "GENERIC_PDK",
+                "cell": "TOP",
+                "instances": [
+                    {
+                        "instName": "I0",
+                        "cell": "NMOS",
+                        "lib": "GENERIC_PDK",
+                        "params": {"w": "1u", "l": "60n"},
+                        "nets": {"D": "vout", "G": "vin",
+                                 "S": "vss", "B": "vss"},
+                    },
+                    {
+                        "instName": "I1",
+                        "subcell": "SUBCELL_0",
+                        "lib": "GENERIC_PDK",
+                        "params": {},
+                        "nets": {"VDD": "vdd", "VSS": "vss"},
+                    },
+                ],
+                "pins": [
+                    {"name": "vin", "direction": "input"},
+                    {"name": "vout", "direction": "output"},
+                ],
+            },
+            "subcells": [
+                {
+                    "handle": "SUBCELL_0",
+                    "depth": 1,
+                    "lib": "GENERIC_PDK",
+                    "cell": "BIAS_BLOCK",
+                    "instances": [
+                        {
+                            "instName": "M0",
+                            "cell": "PMOS",
+                            "lib": "GENERIC_PDK",
+                            "params": {"w": "500n", "l": "60n"},
+                            "nets": {"D": "n1", "G": "vdd",
+                                     "S": "vdd", "B": "vdd"},
+                        },
+                    ],
+                    "pins": [
+                        {"name": "VDD", "direction": "inputOutput"},
+                        {"name": "VSS", "direction": "inputOutput"},
+                    ],
+                },
+            ],
+        }
+
+    # -------- 1. shape -----------------------------------------------
+
+    def test_shape_round_trips_root_and_subcells(self, bridge, monkeypatch):
+        """Happy path: payload threads through Python sanitizer with
+        expected shape, depth counters, and sanitized lib/cell."""
+        bridge._skill_loaded = True
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: self._payload_root_plus_one_subcell(),
+        )
+        result = bridge.read_circuit_hierarchical(
+            lib="mylib", cell="TOP", max_depth=5,
+        )
+        assert result["lib"] == "GENERIC_PDK"
+        assert result["cell"] == "TOP"
+        assert result["max_depth"] == 5
+        assert result["max_depth_reached"] == 1
+        assert result["depth_limit_hit"] is False
+        assert result["root"]["handle"] == "ROOT"
+        assert result["root"]["depth"] == 0
+        assert len(result["root"]["instances"]) == 2
+        assert len(result["subcells"]) == 1
+        sub = result["subcells"][0]
+        assert sub["handle"] == "SUBCELL_0"
+        assert sub["depth"] == 1
+        assert sub["lib"] == "GENERIC_PDK"
+        # Subcell back-ref survives sanitization intact.
+        ref_row = result["root"]["instances"][1]
+        assert ref_row["subcell"] == "SUBCELL_0"
+
+    # -------- 2. dedup ------------------------------------------------
+
+    def test_dedup_two_instances_share_one_subcell(self, bridge, monkeypatch):
+        """Two top-level instances referencing the same same-lib master
+        must produce exactly ONE subcells[] entry with a shared handle —
+        matches the N-instances-share-one-master BFS dedup contract
+        (four instance rows point at SUBCELL_0; subcells[] length == 1)."""
+        bridge._skill_loaded = True
+        payload = {
+            "ok": True,
+            "max_depth": 10, "max_depth_reached": 1, "depth_limit_hit": False,
+            "root": {
+                "handle": "ROOT", "depth": 0,
+                "lib": "GENERIC_PDK", "cell": "DEDUP_TEST_TOP",
+                "instances": [
+                    {"instName": f"I{i}", "subcell": "SUBCELL_0",
+                     "lib": "GENERIC_PDK", "params": {}, "nets": {}}
+                    for i in range(4)
+                ],
+                "pins": [],
+            },
+            "subcells": [
+                {
+                    "handle": "SUBCELL_0", "depth": 1,
+                    "lib": "GENERIC_PDK", "cell": "DEDUP_TEST_SUB",
+                    "instances": [], "pins": [],
+                },
+            ],
+        }
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: payload,
+        )
+        result = bridge.read_circuit_hierarchical(
+            lib="mylib", cell="DEDUP_TEST_TOP", max_depth=3,
+        )
+        refs = [inst["subcell"] for inst in result["root"]["instances"]]
+        assert refs == ["SUBCELL_0"] * 4
+        assert len(result["subcells"]) == 1
+        assert result["subcells"][0]["handle"] == "SUBCELL_0"
+
+    # -------- 3. primitives stay leaves -------------------------------
+
+    def test_primitives_remain_leaves(self, bridge, monkeypatch):
+        """Instances whose master is a primitive (cell name only, no
+        subcell ref) must NOT appear in subcells[] — they are leaves
+        named via cellAlias, consistent with the flat reader."""
+        bridge._skill_loaded = True
+        payload = {
+            "ok": True,
+            "max_depth": 10, "max_depth_reached": 0, "depth_limit_hit": False,
+            "root": {
+                "handle": "ROOT", "depth": 0,
+                "lib": "GENERIC_PDK", "cell": "FLAT_CELL",
+                "instances": [
+                    {"instName": "M0", "cell": "NMOS",
+                     "lib": "GENERIC_PDK",
+                     "params": {"w": "1u", "l": "60n"},
+                     "nets": {"D": "vout"}},
+                    {"instName": "M1", "cell": "PMOS",
+                     "lib": "GENERIC_PDK",
+                     "params": {"w": "500n", "l": "60n"},
+                     "nets": {"D": "vout"}},
+                    {"instName": "R0", "cell": "GENERIC_DEVICE",
+                     "lib": "GENERIC_PDK",
+                     "params": {"r": "1k"}, "nets": {"P": "n1"}},
+                ],
+                "pins": [],
+            },
+            "subcells": [],
+        }
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: payload,
+        )
+        result = bridge.read_circuit_hierarchical(
+            lib="mylib", cell="FLAT_CELL", max_depth=3,
+        )
+        assert result["subcells"] == []
+        for row in result["root"]["instances"]:
+            assert "subcell" not in row or row.get("subcell") is None
+            assert row["cell"] in {"NMOS", "PMOS", "GENERIC_DEVICE"}
+
+    # -------- 4. max_depth threads into SKILL call --------------------
+
+    def test_max_depth_threads_into_skill_and_out(self, bridge, monkeypatch):
+        """Caller-supplied max_depth must be embedded verbatim in the
+        SKILL expr (so the BFS is bounded at source), and the returned
+        depth_limit_hit flag must survive sanitization."""
+        bridge._skill_loaded = True
+        captured: dict[str, str] = {}
+
+        def fake_exec(self_, expr):
+            captured["expr"] = expr
+            return {
+                "ok": True,
+                "max_depth": 2,
+                "max_depth_reached": 2,
+                "depth_limit_hit": True,
+                "root": {
+                    "handle": "ROOT", "depth": 0,
+                    "lib": "GENERIC_PDK", "cell": "A",
+                    "instances": [], "pins": [],
+                },
+                "subcells": [],
+            }
+
+        monkeypatch.setattr(SafeBridge, "_execute_skill_json", fake_exec)
+        result = bridge.read_circuit_hierarchical(
+            lib="mylib", cell="A", max_depth=2,
+        )
+        assert captured["expr"] == (
+            'safeReadSchematicDeep("mylib" "A" 2)'
+        )
+        assert result["max_depth"] == 2
+        assert result["max_depth_reached"] == 2
+        assert result["depth_limit_hit"] is True
+        # Python rejects clearly bad values up front, so a negative or
+        # oversized max_depth never even reaches SKILL.
+        with pytest.raises(ValueError, match="max_depth"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="A", max_depth=-1,
+            )
+        with pytest.raises(ValueError, match="max_depth"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="A", max_depth=51,
+            )
+
+    # -------- 5. error paths ------------------------------------------
+
+    def test_error_paths(self, bridge, monkeypatch):
+        """Bad-identifier inputs raise ValueError; ok=false SKILL
+        response raises RuntimeError; missing SKILL helpers raise
+        RuntimeError (matches the flat reader's error surface)."""
+        # Invalid lib name — does not even call SKILL.
+        bridge._skill_loaded = True
+        with pytest.raises(ValueError, match="lib"):
+            bridge.read_circuit_hierarchical(
+                lib="bad lib!", cell="TOP", max_depth=3,
+            )
+        # SKILL returns ok=false → RuntimeError scrubbed.
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: {"ok": False, "error": "cannot open"},
+        )
+        with pytest.raises(RuntimeError, match="safeReadSchematicDeep"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="TOP", max_depth=3,
+            )
+        # No SKILL helpers loaded → RuntimeError with a hint.
+        bridge._skill_loaded = False
+        with pytest.raises(RuntimeError, match="SKILL"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="TOP", max_depth=3,
+            )
+
+    # -------- 6. allow-list regression guard --------------------------
+
+    def test_entrypoint_in_allowlist(self):
+        """Regression guard: the new SKILL entrypoint must appear in the
+        frozen allow-list, else _execute_skill_json rejects every call."""
+        from src.safe_bridge import _ALLOWED_SKILL_ENTRYPOINTS
+        assert "safeReadSchematicDeep" in _ALLOWED_SKILL_ENTRYPOINTS
+
+    # -------- 7. H1 round-2 dangling-ref defense ----------------------
+
+    def test_dangling_subcell_ref_downgraded_to_leaf(
+            self, bridge, monkeypatch):
+        """Defense-in-depth (codex review Blocker #1): if SKILL ever
+        emits an instance row pointing at a handle that has no matching
+        entry in subcells[], _sanitize_hierarchical must drop the
+        `subcell` field so the caller never sees a dangling ref."""
+        bridge._skill_loaded = True
+        payload = {
+            "ok": True,
+            "max_depth": 5,
+            "max_depth_reached": 1,
+            "depth_limit_hit": False,
+            "root": {
+                "handle": "ROOT", "depth": 0,
+                "lib": "GENERIC_PDK", "cell": "TOP",
+                "instances": [
+                    # Points at SUBCELL_0 — which IS present below.
+                    {"instName": "I0", "subcell": "SUBCELL_0",
+                     "lib": "GENERIC_PDK", "params": {}, "nets": {}},
+                    # Points at SUBCELL_1 — MISSING from subcells[].
+                    {"instName": "I1", "subcell": "SUBCELL_1",
+                     "lib": "GENERIC_PDK", "params": {}, "nets": {}},
+                    # Points at ROOT — pathological but syntactically
+                    # valid; it is a real handle so it must survive.
+                    {"instName": "I2", "subcell": "ROOT",
+                     "lib": "GENERIC_PDK", "params": {}, "nets": {}},
+                ],
+                "pins": [],
+            },
+            "subcells": [
+                {
+                    "handle": "SUBCELL_0", "depth": 1,
+                    "lib": "GENERIC_PDK", "cell": "REAL_SUB",
+                    "instances": [
+                        # Dangling ref also inside a subcell's instances.
+                        {"instName": "M0", "subcell": "SUBCELL_99",
+                         "lib": "GENERIC_PDK", "params": {}, "nets": {}},
+                    ],
+                    "pins": [],
+                },
+            ],
+        }
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: payload,
+        )
+        result = bridge.read_circuit_hierarchical(
+            lib="mylib", cell="TOP", max_depth=5,
+        )
+        root_insts = result["root"]["instances"]
+        # I0 → SUBCELL_0 exists, ref preserved.
+        assert root_insts[0]["subcell"] == "SUBCELL_0"
+        # I1 → SUBCELL_1 dangling, field dropped.
+        assert "subcell" not in root_insts[1]
+        # I2 → ROOT is a real handle, must survive.
+        assert root_insts[2]["subcell"] == "ROOT"
+        # Inside subcell: dangling ref also dropped.
+        sub_inst = result["subcells"][0]["instances"][0]
+        assert "subcell" not in sub_inst
+
+    # -------- 8. H1 round-2 max_depth contract ------------------------
+
+    def test_max_depth_zero_rejected(self, bridge, monkeypatch):
+        """Round-2: max_depth=0 is redundant with the flat read path
+        (--depth 1 covers 'root only'), so the hierarchical API refuses
+        it outright rather than silently collapsing to a flat read."""
+        bridge._skill_loaded = True
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: {"ok": True, "root": {}, "subcells": []},
+        )
+        with pytest.raises(ValueError, match=r"max_depth.*\[1, 50\]"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="TOP", max_depth=0,
+            )
+
+    def test_max_depth_bool_rejected(self, bridge, monkeypatch):
+        """Round-2: bool is an int subclass in Python, so a naive
+        isinstance(int) check would let True/False through. Explicit
+        bool rejection keeps the SKILL expr free of non-integer-looking
+        literals."""
+        bridge._skill_loaded = True
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: {"ok": True, "root": {}, "subcells": []},
+        )
+        with pytest.raises(ValueError, match=r"max_depth.*plain int"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="TOP", max_depth=True,
+            )
+        with pytest.raises(ValueError, match=r"max_depth.*plain int"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="TOP", max_depth=False,
+            )
+
+    def test_max_depth_float_rejected(self, bridge, monkeypatch):
+        """Round-2: float values must be rejected so we never round-trip
+        a non-integer literal to SKILL (even integer-valued floats like
+        2.0 — we require the caller to pass a plain int)."""
+        bridge._skill_loaded = True
+        monkeypatch.setattr(
+            SafeBridge, "_execute_skill_json",
+            lambda self_, expr: {"ok": True, "root": {}, "subcells": []},
+        )
+        with pytest.raises(ValueError, match=r"max_depth.*plain int"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="TOP", max_depth=2.0,
+            )
+        with pytest.raises(ValueError, match=r"max_depth.*plain int"):
+            bridge.read_circuit_hierarchical(
+                lib="mylib", cell="TOP", max_depth=1.5,
+            )
+
+
 class TestSafeBridgeFindInputScs:
     """find_input_scs: auto-discover Maestro input.scs on remote host."""
 

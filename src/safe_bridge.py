@@ -124,6 +124,12 @@ _ABS_UNIX_PATH_RE = re.compile(
 #    primitives (system / popen / exec / shell / evalstring / ipcbegin).
 _ALLOWED_SKILL_ENTRYPOINTS = frozenset({
     "safeReadSchematic",
+    # Task H1 (2026-04-22): hierarchical BFS reader. Same-library only.
+    # Emits root cellview + every unique same-lib subcell (up to
+    # max_depth), deduplicated via SUBCELL_N handles. Cross-lib masters
+    # stay leaves with cellAlias() naming — foundry cell names never
+    # leave remote host, matching the flat reader's PDK posture.
+    "safeReadSchematicDeep",
     "safeReadOpPoint",
     # Stage 1 rev 7 (2026-04-19): tranOp-based op-point read; no dedicated
     # DC analysis required. Dual-signed by probe 7 v3+v4 (dr: handle +
@@ -178,6 +184,12 @@ _ALLOWED_SKILL_NESTED = frozenset({"list"})
 # this pattern AND not containing a blocklist substring. Mirrors
 # safeHelpers_validateParamName in skill/helpers.il. Keep both in sync.
 _SAFE_PARAM_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,31}$")
+
+# Task H1 (2026-04-22): handles issued by safeReadSchematicDeep for unique
+# same-library subcells. Shape is ROOT | SUBCELL_<n> (integer). Python-side
+# rejects any other string — prevents a compromised SKILL payload from
+# smuggling a foundry cell name in the "subcell" slot of an instance row.
+_SUBCELL_HANDLE_RE = re.compile(r"^(ROOT|SUBCELL_\d+)$")
 _BLOCKED_PARAM_WORDS = frozenset({
     "load", "file", "path", "system", "eval", "exec", "shell",
     "include", "require", "getss", "errset", "evalstring",
@@ -465,6 +477,234 @@ class SafeBridge:
                 f'read_schematic("{lib}" "{cell}")'
             )
         return self._sanitize(raw)
+
+    def read_circuit_hierarchical(
+        self,
+        lib: str,
+        cell: str,
+        max_depth: int = 10,
+    ) -> dict:
+        """Hierarchical, same-library BFS schematic read.
+
+        Wraps the remote-side ``safeReadSchematicDeep`` SKILL helper. Returns
+        a dict shaped like::
+
+            {
+              "lib":  "GENERIC_PDK",
+              "cell": "<root cell>",
+              "max_depth":         <effective cap applied by SKILL>,
+              "max_depth_reached": <deepest depth actually visited>,
+              "depth_limit_hit":   <bool — did BFS stop early on cap>,
+              "root":     {handle:"ROOT", depth:0, lib:"GENERIC_PDK",
+                           cell:"...", instances:[...], pins:[...]},
+              "subcells": [ {handle:"SUBCELL_0", depth:1, ...}, ... ],
+            }
+
+        Each instance row inside ``root`` / ``subcells[i]`` carries the
+        same PDK-safe payload as ``read_circuit`` (``cell`` aliased,
+        ``lib`` pinned to ``GENERIC_PDK``, whitelisted params, net map).
+        Rows whose master is another same-library schematic additionally
+        carry a ``subcell: "SUBCELL_<n>"`` back-reference pointing at the
+        dedup'd entry in the top-level ``subcells`` list.
+
+        ``max_depth`` is clamped SKILL-side to ``[0, 50]`` — 0 reads the
+        root only (same pin/instance visibility as ``read_circuit``), 50
+        is a hard safety cap that bounds BFS even if the same-lib seen
+        map somehow fails. Python-side rejects obviously bad values
+        (negative / non-int) up front so we don't emit a SKILL call that
+        will round-trip a bogus integer.
+
+        Cross-library instance masters are NEVER opened — they remain
+        leaves with ``cellAlias()`` naming, preserving the PDK posture
+        of the flat reader (foundry cell names never leave remote host).
+        """
+        _validate_name(lib, "lib")
+        _validate_name(cell, "cell")
+        self._check_scope(lib, cell)
+        # H1 round-2 (codex review): max_depth contract tightened to
+        # [1, 50]. `0` is redundant with the flat read path (same
+        # output as --depth 1), so the hierarchical API refuses it
+        # outright. bool is rejected explicitly because it is an int
+        # subclass in Python — `True`/`False` would otherwise slip
+        # through the plain isinstance(int) check. float is rejected
+        # so we never round-trip a non-integer literal to SKILL.
+        if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+            raise ValueError(
+                f"max_depth must be a plain int "
+                f"(got {type(max_depth).__name__})"
+            )
+        if max_depth < 1 or max_depth > 50:
+            raise ValueError(
+                f"max_depth must be within [1, 50] (got {max_depth})"
+            )
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "read_circuit_hierarchical requires the remote-side SKILL "
+                "helpers. Pass --remote-skill-dir so "
+                "safe_read_schematic.il can be loaded."
+            )
+        raw = self._execute_skill_json(
+            f'safeReadSchematicDeep("{lib}" "{cell}" {max_depth})'
+        )
+        if not raw.get("ok", False):
+            raise RuntimeError(
+                "safeReadSchematicDeep failed: "
+                f"{_scrub(str(raw.get('error', 'unknown')))}"
+            )
+        return self._sanitize_hierarchical(raw, cell)
+
+    def _sanitize_hierarchical(self, raw: dict, root_cell: str) -> dict:
+        """Defense-in-depth scrub for a hierarchical schematic payload.
+
+        Runs the flat ``_sanitize`` on each cellview entry (root plus
+        every subcell), validates the ``subcell`` back-reference on
+        every instance row against ``_SUBCELL_HANDLE_RE`` (dropping
+        bogus values), and coerces the top-level metadata (``lib`` ->
+        ``GENERIC_PDK``, depth counters to int, ``depth_limit_hit`` to
+        bool) so the caller gets a stable shape regardless of SKILL
+        regressions.
+        """
+        root_raw = raw.get("root") or {}
+        if not isinstance(root_raw, dict):
+            raise RuntimeError(
+                "safeReadSchematicDeep returned malformed root"
+            )
+        subcells_raw = raw.get("subcells") or []
+        if not isinstance(subcells_raw, list):
+            raise RuntimeError(
+                "safeReadSchematicDeep returned malformed subcells"
+            )
+
+        root = self._sanitize_cellview_entry(root_raw, expected_handle="ROOT")
+        subcells: list[dict[str, Any]] = []
+        seen_handles: set[str] = {"ROOT"}
+        for entry in subcells_raw:
+            if not isinstance(entry, dict):
+                continue
+            handle = entry.get("handle")
+            if not isinstance(handle, str) or not _SUBCELL_HANDLE_RE.fullmatch(
+                    handle):
+                logger.warning(
+                    "hierarchical reader dropped subcell with bad handle "
+                    "(len=%d)", len(handle) if isinstance(handle, str) else 0
+                )
+                continue
+            if handle in seen_handles:
+                logger.warning(
+                    "hierarchical reader dropped duplicate subcell handle "
+                    "(len=%d)", len(handle)
+                )
+                continue
+            seen_handles.add(handle)
+            subcells.append(self._sanitize_cellview_entry(entry))
+
+        # H1 round-2 (codex review, Blocker #1 defense-in-depth):
+        # Cross-check every instance's `subcell` back-reference against
+        # the set of handles we actually emitted. If SKILL ever re-
+        # introduces a dangling-ref regression (e.g. allocated a handle
+        # but failed to produce the matching subcells[] entry), drop
+        # the field here so callers never see a pointer into the void.
+        actual_handles = {"ROOT"} | {s["handle"] for s in subcells}
+        for cellview in (root, *subcells):
+            for inst in cellview.get("instances") or []:
+                if not isinstance(inst, dict):
+                    continue
+                ref = inst.get("subcell")
+                if ref is None:
+                    continue
+                if ref not in actual_handles:
+                    inst.pop("subcell", None)
+                    logger.warning(
+                        "hierarchical reader dropped dangling subcell "
+                        "ref (len=%d) on cellview %s",
+                        len(ref) if isinstance(ref, str) else 0,
+                        cellview.get("handle", "?"),
+                    )
+
+        max_depth = raw.get("max_depth")
+        max_depth_reached = raw.get("max_depth_reached")
+        depth_limit_hit = raw.get("depth_limit_hit")
+        return {
+            "lib": "GENERIC_PDK",
+            "cell": root_cell,
+            "max_depth": int(max_depth) if isinstance(
+                max_depth, (int, float)) else 0,
+            "max_depth_reached": int(max_depth_reached) if isinstance(
+                max_depth_reached, (int, float)) else 0,
+            "depth_limit_hit": bool(depth_limit_hit),
+            "root": root,
+            "subcells": subcells,
+        }
+
+    def _sanitize_cellview_entry(
+        self, entry: dict, expected_handle: str | None = None,
+    ) -> dict:
+        """Scrub a single cellview dict (root or subcell).
+
+        Applies the existing ``_sanitize`` to ``instances`` (so each row
+        gets its ``cell`` aliased and ``lib`` pinned to GENERIC_PDK),
+        then re-validates the per-row ``subcell`` back-reference against
+        ``_SUBCELL_HANDLE_RE``. Rows with a bogus reference have the
+        field silently removed — a PDK-safe leaf representation remains.
+        """
+        # Copy shape that _sanitize expects: {"instances":[...], ...}.
+        # _sanitize mutates instance dicts in place and returns a deep
+        # copy of the whole payload, so we can use it as-is.
+        sanitized = self._sanitize({
+            "instances": entry.get("instances") or [],
+        })
+        instances = sanitized.get("instances") or []
+        for inst in instances:
+            if not isinstance(inst, dict):
+                continue
+            ref = inst.get("subcell")
+            if ref is None:
+                continue
+            if not isinstance(ref, str) or not _SUBCELL_HANDLE_RE.fullmatch(
+                    ref):
+                inst.pop("subcell", None)
+                logger.warning(
+                    "hierarchical reader dropped bad subcell ref on "
+                    "instance (len=%d)",
+                    len(ref) if isinstance(ref, str) else 0,
+                )
+
+        pins_raw = entry.get("pins") or []
+        pins: list[dict[str, str]] = []
+        if isinstance(pins_raw, list):
+            for pin in pins_raw:
+                if not isinstance(pin, dict):
+                    continue
+                name = pin.get("name")
+                direction = pin.get("direction")
+                if not isinstance(name, str) or not name:
+                    continue
+                if not _SAFE_PARAM_NAME_RE.fullmatch(name):
+                    continue
+                if not isinstance(direction, str):
+                    direction = "unknown"
+                pins.append({"name": name, "direction": direction})
+
+        handle = entry.get("handle")
+        if expected_handle is not None:
+            handle = expected_handle
+        elif not isinstance(handle, str) or not _SUBCELL_HANDLE_RE.fullmatch(
+                handle):
+            handle = ""
+
+        cell_name = entry.get("cell", "")
+        if not isinstance(cell_name, str):
+            cell_name = ""
+
+        depth = entry.get("depth")
+        return {
+            "handle": handle,
+            "depth": int(depth) if isinstance(depth, (int, float)) else 0,
+            "lib": "GENERIC_PDK",
+            "cell": cell_name,
+            "instances": instances,
+            "pins": pins,
+        }
 
     def read_op_point(self, lib: str, cell: str) -> dict:
         """Read and sanitize DC operating-point data.
