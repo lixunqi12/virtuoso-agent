@@ -1,0 +1,52 @@
+# HSpice scrub patterns — public-facing seed for src/hspice_scrub.py.
+#
+# IMPORTANT: this file is public and therefore only declares GENERIC
+# patterns. Real foundry cell/model names never live here; the PC-side
+# repo mirrors the same posture as config/pdk_map.yaml and the
+# _scrub()/_FOUNDRY_LEAK_RE source-of-truth list in src/safe_bridge.py.
+# The foundry seed list itself lives inside hspice_scrub.py because it
+# is the authoritative banned-token gate — this YAML is just the
+# swappable public extension.
+#
+# Keys recognised by load_patterns():
+#   banned_prefixes : string prefixes to redact as <path>
+#                     (matched case-insensitively, greedy up to
+#                      whitespace / quote / control char)
+#   banned_tokens   : bare tokens to redact as <redacted>, matched
+#                     \btoken\w* so identifiers built on the token
+#                     (e.g. "N16_core_top") are also caught
+#   model_regex     : extra raw regexes applied BEFORE token scrubs,
+#                     whole-match replaced by "<model_lib>". Useful
+#                     for directive lines like .LIB "<path>" <section>
+#                     when the path regex alone isn't enough.
+#   preserve_tokens : identifiers that are never to be redacted —
+#                     case-insensitive exact match grants them an
+#                     exception in both the scrub and gate passes.
+#                     These are design-space names the agent / LLM
+#                     legitimately needs to see.
+#
+# The bundled foundry seeds in hspice_scrub._FOUNDRY_LEAK_RE
+# (nch_/pch_/cfmom/rppoly/rm1_/tsmc/tcbn/TUFP/dkit/N16) are ALWAYS
+# applied in addition to whatever is listed here.
+
+banned_prefixes:
+  - "/usr/local/dkits/"
+
+banned_tokens:
+  - "N16"
+  - "tsmc"
+  - "dkit"
+  - "TUFP"
+
+model_regex: []
+
+preserve_tokens:
+  - "top_tt"
+  - "matching_test"
+  - "WBL"
+  - "WWL"
+  - "vdd"
+  - "vss"
+  - "gnd"
+  - "h_in_mid"
+  - "H_IN"
