@@ -17,6 +17,7 @@ import yaml
 
 from src.hspice_scrub import (
     DEFAULT_PATTERNS_PATH,
+    TEMPLATE_PATTERNS_PATH,
     ScrubError,
     load_patterns,
     scrub_lis,
@@ -452,8 +453,13 @@ class TestScrubRoundTwoBlockers:
 class TestLoadPatterns:
 
     def test_default_path_loads(self) -> None:
-        """The repo-bundled YAML is valid and parseable."""
-        assert DEFAULT_PATTERNS_PATH.exists()
+        """Either the private or the template YAML resolves and parses."""
+        # load_patterns() prefers DEFAULT_PATTERNS_PATH (.private.yaml)
+        # when present, else falls back to TEMPLATE_PATTERNS_PATH.
+        assert (
+            DEFAULT_PATTERNS_PATH.exists()
+            or TEMPLATE_PATTERNS_PATH.exists()
+        )
         loaded = load_patterns()
         # All four canonical keys populated.
         for key in (

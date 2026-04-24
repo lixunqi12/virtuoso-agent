@@ -21,8 +21,9 @@ external reviewer. Three artifact types are supported:
 Design follows ``src/safe_bridge.py`` (``_scrub`` + ``_sanitize*``):
 
 - **Seed list is source-of-truth in this file** (_FOUNDRY_LEAK_RE),
-  mirroring the safe_bridge posture. The public YAML at
-  ``config/hspice_scrub_patterns.yaml`` extends — it does not
+  mirroring the safe_bridge posture. The private YAML at
+  ``config/hspice_scrub_patterns.private.yaml`` (gitignored; derived
+  from the committed ``.template.yaml``) extends — it does not
   replace — the built-in seeds.
 - **Post-scrub gate**: after substitution we re-scan the output and
   raise :class:`ScrubError` if any banned token / prefix survived.
@@ -51,11 +52,19 @@ __all__ = [
 ]
 
 
-DEFAULT_PATTERNS_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "config"
-    / "hspice_scrub_patterns.yaml"
-)
+_CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
+
+# Private (gitignored) YAML with the real foundry tokens for this site.
+# Developers derive it from the committed .template.yaml by running
+#   cp config/hspice_scrub_patterns.template.yaml \
+#      config/hspice_scrub_patterns.private.yaml
+# and filling in process/foundry/stdcell-lib names. If the private
+# copy is missing, load_patterns() falls back to the public template,
+# which has empty banned_{prefixes,tokens} lists — in that mode the
+# only active scrub rules are the hardcoded _FOUNDRY_LEAK_RE seeds
+# below.
+DEFAULT_PATTERNS_PATH = _CONFIG_DIR / "hspice_scrub_patterns.private.yaml"
+TEMPLATE_PATTERNS_PATH = _CONFIG_DIR / "hspice_scrub_patterns.template.yaml"
 
 
 # Round-2 (codex review): cap on residuals kept in a ScrubError so a
@@ -196,12 +205,20 @@ def _normalize_patterns(patterns: dict | None) -> dict:
 def load_patterns(path: str | Path | None = None) -> dict:
     """Load & validate HSpice scrub patterns from YAML.
 
-    ``path=None`` (default) loads the repo-bundled
-    ``config/hspice_scrub_patterns.yaml``. Any of the four recognised
-    keys may be absent — defaults apply. Unknown keys are ignored so a
-    future schema extension does not break older callers.
+    ``path=None`` (default) loads the private
+    ``config/hspice_scrub_patterns.private.yaml`` if it exists, else
+    falls back to the public ``.template.yaml`` (empty banned lists;
+    scrubbing still works via the hardcoded ``_FOUNDRY_LEAK_RE``
+    seeds). Any of the four recognised keys may be absent — defaults
+    apply. Unknown keys are ignored so a future schema extension does
+    not break older callers.
     """
-    resolved = Path(path) if path is not None else DEFAULT_PATTERNS_PATH
+    if path is not None:
+        resolved = Path(path)
+    elif DEFAULT_PATTERNS_PATH.exists():
+        resolved = DEFAULT_PATTERNS_PATH
+    else:
+        resolved = TEMPLATE_PATTERNS_PATH
     if not resolved.exists():
         raise FileNotFoundError(
             f"hspice scrub patterns not found: {resolved.name}"
@@ -394,10 +411,11 @@ def _run_scrub(text: str, patterns: dict | None, stage: str) -> str:
 def scrub_sp(text: str, patterns: dict | None = None) -> str:
     """Scrub an HSpice ``.sp`` main-netlist text.
 
-    ``patterns`` defaults to the bundled
-    ``config/hspice_scrub_patterns.yaml``. Pass an inline dict for
-    tests or custom deployment policies; the built-in foundry seeds
-    always apply in addition.
+    ``patterns`` defaults to the private
+    ``config/hspice_scrub_patterns.private.yaml`` (gitignored), or
+    the public ``.template.yaml`` if the private copy is missing.
+    Pass an inline dict for tests or custom deployment policies; the
+    built-in foundry seeds always apply in addition.
     """
     return _run_scrub(text, patterns, stage="sp")
 
