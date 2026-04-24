@@ -15,8 +15,9 @@
 #
 # T6 (2026-04-23): additive second phase scans the HSpice work-dir
 # artifacts ({HSPICE_WORK_DIR}/**/*.{sp,mt[0-9]*,lis}) against the T1
-# scrub YAML (config/hspice_scrub_patterns.yaml) as the single source
-# of truth for banned_prefixes / banned_tokens / preserve_tokens.
+# scrub YAML (config/hspice_scrub_patterns.private.yaml, gitignored;
+# falls back to .template.yaml) as the single source of truth for
+# banned_prefixes / banned_tokens / preserve_tokens.
 # Matches .mt0 through .mt<N>, so multi-digit alters are covered.
 # Hit logs follow T1's privacy posture: path + category + count only;
 # the raw match text never surfaces. Phase skipped when
@@ -97,7 +98,8 @@ if ($leaks.Count -gt 0) {
 # Reads {HSPICE_WORK_DIR}/**/*.{sp,mt[0-9]*,lis} and rejects any file
 # carrying a banned prefix / banned token / foundry seed that was not
 # granted an exception via preserve_tokens. The YAML at
-# config/hspice_scrub_patterns.yaml is the single source of truth for
+# config/hspice_scrub_patterns.private.yaml (gitignored; derived from
+# the committed .template.yaml) is the single source of truth for
 # the configurable patterns; the foundry-seed regex literal reuses
 # $Banned above (the one authoritative copy in this script).
 #
@@ -111,7 +113,7 @@ if ($leaks.Count -gt 0) {
 function Read-HspiceScrubYaml {
     <#
     .SYNOPSIS
-    Strict parser for config/hspice_scrub_patterns.yaml.
+    Strict parser for config/hspice_scrub_patterns.{private,template}.yaml.
 
     .DESCRIPTION
     Fail-closed (R2 B1): the pre-rework parser tolerated a number of
@@ -426,11 +428,24 @@ if ([string]::IsNullOrWhiteSpace($workDir)) {
 } elseif (-not (Test-Path -LiteralPath $workDir -PathType Container)) {
     Write-Host "HSPICE_WORK_DIR=$workDir not a directory - skipping work-dir artifact scan." -ForegroundColor DarkGray
 } else {
-    $yamlPath = Join-Path $RepoRoot 'config/hspice_scrub_patterns.yaml'
-    if (-not (Test-Path -LiteralPath $yamlPath -PathType Leaf)) {
-        Write-Host "hspice_scrub_patterns.yaml missing at $yamlPath - cannot run work-dir scan." -ForegroundColor Red
-        $exitCode = 1
+    # Prefer the private (gitignored) YAML with real foundry tokens.
+    # Fall back to the public template when the private copy is absent
+    # (new clone, CI without secrets): banned_{prefixes,tokens} are empty
+    # there, so the work-dir scan still runs but only the hardcoded
+    # foundry seed regex fires — matching the posture in src/hspice_scrub.py.
+    $privateYaml  = Join-Path $RepoRoot 'config/hspice_scrub_patterns.private.yaml'
+    $templateYaml = Join-Path $RepoRoot 'config/hspice_scrub_patterns.template.yaml'
+    if (Test-Path -LiteralPath $privateYaml -PathType Leaf) {
+        $yamlPath = $privateYaml
+    } elseif (Test-Path -LiteralPath $templateYaml -PathType Leaf) {
+        Write-Host "hspice_scrub_patterns.private.yaml missing - falling back to .template.yaml (seed-only scan)." -ForegroundColor DarkYellow
+        $yamlPath = $templateYaml
     } else {
+        Write-Host "No hspice_scrub_patterns YAML found (private or template) - cannot run work-dir scan." -ForegroundColor Red
+        $exitCode = 1
+        $yamlPath = $null
+    }
+    if ($yamlPath) {
         $workRc = Invoke-HspiceWorkDirScan `
                     -WorkDir $workDir `
                     -YamlPath $yamlPath `

@@ -51,6 +51,12 @@ config/.sync.local
 *.pem
 .ssh/
 
+# PDK scrub pattern extension — real foundry tokens live here, never commit.
+# Ship the sanitized config/hspice_scrub_patterns.template.yaml instead and
+# have each dev copy it to *.private.yaml to fill in real values.
+config/hspice_scrub_patterns.private.yaml
+config/hspice_scrub_patterns.yaml
+
 # =========================================================================
 # Python
 # =========================================================================
