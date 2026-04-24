@@ -1,0 +1,64 @@
+# HSpice scrub patterns — PUBLIC TEMPLATE (placeholders only).
+#
+# ============================================================================
+# HOW TO USE
+# ============================================================================
+#   1. Copy this file to a private (gitignored) sibling:
+#        cp config/hspice_scrub_patterns.template.yaml \
+#           config/hspice_scrub_patterns.private.yaml
+#   2. Edit the private copy with the real foundry tokens for your site.
+#   3. src/hspice_scrub.py and scripts/check_p0_gate.ps1 will load the
+#      private copy automatically; if it is missing they fall back to
+#      the hardcoded foundry seed in src/hspice_scrub.py::_FOUNDRY_LEAK_RE,
+#      which already covers generic NMOS/PMOS/metal-resistor prefixes.
+#
+# The private copy is gitignored — real foundry cell / model names MUST
+# never land in this template or in any other committed file.
+# ============================================================================
+#
+# Keys recognised by load_patterns():
+#   banned_prefixes : string prefixes to redact as <path>
+#                     (matched case-insensitively, greedy up to
+#                      whitespace / quote / control char)
+#   banned_tokens   : bare tokens to redact as <redacted>, matched
+#                     \btoken\w* so identifiers built on the token
+#                     (e.g. "<NODE>_core_top") are also caught
+#   model_regex     : extra raw regexes applied BEFORE token scrubs,
+#                     whole-match replaced by "<model_lib>". Useful
+#                     for directive lines like .LIB "<path>" <section>
+#                     when the path regex alone isn't enough.
+#   preserve_tokens : identifiers that are never to be redacted —
+#                     case-insensitive exact match grants them an
+#                     exception in both the scrub and gate passes.
+#                     These are design-space names the agent / LLM
+#                     legitimately needs to see.
+
+# Absolute path prefixes for the on-disk PDK install. Examples:
+#   - "/path/to/your/foundry/dkit/install/"
+#   - "/opt/foundry_x/pdk/"
+banned_prefixes: []
+
+# Foundry / process / library tokens that must NEVER leak. Examples of
+# categories to fill in (use real names in the .private.yaml, not here):
+#   - process node code        (e.g. "YOUR_NODE_CODE")
+#   - foundry short name       (e.g. "YOUR_FOUNDRY")
+#   - PDK / dkit family code   (e.g. "YOUR_DKIT_CODE")
+#   - standard-cell lib prefix (e.g. "YOUR_STDCELL_PREFIX")
+banned_tokens: []
+
+# Optional raw regexes. Leave empty unless you have directive lines
+# that the banned_prefixes / banned_tokens scans cannot catch.
+model_regex: []
+
+# Design-space tokens that must be preserved verbatim through scrubbing
+# so the LLM/agent can reason about them. Extend for each new DUT.
+preserve_tokens:
+  - "top_tt"
+  - "matching_test"
+  - "WBL"
+  - "WWL"
+  - "vdd"
+  - "vss"
+  - "gnd"
+  - "h_in_mid"
+  - "H_IN"
