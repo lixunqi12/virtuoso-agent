@@ -111,7 +111,8 @@ def _mock_worker(
     w.cfg = mock.Mock(
         remote_host="testhost",
         hspice_bin="/apps/hspice",
-        wall_timeout_s=600.0,
+        hard_ceiling_s=14400.0,
+        idle_timeout_s=600.0,
     )
     if run_raises is not None:
         w.run.side_effect = run_raises

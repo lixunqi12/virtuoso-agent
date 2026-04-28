@@ -179,6 +179,12 @@ def _normalize_patterns(patterns: dict | None) -> dict:
 
     Round-2 (codex review): runs :func:`_validate_patterns` so inline
     callers get the same fail-closed guarantee as the YAML loader.
+
+    Round-3 (codex N1): includes ``mosfet_param_whitelist`` — a set of
+    generic SPICE MOSFET parameter names that survive the second-pass
+    filter on ``<redacted>``-touching element lines. Missing key OR
+    explicit empty list disables the second pass entirely (back-compat
+    with deployments whose YAML predates the filter).
     """
     patterns = patterns or {}
     normalised = {
@@ -196,6 +202,11 @@ def _normalize_patterns(patterns: dict | None) -> dict:
                 patterns.get("preserve_tokens")
                 or ["top_tt", "matching_test"]
             ) if t
+        ],
+        "mosfet_param_whitelist": [
+            str(p).lower()
+            for p in (patterns.get("mosfet_param_whitelist") or [])
+            if p
         ],
     }
     _validate_patterns(normalised)
@@ -257,6 +268,107 @@ def _sub_with_preserve(
     return pattern.sub(cb, text)
 
 
+# Round-3 (codex N1) — second-pass MOSFET param whitelist filter.
+# Tokenizer that keeps single/double-quoted runs intact so behavioural
+# expressions like ``Q='V(a) * 1p'`` survive as a single token.
+_PARAM_TOKEN_RE = re.compile(r"(?:[^\s'\"]+|'[^']*'|\"[^\"]*\")+")
+
+
+# N3 R2 (codex): mirror the ``_FOUNDRY_LEAK_RE`` posture — Python holds
+# the strong default; YAML's ``mosfet_param_whitelist`` is *additive*
+# only. This way the production runtime (``load_patterns()`` →
+# ``private.yaml`` which usually omits the key) still scrubs PDK
+# extraction params, instead of silently disabling the pass.
+#
+# Default = 12 generic SPICE MOSFET geometry / sizing names + 4 standard
+# user-authored HSpice instance params (initial condition, per-element
+# temperature override / delta, operating-region selector). YAML can
+# extend with site-specific names but cannot subtract from this set.
+_DEFAULT_MOSFET_WHITELIST: frozenset[str] = frozenset({
+    "l", "w", "m", "nf", "multi",
+    "ad", "as", "pd", "ps",
+    "nrd", "nrs", "sd",
+    "ic", "temp", "dtemp", "region",
+})
+
+
+def _filter_mosfet_params_line(
+    line: str, whitelist_lower: frozenset[str],
+) -> str:
+    """Drop ``key=value`` tokens whose key (lowercased) is not in the
+    whitelist. Non-param tokens (refdes, nets, ``<redacted>`` marker,
+    bare keywords) are kept verbatim. Leading whitespace (the ``+``
+    indent or just spaces) is preserved so continuation rendering is
+    unchanged.
+    """
+    leading_len = len(line) - len(line.lstrip())
+    leading = line[:leading_len]
+    body = line[leading_len:]
+    tokens = _PARAM_TOKEN_RE.findall(body)
+    kept: list[str] = []
+    for tok in tokens:
+        if "=" in tok and not tok.startswith("="):
+            key = tok.split("=", 1)[0]
+            if key.lower() in whitelist_lower:
+                kept.append(tok)
+            # else: drop foundry-extraction param token
+        else:
+            kept.append(tok)
+    return leading + " ".join(kept)
+
+
+def _apply_mosfet_param_whitelist(
+    text: str, extra_whitelist: "Iterable[str] | frozenset[str]" = (),
+) -> str:
+    """Walk lines; when a non-continuation line contains ``<redacted>``
+    open a foundry-instance block. Filter that line and any following
+    ``+`` continuation lines down to a whitelist of allowed param keys.
+    ``*`` comments and blank lines pass through verbatim and do NOT
+    terminate the block (mirrors :func:`_join_continuations` in
+    netlist_reader). The next non-continuation, non-comment, non-blank
+    line resets the state.
+
+    The effective whitelist is the union of :data:`_DEFAULT_MOSFET_WHITELIST`
+    (Python source-of-truth, 16 names) and ``extra_whitelist`` (YAML
+    additions, lowercased). Defaults always fire — passing an empty
+    iterable does NOT disable the second pass. This mirrors the
+    ``_FOUNDRY_LEAK_RE`` posture so the production runtime path
+    (``load_patterns()`` → ``private.yaml`` which typically omits the
+    key) still scrubs PDK extraction params.
+    """
+    effective = _DEFAULT_MOSFET_WHITELIST | frozenset(
+        str(name).lower() for name in extra_whitelist
+    )
+    out: list[str] = []
+    in_block = False
+    for raw in text.split("\n"):
+        suffix = ""
+        body = raw
+        if body.endswith("\r"):
+            suffix = "\r"
+            body = body[:-1]
+        stripped = body.strip()
+        if not stripped:
+            out.append(raw)
+            continue
+        if stripped.startswith("*"):
+            out.append(raw)
+            continue
+        if stripped.startswith("+"):
+            if in_block:
+                body = _filter_mosfet_params_line(body, effective)
+            out.append(body + suffix)
+            continue
+        # Non-comment / non-blank / non-continuation line: this line
+        # opens a (possibly empty) new block. Membership is decided by
+        # whether the foundry-redaction marker appears here.
+        in_block = "<redacted>" in body
+        if in_block:
+            body = _filter_mosfet_params_line(body, effective)
+        out.append(body + suffix)
+    return "\n".join(out)
+
+
 def _apply_scrub(text: str, patterns: dict) -> str:
     """Core scrub sequence applied by all three public scrubbers.
 
@@ -313,6 +425,22 @@ def _apply_scrub(text: str, patterns: dict) -> str:
             flags=re.IGNORECASE,
         )
         text = _sub_with_preserve(text, tok_re, "<redacted>", preserve)
+
+    # 6. MOSFET-param whitelist second pass. On element lines already
+    #    touched by foundry-token redaction (the ``<redacted>`` marker
+    #    survives steps 4 + 5), drop key=value pairs whose key isn't in
+    #    the effective whitelist.
+    #
+    #    N3 R2 (codex): the filter ALWAYS runs — :data:`_DEFAULT_MOSFET_WHITELIST`
+    #    (16 standard SPICE/HSpice MOS instance params) is the Python
+    #    source-of-truth; YAML's ``mosfet_param_whitelist`` is *additive*
+    #    only and cannot disable any default. Mirrors the
+    #    ``_FOUNDRY_LEAK_RE`` posture so the production
+    #    ``load_patterns()`` path still scrubs PDK extraction params
+    #    even when the deployment YAML omits the key.
+    text = _apply_mosfet_param_whitelist(
+        text, patterns.get("mosfet_param_whitelist", []),
+    )
 
     return text
 

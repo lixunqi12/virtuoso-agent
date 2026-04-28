@@ -264,7 +264,7 @@ class MinimaxClient(LLMClient):
 
     Default base_url points at ``api.minimaxi.com`` (domestic China);
     override MINIMAX_BASE_URL for the overseas endpoint. Default model
-    is ``MiniMax-M2``; override via MINIMAX_MODEL env or ``--model``.
+    is ``MiniMax-M2.7``; override via MINIMAX_MODEL env or ``--model``.
     """
 
     def __init__(
@@ -283,7 +283,7 @@ class MinimaxClient(LLMClient):
             ),
             max_retries=max_retries,
         )
-        self.model = model or os.environ.get("MINIMAX_MODEL", "MiniMax-M2")
+        self.model = model or os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         import openai
@@ -325,7 +325,7 @@ class MinimaxClient(LLMClient):
         msg = choice.message
         content = (msg.content or "").strip()
         if not content:
-            # MiniMax-M2 is a reasoning model and may return the full
+            # MiniMax-M2.7 is a reasoning model and may return the full
             # reply in `reasoning_content` when the visible content is
             # consumed by thinking tokens.
             reasoning = getattr(msg, "reasoning_content", None) or ""

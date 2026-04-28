@@ -29,11 +29,15 @@ sys.path.insert(0, str(REPO))
 
 from src.agent import (  # noqa: E402
     CircuitAgent,
+    HspiceAgent,
     SAFEGUARD_AMP_HOLD_MIN,
     SAFEGUARD_CONSECUTIVE_LIMIT,
+    TOPOLOGY_SANITY_VIOLATION_LIMIT,
     _VALID_DESIGN_VAR_NAMES,
     _coerce_float,
+    _has_sanity_violation,
 )
+from src.hspice_worker import HspiceRunResult  # noqa: E402
 
 
 # ---------------------------------------------------------------- #
@@ -1094,4 +1098,377 @@ class TestUnselectResultCleanup:
         assert "read_op_point_after_tran failed" in caplog.text
         assert "RuntimeError" in caplog.text
         assert "selectResult('tranOp) failed; tran may not have run" in caplog.text
+
+
+# ---------------------------------------------------------------- #
+#  T8.8 — topology abort_reason classification
+# ---------------------------------------------------------------- #
+
+_SUSPECT_HI = "UNMEASURABLE (suspect: value 1e6 > sanity hi 1e3)"
+_SUSPECT_LO = "UNMEASURABLE (suspect: value -5 < sanity lo 0)"
+
+
+class TestHasSanityViolation:
+    """Direct unit-tests of the sanity-violation detector."""
+
+    def test_suspect_hi_detected(self):
+        assert _has_sanity_violation({"f_osc": _SUSPECT_HI}) is True
+
+    def test_suspect_lo_detected(self):
+        assert _has_sanity_violation({"f_osc": _SUSPECT_LO}) is True
+
+    def test_pass_only_returns_false(self):
+        assert _has_sanity_violation({"f_osc": "PASS", "Vpp": "PASS"}) is False
+
+    def test_plain_fail_returns_false(self):
+        assert _has_sanity_violation({"f_osc": "FAIL (above 20.5)"}) is False
+
+    def test_other_unmeasurable_flavors_not_topology(self):
+        """Non-suspect UNMEASURABLE flavors are instrumentation problems,
+        not topology — must NOT trip the topology streak."""
+        assert _has_sanity_violation(
+            {"f_osc": "UNMEASURABLE (no value)"}
+        ) is False
+        assert _has_sanity_violation(
+            {"f_osc": "UNMEASURABLE (DumpStatus.TIMEOUT)"}
+        ) is False
+        assert _has_sanity_violation(
+            {"f_osc": "UNMEASURABLE (mean: needs >=2 finite samples)"}
+        ) is False
+
+    def test_empty_dict_returns_false(self):
+        assert _has_sanity_violation({}) is False
+
+    def test_none_returns_false(self):
+        assert _has_sanity_violation(None) is False
+
+    def test_mixed_dict_any_suspect_trips(self):
+        """A single sanity-violating metric is enough."""
+        pf = {"f_osc": "PASS", "Vpp": _SUSPECT_HI, "noise": "FAIL (above 1)"}
+        assert _has_sanity_violation(pf) is True
+
+    def test_non_string_values_ignored(self):
+        """Defensive: numeric/None values can't start with the prefix."""
+        assert _has_sanity_violation({"f_osc": 0.0, "Vpp": None}) is False
+
+
+def _simulate_topology_streak(verdicts: list[dict]) -> tuple[bool, int]:
+    """Walk the topology streak rule across a sequence of pass_fail dicts.
+
+    Returns (would_relabel_at_max_iter, final_streak). Mirrors the rule
+    in agent.py: increment on any sanity-violation, reset to 0 otherwise.
+    Relabel iff final streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT.
+    """
+    streak = 0
+    for pf in verdicts:
+        if _has_sanity_violation(pf):
+            streak += 1
+        else:
+            streak = 0
+    return (streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT, streak)
+
+
+class TestTopologyStreak:
+    """Streak-counter semantics (mirrors TestSafeguardStreak shape)."""
+
+    def test_three_consecutive_relabel(self):
+        relabel, n = _simulate_topology_streak(
+            [{"m": _SUSPECT_HI}] * 3
+        )
+        assert relabel is True
+        assert n == 3
+
+    def test_two_consecutive_keep_max_iter(self):
+        relabel, n = _simulate_topology_streak(
+            [{"m": _SUSPECT_HI}] * 2
+        )
+        assert relabel is False
+        assert n == 2
+
+    def test_recovery_iter_resets_streak(self):
+        """Final streak — not 'ever happened' — drives relabel.
+        Sequence: 3 violations, then a recovery iter, then 2 violations.
+        Final streak = 2 < 3, so DON'T relabel."""
+        seq = (
+            [{"m": _SUSPECT_HI}] * 3
+            + [{"m": "FAIL (above 1)"}]
+            + [{"m": _SUSPECT_LO}] * 2
+        )
+        relabel, n = _simulate_topology_streak(seq)
+        assert relabel is False
+        assert n == 2
+
+    def test_pass_iter_resets_streak(self):
+        relabel, n = _simulate_topology_streak(
+            [{"m": _SUSPECT_HI}, {"m": _SUSPECT_HI}, {"m": "PASS"}]
+        )
+        assert relabel is False
+        assert n == 0
+
+    def test_other_unmeasurable_does_not_advance(self):
+        """Instrumentation-flavor UNMEASURABLE is a streak reset."""
+        relabel, n = _simulate_topology_streak(
+            [{"m": _SUSPECT_HI}, {"m": "UNMEASURABLE (no value)"},
+             {"m": _SUSPECT_HI}, {"m": _SUSPECT_HI}]
+        )
+        assert relabel is False
+        assert n == 2
+
+    def test_more_than_limit_still_relabels(self):
+        relabel, n = _simulate_topology_streak(
+            [{"m": _SUSPECT_HI}] * 7
+        )
+        assert relabel is True
+        assert n == 7
+
+
+class TestTopologyClassifierOcean:
+    """End-to-end OCEAN-path: agent.run() must relabel max_iter→topology
+    when the LAST N consecutive iters all carry sanity-violations."""
+
+    @staticmethod
+    def _llm_response(design_vars: dict, pass_fail: dict) -> str:
+        import json
+        payload = {
+            "design_vars": design_vars,
+            # amp_hold > 0.3 prevents safeguard from firing first.
+            "measurements": {"amp_hold_ratio": 0.95, "f_osc_GHz": 19.9},
+            "pass_fail": pass_fail,
+            "reasoning": "mock",
+        }
+        return "```json\n" + json.dumps(payload) + "\n```"
+
+    @staticmethod
+    def _wire(agent, responses: list[str]) -> None:
+        agent.llm.chat.side_effect = responses
+        agent.bridge.run_ocean_sim.return_value = {
+            "ok": True,
+            "measurements": {"amp_hold_ratio": 0.95, "f_osc_GHz": 19.9},
+        }
+        agent.bridge.write_and_save_maestro.return_value = {
+            "ok": True, "saved": True, "wrote": 1,
+        }
+
+    def test_three_consecutive_sanity_violations_relabel_topology(self, agent):
+        """3 iters all sanity-violating + different vars (avoid stuck) →
+        max_iter relabeled to topology."""
+        sanity_pf = {"f_osc": _SUSPECT_HI}
+        # initial response + 3 in-loop responses
+        responses = [
+            self._llm_response({"nfin_cc": 12 + i}, sanity_pf)
+            for i in range(4)
+        ]
+        self._wire(agent, responses)
+        result = agent.run(
+            lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=3,
+        )
+        assert result["abort_reason"] == "topology"
+        assert result["converged"] is False
+
+    def test_two_consecutive_keeps_max_iter(self, agent):
+        """Threshold strictly N=3; only 2 sanity iters → max_iter."""
+        responses = [
+            self._llm_response({"nfin_cc": 12}, {"f_osc": "FAIL (above 20.5)"}),
+            self._llm_response({"nfin_cc": 13}, {"f_osc": "FAIL (above 20.5)"}),
+            self._llm_response({"nfin_cc": 14}, {"f_osc": _SUSPECT_HI}),
+            self._llm_response({"nfin_cc": 15}, {"f_osc": _SUSPECT_HI}),
+        ]
+        self._wire(agent, responses)
+        result = agent.run(
+            lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=3,
+        )
+        assert result["abort_reason"] == "max_iter"
+
+    def test_recovery_iter_resets_streak_keeps_max_iter(self, agent):
+        """3 sanity iters, then 1 plain-FAIL iter, then 1 sanity iter:
+        final streak=1 < 3, so still max_iter (not topology)."""
+        responses = [
+            self._llm_response({"nfin_cc": 12}, {"f_osc": _SUSPECT_HI}),
+            self._llm_response({"nfin_cc": 13}, {"f_osc": _SUSPECT_HI}),
+            self._llm_response({"nfin_cc": 14}, {"f_osc": _SUSPECT_HI}),
+            self._llm_response({"nfin_cc": 15}, {"f_osc": "FAIL (above 1)"}),
+            self._llm_response({"nfin_cc": 16}, {"f_osc": _SUSPECT_HI}),
+            self._llm_response({"nfin_cc": 17}, {"f_osc": _SUSPECT_HI}),
+        ]
+        self._wire(agent, responses)
+        result = agent.run(
+            lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=5,
+        )
+        assert result["abort_reason"] == "max_iter"
+
+    def test_other_unmeasurable_flavor_does_not_relabel(self, agent):
+        """UNMEASURABLE (no value) is instrumentation, not topology —
+        max_iter, not topology."""
+        responses = [
+            self._llm_response(
+                {"nfin_cc": 12 + i},
+                {"f_osc": "UNMEASURABLE (no value)"},
+            )
+            for i in range(4)
+        ]
+        self._wire(agent, responses)
+        result = agent.run(
+            lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=3,
+        )
+        assert result["abort_reason"] == "max_iter"
+
+    def test_converged_does_not_relabel(self, agent):
+        """If the run converges, abort_reason stays None even if earlier
+        iters had sanity-violations (only matters at max_iter)."""
+        # Iter 1: sanity-violation. Iter 2: PASS → converged.
+        sanity_pf = {"f_osc": _SUSPECT_HI}
+        pass_pf = {"f_osc": "PASS"}
+        responses = [
+            self._llm_response({"nfin_cc": 12}, sanity_pf),
+            self._llm_response({"nfin_cc": 13}, sanity_pf),
+            self._llm_response({"nfin_cc": 14}, pass_pf),
+        ]
+        self._wire(agent, responses)
+        # _log_final_converged_values reads bridge._scope_lib/_scope_tb_cell;
+        # with a MagicMock bridge those auto-resolve to MagicMocks and the
+        # SafeBridge log helper rejects them. Pin to None to keep the test
+        # focused on abort_reason classification.
+        agent.bridge._scope_lib = None
+        agent.bridge._scope_tb_cell = None
+        result = agent.run(
+            lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=3,
+        )
+        assert result["abort_reason"] is None
+        assert result["converged"] is True
+
+
+class TestTopologyClassifierHspice:
+    """End-to-end HSpice-path: HspiceAgent.run() must relabel max_iter→
+    topology when the last N iters all carry sanity-violations."""
+
+    @staticmethod
+    def _llm_response(design_vars: dict) -> str:
+        import json
+        payload = {
+            "design_vars": design_vars,
+            "measurements": {},
+            "pass_fail": {},
+            "reasoning": "mock",
+        }
+        return "```json\n" + json.dumps(payload) + "\n```"
+
+    @staticmethod
+    def _build_agent(monkeypatch):
+        """HspiceAgent with mocks that bypass ssh / hspice entirely.
+
+        The remote patcher and the worker are MagicMocks; evaluate_hspice
+        is monkey-patched with a programmable side_effect so each iter's
+        pass_fail can be controlled."""
+        from unittest.mock import MagicMock
+
+        from src import agent as _agent_mod
+        from src.hspice_resolver import EvaluationResult
+        from src.remote_patch import RemotePatchResult
+
+        agent = HspiceAgent.__new__(HspiceAgent)
+        agent.llm = MagicMock()
+        agent.worker = MagicMock()
+        agent.spec_text = "spec"
+        agent.spec_metrics = [{"name": "f_osc"}]
+        agent.whitelist = frozenset({"nfin_cc"})
+        agent.remote_target_path = "/remote/target.sp"
+        agent.remote_run_path = "/remote/run.sp"
+        agent._remote_patcher = MagicMock()
+        agent.history = []
+
+        agent._remote_patcher.patch.return_value = RemotePatchResult(
+            keys_patched=1, backup_path="/remote/backup",
+            noop=False, backup_already_existed=False,
+        )
+
+        # worker.run returns a real-ish HspiceRunResult; mt_files content
+        # is irrelevant because evaluate_hspice is also mocked.
+        agent.worker.run.return_value = HspiceRunResult(
+            returncode=0, stdout_scrubbed="", stderr_scrubbed="",
+            mt_files={}, lis_scrubbed=None,
+            run_dir_remote="/remote/run", sp_base="run",
+        )
+
+        return agent, _agent_mod, EvaluationResult
+
+    def test_three_consecutive_sanity_violations_relabel_topology(
+        self, monkeypatch
+    ):
+        agent, mod, EvaluationResult = self._build_agent(monkeypatch)
+        # initial + 3 in-loop responses
+        responses = [
+            self._llm_response({"nfin_cc": 12 + i}) for i in range(4)
+        ]
+        agent.llm.chat.side_effect = responses
+
+        sanity_eval = EvaluationResult(
+            measurements={"f_osc": [1e6]},
+            pass_fail={"f_osc": _SUSPECT_HI},
+            per_row_verdicts={"f_osc": [_SUSPECT_HI]},
+        )
+        monkeypatch.setattr(
+            mod, "evaluate_hspice", lambda mt, m: sanity_eval,
+        )
+
+        result = agent.run(max_iter=3)
+        assert result["abort_reason"] == "topology"
+        assert result["converged"] is False
+
+    def test_two_consecutive_keeps_max_iter(self, monkeypatch):
+        agent, mod, EvaluationResult = self._build_agent(monkeypatch)
+        responses = [
+            self._llm_response({"nfin_cc": 12 + i}) for i in range(4)
+        ]
+        agent.llm.chat.side_effect = responses
+
+        evals = [
+            EvaluationResult(
+                measurements={"f_osc": [0.0]},
+                pass_fail={"f_osc": "FAIL (above 1)"},
+                per_row_verdicts={"f_osc": ["FAIL (above 1)"]},
+            ),
+            EvaluationResult(
+                measurements={"f_osc": [1e6]},
+                pass_fail={"f_osc": _SUSPECT_HI},
+                per_row_verdicts={"f_osc": [_SUSPECT_HI]},
+            ),
+            EvaluationResult(
+                measurements={"f_osc": [1e6]},
+                pass_fail={"f_osc": _SUSPECT_HI},
+                per_row_verdicts={"f_osc": [_SUSPECT_HI]},
+            ),
+        ]
+        eval_iter = iter(evals)
+        monkeypatch.setattr(
+            mod, "evaluate_hspice", lambda mt, m: next(eval_iter),
+        )
+
+        result = agent.run(max_iter=3)
+        assert result["abort_reason"] == "max_iter"
+
+    def test_converged_does_not_relabel(self, monkeypatch):
+        agent, mod, EvaluationResult = self._build_agent(monkeypatch)
+        responses = [self._llm_response({"nfin_cc": 12}) for _ in range(3)]
+        agent.llm.chat.side_effect = responses
+
+        evals = [
+            EvaluationResult(
+                measurements={"f_osc": [1e6]},
+                pass_fail={"f_osc": _SUSPECT_HI},
+                per_row_verdicts={"f_osc": [_SUSPECT_HI]},
+            ),
+            EvaluationResult(
+                measurements={"f_osc": [19.9]},
+                pass_fail={"f_osc": "PASS"},
+                per_row_verdicts={"f_osc": ["PASS"]},
+            ),
+        ]
+        eval_iter = iter(evals)
+        monkeypatch.setattr(
+            mod, "evaluate_hspice", lambda mt, m: next(eval_iter),
+        )
+
+        result = agent.run(max_iter=5)
+        assert result["abort_reason"] is None
+        assert result["converged"] is True
 

@@ -24,6 +24,10 @@ from src.hspice_scrub import (
     scrub_mt0,
     scrub_sp,
 )
+from src.hspice_scrub import (  # private helpers exercised in unit tests
+    _DEFAULT_MOSFET_WHITELIST,
+    _apply_mosfet_param_whitelist,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +67,7 @@ xcore h_in_mid g s b nch_hvt w=2u l=60n
 def mt0_text() -> str:
     return """\
 $DATA1 SOURCE='HSPICE' VERSION='2021.09'
-.TITLE '/proj/user/work/matching_test.sp'
+.TITLE '/proj/user/work/dut_tb.sp'
 .ALTER top_tt
 vout_pp       hmid_avg
 0.842e+00     0.405e+00
@@ -74,7 +78,7 @@ vout_pp       hmid_avg
 def lis_text() -> str:
     return """\
 HSPICE -- Version 2021.09
-Input File: /usr/local/dkits/tsmcN16/tb/matching_test.sp
+Input File: /usr/local/dkits/tsmcN16/tb/dut_tb.sp
 
 **** operating point information ****
  element   0:main:xmn0
@@ -536,3 +540,193 @@ class TestEdgeCases:
             },
         )
         assert "h_in_mid" in out
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (codex N1) — MOSFET-param whitelist second pass.
+# On `<redacted>`-touching element lines, drop foundry-extraction params
+# (dfm_flag, spmt, sapb, ...) while keeping generic SPICE params (l, w,
+# m, nf, multi, ad, as, pd, ps, nrd, nrs, sd). Continuation lines
+# inherit the trigger from the line that opened them.
+# ---------------------------------------------------------------------------
+
+_MOSFET_WHITELIST_PATTERNS = {
+    "mosfet_param_whitelist": [
+        "l", "w", "m", "nf", "multi",
+        "ad", "as", "pd", "ps",
+        "nrd", "nrs", "sd",
+    ],
+}
+
+
+class TestMosfetParamWhitelist:
+    def test_mosfet_whitelist_drops_foundry_params(self) -> None:
+        text = (
+            "xmm1 a b c d <redacted> l=30e-9 w=140e-9 dfm_flag=0 "
+            "spmt=1.11e15 sapb=114e-9\n"
+        )
+        out = scrub_sp(text, patterns=_MOSFET_WHITELIST_PATTERNS)
+        assert "l=30e-9" in out
+        assert "w=140e-9" in out
+        assert "dfm_flag" not in out
+        assert "spmt" not in out
+        assert "sapb" not in out
+        # Refdes / nets / marker survive verbatim.
+        assert "xmm1" in out
+        assert "<redacted>" in out
+
+    def test_passive_params_unaffected(self) -> None:
+        text = "R1 a b 1k tc1=2e-3 tc2=3e-6\n"
+        out = scrub_sp(text, patterns=_MOSFET_WHITELIST_PATTERNS)
+        # No <redacted> on this line, second pass skips it entirely.
+        assert "tc1=2e-3" in out
+        assert "tc2=3e-6" in out
+
+    def test_user_subckt_unaffected(self) -> None:
+        text = "xi1 a b c USER_CELL length=2 width=4\n"
+        out = scrub_sp(text, patterns=_MOSFET_WHITELIST_PATTERNS)
+        assert "length=2" in out
+        assert "width=4" in out
+        assert "USER_CELL" in out
+
+    def test_continuation_params_filtered(self) -> None:
+        text = (
+            "xmm8 net10 net10 vss vss <redacted> l=30e-9 w=280e-9 "
+            "multi=1 nf=1\n"
+            "+ sd=100e-9 ad=21e-15 as=21e-15 dfm_flag=0 "
+            "spmt=1.11111e15\n"
+        )
+        out = scrub_sp(text, patterns=_MOSFET_WHITELIST_PATTERNS)
+        # Trigger line: whitelist params survive, foundry params gone.
+        assert "l=30e-9" in out
+        assert "w=280e-9" in out
+        assert "multi=1" in out
+        assert "nf=1" in out
+        # Continuation line: same filter applies.
+        assert "sd=100e-9" in out
+        assert "ad=21e-15" in out
+        assert "as=21e-15" in out
+        assert "dfm_flag" not in out
+        assert "spmt" not in out
+
+    def test_idempotent(self) -> None:
+        text = (
+            "xmm1 a b c d <redacted> l=30e-9 dfm_flag=0\n"
+            "R1 a b 1k tc1=2e-3\n"
+        )
+        once = scrub_sp(text, patterns=_MOSFET_WHITELIST_PATTERNS)
+        twice = scrub_sp(once, patterns=_MOSFET_WHITELIST_PATTERNS)
+        assert once == twice
+
+    def test_default_whitelist_active_when_yaml_missing(self) -> None:
+        """N3 R2 (codex): mirror the ``_FOUNDRY_LEAK_RE`` posture —
+        Python holds the strong default; YAML's ``mosfet_param_whitelist``
+        is *additive* only and cannot disable any default. Both an
+        explicit empty list AND a missing key STILL trigger the second
+        pass via :data:`_DEFAULT_MOSFET_WHITELIST`. This test ensures
+        the production runtime path (where ``private.yaml`` typically
+        omits the key) actually scrubs PDK extraction params instead
+        of silently disabling the filter.
+        """
+        text = "xmm1 a b c d <redacted> l=30e-9 dfm_flag=0 spmt=1.11e15\n"
+        # Explicit empty list — defaults still active.
+        out_empty = scrub_sp(text, patterns={"mosfet_param_whitelist": []})
+        assert "l=30e-9" in out_empty
+        assert "dfm_flag" not in out_empty
+        assert "spmt" not in out_empty
+        # Missing key — same behaviour (defaults still active).
+        out_missing = scrub_sp(text, patterns={})
+        assert "l=30e-9" in out_missing
+        assert "dfm_flag" not in out_missing
+        assert "spmt" not in out_missing
+        # Direct helper call with empty extra-list confirms defaults.
+        out_direct = _apply_mosfet_param_whitelist(text, [])
+        assert "l=30e-9" in out_direct
+        assert "dfm_flag" not in out_direct
+        assert "spmt" not in out_direct
+
+    def test_yaml_extends_default_whitelist(self) -> None:
+        """YAML-supplied names ADD to the Python default; both the
+        Python default and the YAML extension survive on the same line.
+        """
+        text = (
+            "xmm1 d g s b <redacted> l=30e-9 my_custom_param=42 "
+            "dfm_flag=0\n"
+        )
+        out = scrub_sp(
+            text, patterns={"mosfet_param_whitelist": ["my_custom_param"]},
+        )
+        assert "l=30e-9" in out  # default whitelist
+        assert "my_custom_param=42" in out  # YAML extension
+        assert "dfm_flag" not in out  # neither — gets dropped
+
+    def test_load_patterns_default_path_activates_filter(self) -> None:
+        """End-to-end production path: ``load_patterns()`` with no
+        args returns the deployment YAML (private if present, else
+        template). Even when neither carries the whitelist key, the
+        Python default activates the filter and PDK extraction params
+        are stripped. This is the regression guard for the silent-
+        disable bug codex caught in N3 R1.
+        """
+        text = (
+            "xmm1 d g s b nch_lvt l=30e-9 ic='V(out)=0.5V' "
+            "temp='27 + 5' m=2 dfm_flag=0 spmt=1.11e15\n"
+        )
+        patterns = load_patterns()
+        out = scrub_sp(text, patterns)
+        # Foundry token redacted by pass 1, params filtered by pass 2.
+        assert "<redacted>" in out
+        assert "nch_lvt" not in out
+        # Default whitelist members survive (l, ic, temp, m).
+        assert "l=30e-9" in out
+        assert "ic='V(out)=0.5V'" in out
+        assert "temp='27 + 5'" in out
+        assert "m=2" in out
+        # Foundry-extraction params dropped.
+        assert "dfm_flag" not in out
+        assert "spmt" not in out
+
+    def test_default_whitelist_constant_shape(self) -> None:
+        """Source-of-truth check on the hardcoded default — guards
+        against an accidental rename / removal of one of the 16
+        canonical keys.
+        """
+        expected = frozenset({
+            "l", "w", "m", "nf", "multi",
+            "ad", "as", "pd", "ps",
+            "nrd", "nrs", "sd",
+            "ic", "temp", "dtemp", "region",
+        })
+        assert _DEFAULT_MOSFET_WHITELIST == expected
+
+    def test_case_insensitive_whitelist(self) -> None:
+        text = "xmm1 a b c d <redacted> L=30e-9 W=140e-9 DFM_flag=0\n"
+        out = scrub_sp(text, patterns=_MOSFET_WHITELIST_PATTERNS)
+        # Whitelist matches by lowercased key, so uppercase L / W survive.
+        assert "L=30e-9" in out
+        assert "W=140e-9" in out
+        # DFM_flag is not in the whitelist regardless of case.
+        assert "DFM_flag" not in out
+
+    def test_bsim4_instance_params_preserved(self) -> None:
+        """N3 (codex): ``ic`` / ``temp`` / ``dtemp`` / ``region`` are
+        standard HSpice MOS instance params that are user-authored
+        (initial condition, per-element temperature override / delta,
+        operating-region selector) — not PDK extraction residue. The
+        12-name whitelist over-pruned them; N3 extends to 16.
+        """
+        text = (
+            "xmm1 d g s b <redacted> "
+            "l=30e-9 ic='V(out)=0.5V' temp='27 + 5' m=2 dtemp=5 region=0\n"
+        )
+        out = scrub_sp(text, {"mosfet_param_whitelist": [
+            "l", "w", "m", "nf", "multi", "ad", "as", "pd", "ps",
+            "nrd", "nrs", "sd", "ic", "temp", "dtemp", "region",
+        ]})
+        for surviving in (
+            "l=30e-9", "ic=", "temp=", "m=2", "dtemp=5", "region=0",
+        ):
+            assert surviving in out, f"{surviving!r} dropped"
+        # Quoted-value preservation: spaces inside quotes survive.
+        assert "ic='V(out)=0.5V'" in out
+        assert "temp='27 + 5'" in out

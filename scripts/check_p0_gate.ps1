@@ -6,12 +6,19 @@
 # .pytest_cache, .quarantine, and logs/ are out of scope because they
 # are either third-party or already-isolated artifacts.
 #
-# Three files are authorized GREP-GATE EXCEPTIONs:
-#   - src/safe_bridge.py (authoritative banned-pattern list for _scrub)
-#   - tests/test_safe_bridge.py (synthetic stand-ins for scrubber tests)
-#   - scripts/check_p0_gate.ps1 (this script defines the banned-pattern
-#     regex literal, so it must contain the tokens by construction)
-# Any other hit fails the gate.
+# Phase-1 (repo scan) consults config/p0_gate_allowlist.yaml as the
+# single source of truth for legitimate carriers. The yaml has two
+# required keys:
+#   paths         : exact relative paths (forward-slash) allowed to
+#                   contain banned tokens
+#   path_prefixes : relative directory prefixes (forward-slash, with
+#                   trailing slash) — any file whose path begins with
+#                   one of these is allowed
+# The yaml itself includes scripts/check_p0_gate.ps1 (this script
+# defines the banned-pattern regex literal, so it must contain the
+# tokens by construction) and src/safe_bridge.py + tests/test_safe_bridge.py
+# (authoritative banned-pattern list for _scrub and its synthetic test
+# stand-ins). Any other hit fails the gate.
 #
 # T6 (2026-04-23): additive second phase scans the HSpice work-dir
 # artifacts ({HSPICE_WORK_DIR}/**/*.{sp,mt[0-9]*,lis}) against the T1
@@ -35,24 +42,135 @@ Set-Location $RepoRoot
 
 $Banned = 'nch_|pch_|cfmom|rppoly|rm1_|tsmc|tcbn'
 
-# Excluded top-level directories (third-party or isolated artifacts).
+# Excluded top-level directories (third-party, isolated artifacts, or
+# runtime scratch). `tmp` is operator-local scratch — anything that
+# matters out of `tmp` should land in a tracked location first.
 $ExcludedTop = @(
     '.venv', 'venv',
     '.quarantine',
     'logs',
     '.git',
-    '.idea', '.vscode'
+    '.idea', '.vscode',
+    'tmp'
 )
 # Directory-name components that are excluded at any depth (generated
 # build artifacts that may contain stale compiled strings).
 $ExcludedAnywhere = @('__pycache__', '.pytest_cache')
 
-# GREP-GATE EXCEPTION files (relative path from repo root, forward slash).
-$Allowed = @(
-    'src/safe_bridge.py',
-    'tests/test_safe_bridge.py',
-    'scripts/check_p0_gate.ps1'
-)
+# Top-level files that are excluded outright (transient logs / chat
+# captures that naturally carry foundry token discussion).
+$ExcludedFiles = @('.chat_recent.jsonl')
+
+
+function Read-AllowlistYaml {
+    # Strict parser for config/p0_gate_allowlist.yaml. Mirrors the
+    # Read-HspiceScrubYaml posture (T6 R3 fail-closed): unknown top-level
+    # keys, inline flow other than [], scalar RHS, orphaned list items,
+    # missing required keys, and YAML list-item metasyntax on unquoted
+    # values all throw rather than silently relaxing the allowlist.
+    # Known top-level keys: paths, path_prefixes. Both required.
+    # Privacy posture: errors carry only "line=<n> category=<token>" -
+    # the offending key/value is never embedded.
+    # Returns a PSCustomObject with Paths, PathPrefixes (each List[string]).
+    param([Parameter(Mandatory)][string]$Path)
+
+    $paths    = New-Object System.Collections.Generic.List[string]
+    $prefixes = New-Object System.Collections.Generic.List[string]
+    $seenKeys = New-Object System.Collections.Generic.HashSet[string]
+    $knownKeys = @('paths','path_prefixes')
+    $required  = @('paths','path_prefixes')
+    $currentKey = $null
+    $lineNo = 0
+
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        $lineNo++
+        if ($line -match '^\s*#' -or $line -match '^\s*$') { continue }
+
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$') {
+            $key = $Matches[1]
+            $rhs = $Matches[2]
+            if ($knownKeys -notcontains $key) {
+                throw "yaml_parse_fail: line=$lineNo category=unknown_top_level_key"
+            }
+            $null = $seenKeys.Add($key)
+            if ($rhs -eq '') {
+                $currentKey = $key
+            } elseif ($rhs -eq '[]') {
+                $currentKey = $null
+            } else {
+                throw "yaml_parse_fail: line=$lineNo category=inline_flow_or_scalar_not_supported"
+            }
+            continue
+        }
+
+        if ($line -match '^\s*-\s*(.+?)\s*$') {
+            if (-not $currentKey) {
+                throw "yaml_parse_fail: line=$lineNo category=list_item_without_key"
+            }
+            $val = $Matches[1]
+            if ($val -match '^[*&!|>]') {
+                throw "yaml_parse_fail: line=$lineNo category=list_item_metasyntax_not_supported"
+            }
+            if ($val -match '^"(.*)"$')     { $val = $Matches[1] }
+            elseif ($val -match "^'(.*)'$") { $val = $Matches[1] }
+            switch ($currentKey) {
+                'paths'         { $null = $paths.Add($val) }
+                'path_prefixes' { $null = $prefixes.Add($val) }
+            }
+            continue
+        }
+
+        throw "yaml_parse_fail: line=$lineNo category=malformed_line"
+    }
+
+    foreach ($req in $required) {
+        if (-not $seenKeys.Contains($req)) {
+            throw "yaml_parse_fail: line=0 category=missing_required_key"
+        }
+    }
+
+    return [pscustomobject]@{
+        Paths        = $paths
+        PathPrefixes = $prefixes
+    }
+}
+
+
+# Phase-1 allowlist: fail-closed if missing or malformed. Silent fallback
+# would break the gate either direction (every file fails, OR every file
+# passes), neither of which is acceptable.
+$AllowlistYaml = Join-Path $RepoRoot 'config/p0_gate_allowlist.yaml'
+if (-not (Test-Path -LiteralPath $AllowlistYaml -PathType Leaf)) {
+    Write-Host "P0 GATE FAIL (repo): config/p0_gate_allowlist.yaml missing - cannot run phase-1 scan." -ForegroundColor Red
+    exit 1
+}
+try {
+    $Allowlist = Read-AllowlistYaml -Path $AllowlistYaml
+} catch {
+    Write-Host ("P0 GATE FAIL (repo): {0}" -f $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+
+# T8.9 R2: hard-fail if any path under config/logs/ is tracked by git.
+# config/logs/ is gitignored runtime scratch (HSpice transcripts, agent
+# logs). The phase-1 allowlist's path_prefixes entry for "config/logs/"
+# short-circuits the banned-token scan via a pure prefix match - which
+# is the correct posture for ignored local artifacts, but silently
+# admits any file that was force-added with `git add -f` past .gitignore.
+# Close the loop by forbidding *tracked* paths under config/logs/
+# outright; ignored / untracked artifacts are unaffected.
+$gitMarker = Join-Path $RepoRoot '.git'
+if (Test-Path -LiteralPath $gitMarker) {
+    $tracked = & git -C $RepoRoot ls-files -- 'config/logs' 2>$null
+    if ($LASTEXITCODE -eq 0 -and $tracked) {
+        $trackedList = @($tracked | Where-Object { $_ -and $_.Trim() })
+        if ($trackedList.Count -gt 0) {
+            Write-Host "P0 GATE FAIL (repo): config/logs/ has $($trackedList.Count) tracked file(s) - gitignored runtime artifacts must NEVER be committed (force-add bypass detected):" -ForegroundColor Red
+            foreach ($t in $trackedList) { Write-Host "  $t" -ForegroundColor Red }
+            exit 1
+        }
+    }
+}
 
 Write-Host "P0 grep gate scanning $RepoRoot ..."
 
@@ -62,6 +180,7 @@ $files = Get-ChildItem -Path $RepoRoot -Recurse -File -Force |
         $parts = $rel -split '/'
         $top = $parts[0]
         if ($ExcludedTop -contains $top) { return $false }
+        if ($parts.Count -eq 1 -and $ExcludedFiles -contains $top) { return $false }
         foreach ($p in $parts) {
             if ($ExcludedAnywhere -contains $p) { return $false }
         }
@@ -71,7 +190,12 @@ $files = Get-ChildItem -Path $RepoRoot -Recurse -File -Force |
 $leaks = @()
 foreach ($f in $files) {
     $rel = $f.FullName.Substring($RepoRoot.Path.Length + 1) -replace '\\', '/'
-    if ($Allowed -contains $rel) { continue }
+    if ($Allowlist.Paths -contains $rel) { continue }
+    $prefixHit = $false
+    foreach ($pfx in $Allowlist.PathPrefixes) {
+        if ($rel.StartsWith($pfx)) { $prefixHit = $true; break }
+    }
+    if ($prefixHit) { continue }
     try {
         $hit = Select-String -Path $f.FullName -Pattern $Banned -CaseSensitive:$false -SimpleMatch:$false -List -ErrorAction SilentlyContinue
     } catch {

@@ -11,12 +11,23 @@ section CircuitAgent feeds the LLM — it is exactly
 ``--with-summary`` to append a human-oriented ``### Summary`` tally
 (NOT sent to the agent).
 
-Usage:
+Usage (Virtuoso schematic mode):
     python scripts/read_schematic.py --lib pllLib --cell LC_VCO
     python scripts/read_schematic.py --lib pllLib --cell LC_VCO \\
         --format both --output ./out/lc_vco
     python scripts/read_schematic.py --lib pllLib --cell LC_VCO \\
         --remote-skill-dir /project/.../skill
+
+Usage (HSpice netlist mode — T8.2):
+    python scripts/read_schematic.py --netlist path/to/netlist.sp
+    python scripts/read_schematic.py --netlist netlist.sp \\
+        --testbench sch_test.sp --output ./out/dut.md
+
+Netlist mode runs the file(s) through ``src/hspice_scrub.scrub_sp``
+before parsing, then renders a per-subcircuit Markdown view that mirrors
+the schematic-mode topology format. ``--lib`` / ``--cell`` are ignored
+in netlist mode; the design library / cell come from the netlist's
+``** Design library/cell name:`` header comments.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ from dotenv import load_dotenv
 from virtuoso_bridge import VirtuosoClient
 
 from src.agent import CircuitAgent
+from src.netlist_reader import read_and_render
 from src.safe_bridge import SafeBridge
 
 # Must match the SKILL-side hard cap in safeReadSchematicDeep. Keep in
@@ -65,8 +77,32 @@ def parse_args() -> argparse.Namespace:
             "LLM-friendly dump of a single (lib, cell)."
         )
     )
-    parser.add_argument("--lib", required=True, help="Virtuoso library name")
-    parser.add_argument("--cell", required=True, help="Cell name to read")
+    # --lib/--cell are required for the Virtuoso path but unused in
+    # netlist mode. We validate the combination in main() so we can give
+    # a precise error message instead of relying on argparse's terse
+    # ``required`` failure.
+    parser.add_argument("--lib", default=None, help="Virtuoso library name (schematic mode)")
+    parser.add_argument("--cell", default=None, help="Cell name to read (schematic mode)")
+    parser.add_argument(
+        "--netlist",
+        default=None,
+        help=(
+            "Path to a HSpice .sp netlist (T8.2 — HSpice mode). When "
+            "given, --lib/--cell are ignored and the file is parsed + "
+            "scrubbed locally instead of routing through SafeBridge. "
+            "Output is always Markdown."
+        ),
+    )
+    parser.add_argument(
+        "--testbench",
+        default=None,
+        help=(
+            "Optional companion HSpice testbench .sp (the file with "
+            "`.tran` / `.measure` / `.alter`). Only meaningful with "
+            "--netlist. If given, its scrubbed view is appended to the "
+            "rendered Markdown."
+        ),
+    )
     parser.add_argument(
         "--depth",
         type=_parse_depth,
@@ -195,6 +231,50 @@ def _render_hierarchical_markdown(hier: dict) -> str:
     return "\n".join(parts)
 
 
+def _run_netlist_mode(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """Handle --netlist [--testbench] mode.
+
+    Reads from local disk only — remote fetch is not in scope for the
+    MVP; users on COBI can ``scp`` files down first or invoke the
+    script over ssh.
+    """
+    netlist_path = Path(args.netlist)
+    if not netlist_path.exists():
+        logger.error("netlist not found: %s", netlist_path)
+        return 1
+    testbench_path: Path | None = None
+    if args.testbench:
+        testbench_path = Path(args.testbench)
+        if not testbench_path.exists():
+            logger.error("testbench not found: %s", testbench_path)
+            return 1
+
+    logger.info(
+        "Netlist mode: scrub + parse %s%s",
+        netlist_path,
+        f" + {testbench_path}" if testbench_path else "",
+    )
+    md_text = read_and_render(netlist_path, testbench_path)
+    if not md_text.endswith("\n"):
+        md_text += "\n"
+
+    out = args.output
+    if out is None or out == "-":
+        # The renderer emits a `→` for V-source nodes; on Windows the
+        # default stdout codec is cp1252 and would crash on that
+        # codepoint. Write the bytes through the binary buffer so the
+        # CLI is portable regardless of console code page.
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            buf.write(md_text.encode("utf-8"))
+        else:
+            sys.stdout.write(md_text)
+        return 0
+    _write(Path(out), md_text)
+    logger.info("Wrote %s", out)
+    return 0
+
+
 def _write(out_path: Path, text: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
@@ -208,6 +288,30 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger = logging.getLogger("read_schematic")
+
+    # Mode detection. Netlist mode short-circuits the SafeBridge path
+    # entirely — no Virtuoso connection, no env load, no PDK map.
+    if args.netlist is not None:
+        if args.lib or args.cell:
+            logger.warning(
+                "--lib/--cell are ignored in netlist mode "
+                "(--netlist=%s)", args.netlist,
+            )
+        if args.format != "markdown":
+            logger.error(
+                "--format=%r is not supported in netlist mode "
+                "(only markdown). Drop --format or pass markdown.",
+                args.format,
+            )
+            return 2
+        return _run_netlist_mode(args, logger)
+
+    if not args.lib or not args.cell:
+        logger.error(
+            "schematic mode requires --lib and --cell "
+            "(or pass --netlist for HSpice .sp mode)."
+        )
+        return 2
 
     # --format both has strict output semantics: a real directory is
     # required and stdout is not supported. Validate up front so we

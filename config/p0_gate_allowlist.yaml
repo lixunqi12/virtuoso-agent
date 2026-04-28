@@ -1,0 +1,81 @@
+# P0 grep gate phase-1 (repo scan) allowlist.
+#
+# Files / path-prefixes here are permitted to contain banned foundry
+# tokens (nch_, pch_, cfmom, rppoly, rm1_, tsmc, tcbn) because they are
+# legitimate carriers — source defining the leak detection regex, test
+# fixtures with synthetic inputs, configuration patterns themselves,
+# project documentation discussing the leak surface, or review history.
+#
+# Phase-2 (work-dir HSpice artifact scan) is unaffected — it uses
+# preserve_tokens in config/hspice_scrub_patterns.{private,template}.yaml
+# for its own substring exemption mechanism.
+#
+# Schema (mirrors Read-HspiceScrubYaml posture — strict, fail-closed):
+#   paths         : list of exact relative paths (forward-slash) that
+#                   are allowed to carry banned tokens.
+#   path_prefixes : list of relative directory prefixes (forward-slash,
+#                   trailing slash required) — any file whose path
+#                   begins with one of these is allowed.
+# Both keys are REQUIRED. Empty list (`[]`) is permitted; missing key
+# is a fail-closed parse error. No inline flow other than `[]`. No
+# unknown top-level keys. List items may not begin with YAML metasyntax
+# (* & ! | >) unless quoted.
+
+paths:
+  # Source code defining leak detection or interacting with the
+  # foundry-aware scrubbing surface.
+  - src/safe_bridge.py
+  - src/hspice_scrub.py
+  - src/netlist_reader.py
+  - src/remote_patch.py
+  - scripts/check_p0_gate.ps1
+  - scripts/read_schematic.py
+
+  # This allowlist names the banned tokens in its own schema comment,
+  # so by construction it must be permitted to carry them.
+  - config/p0_gate_allowlist.yaml
+
+  # Test files with synthetic foundry inputs.
+  - tests/test_safe_bridge.py
+  - tests/test_hspice_scrub.py
+  - tests/test_hspice_worker.py
+  - tests/test_netlist_reader.py
+  - tests/test_remote_patch.py
+  - tests/test_run_agent_hspice.py
+  - tests/test_p0_gate_allowlist.ps1
+
+  # Pattern configuration yamls — the patterns themselves contain the
+  # foundry strings they exist to redact. The .private.yaml is
+  # gitignored and holds real tokens; the others are public.
+  - config/hspice_scrub_patterns.yaml
+  - config/hspice_scrub_patterns.template.yaml
+  - config/hspice_scrub_patterns.private.yaml
+
+  # Project / configuration docs that discuss the leak surface.
+  - CLAUDE.md
+  - README.md
+  - config/pdk_map.yaml
+
+  # Per-DUT spec markdowns are gitignored (see .gitignore) but a developer
+  # working a hspice loop will have them locally. They legitimately
+  # reference foundry-shaped tokens in the design-variable / metric
+  # discussion, so allowlist them so the local P0 gate doesn't trip.
+  - config/delay_test_spec.md
+  - config/matching_test_spec.md
+
+path_prefixes:
+  # Project documentation.
+  - docs/
+
+  # Review history (project context, naturally discusses foundry tokens).
+  - reviews/
+
+  # SKILL source code (foundry-aware Cadence integration).
+  - skill/
+
+  # Agent transcript logs (gitignored; written next to specs during runs).
+  # These hold raw scrubbed hspice transcript output and may legitimately
+  # contain foundry-shaped tokens that survived a partial scrub of a
+  # third-party log line. Allowlisted so the P0 gate doesn't trip on
+  # local-only artifacts; .gitignore prevents them being committed.
+  - config/logs/
