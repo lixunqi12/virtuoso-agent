@@ -32,6 +32,19 @@
 #                     exception in both the scrub and gate passes.
 #                     These are design-space names the agent / LLM
 #                     legitimately needs to see.
+#   mosfet_param_whitelist : ADDITIONAL MOSFET instance params to
+#                     preserve through the second-pass scrub. Extends
+#                     the Python source-of-truth default in
+#                     src/hspice_scrub.py::_DEFAULT_MOSFET_WHITELIST
+#                     (l, w, m, nf, multi, ad, as, pd, ps, nrd, nrs,
+#                     sd, ic, temp, dtemp, region — 16 names). YAML
+#                     entries are ADDED to the default; empty list
+#                     does NOT disable any default — the second pass
+#                     ALWAYS runs, mirroring the _FOUNDRY_LEAK_RE
+#                     posture (Python holds the strong default; YAML
+#                     is additive only). Lines without `<redacted>`
+#                     (passives, user subckts, behavioural sources)
+#                     are never touched by the second pass.
 
 # Absolute path prefixes for the on-disk PDK install. Examples:
 #   - "/path/to/your/foundry/dkit/install/"
@@ -62,3 +75,11 @@ preserve_tokens:
   - "gnd"
   - "h_in_mid"
   - "H_IN"
+
+# N3 R2 (codex): ADDITIONAL MOSFET instance params to preserve.
+# EXTENDS the Python default at src/hspice_scrub.py::_DEFAULT_MOSFET_WHITELIST:
+#   l, w, m, nf, multi, ad, as, pd, ps, nrd, nrs, sd, ic, temp, dtemp, region
+# Empty list does NOT disable the second pass — defaults always fire.
+# Add only site-specific keys here (the default already covers BSIM4
+# geometry, sizing, and standard user-authored instance params).
+mosfet_param_whitelist: []

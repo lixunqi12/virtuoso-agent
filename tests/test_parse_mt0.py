@@ -354,7 +354,7 @@ class TestR2Blockers:
         # Realistic .mt0 accident: a malformed .TITLE whose value
         # contains an absolute path. The parser must NOT echo that
         # path into `str(err)`; it belongs on `err.snippet` only.
-        leaky_path = "/usr/local/dkits/foundry_x/cobi/top_tt.lib"
+        leaky_path = "/usr/local/dkits/foundry_x/work/sim/top_tt.lib"
         payload = (
             "$DATA1 SOURCE='HSPICE' VERSION='V1' PARAM_COUNT=0\n"
             f".TITLE '{leaky_path}\n"  # missing closing quote
