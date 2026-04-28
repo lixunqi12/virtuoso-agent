@@ -37,6 +37,14 @@ specs_work/
 config/delay_test_spec.md
 config/matching_test_spec.md
 
+# Projects tree — every project under projects/ carries scrubbed
+# circuit data, agent run logs, and hspice transcripts that must not
+# ship to GitHub. The whole tree is local-only; .gitkeep at the root
+# is the only file that is tracked, so the directory exists for
+# tooling but stays empty in the public repo.
+projects/*
+!projects/.gitkeep
+
 # Historical draft-review doc (contains real usernames and host)
 docs/stage0_draft_review.md
 

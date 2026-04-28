@@ -46,6 +46,7 @@ from virtuoso_bridge import VirtuosoClient
 
 from src.agent import CircuitAgent
 from src.netlist_reader import read_and_render
+from src.project import resolve_project
 from src.safe_bridge import SafeBridge
 
 # Must match the SKILL-side hard cap in safeReadSchematicDeep. Keep in
@@ -167,6 +168,19 @@ def parse_args() -> argparse.Namespace:
         "--env-file",
         default=None,
         help="Path to .env file (default: config/.env)",
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help=(
+            "Project name. When given (and --output is omitted), the "
+            "scrubbed circuit is written under "
+            "projects/<name>/circuit/<cell>.{md,json} instead of "
+            "stdout. Useful when the read is the first step of a new "
+            "optimization run — the file lands in the right place for "
+            "the next run_agent.py invocation. Pure-stdout callers can "
+            "ignore this flag."
+        ),
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose logging"
@@ -382,6 +396,18 @@ def main() -> int:
 
     fmt = args.format
     out = args.output
+
+    # If --project is given and the caller did not pass --output, default
+    # the destination to projects/<name>/circuit/. For markdown/json this
+    # becomes a single file; for "both" it becomes the directory.
+    if out is None and args.project:
+        proj = resolve_project(args.project, repo_root=PROJECT_ROOT)
+        proj.ensure()
+        if fmt == "both":
+            out = str(proj.circuit_dir)
+        else:
+            ext = "md" if fmt == "markdown" else "json"
+            out = str(proj.circuit_dir / f"{args.cell}.{ext}")
 
     if fmt == "both":
         # Validated above: out is a real directory path.
