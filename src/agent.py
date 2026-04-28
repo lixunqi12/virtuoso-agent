@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from . import spec_evaluator
 from .failure_codes import DumpStatus
@@ -31,12 +31,44 @@ from .ocean_worker import (
 )
 from .plan_auto import PlanAuto
 from .safe_bridge import SafeBridge
+from .remote_patch import RemotePatchError, RemotePatcher
+from .sp_rewrite import ParamRewriteError
 
 logger = logging.getLogger(__name__)
 
 
 SAFEGUARD_AMP_HOLD_MIN = 0.3
 SAFEGUARD_CONSECUTIVE_LIMIT = 3
+
+# T8.8: when the LAST N consecutive iterations of a non-converged run
+# all produced at least one sanity-range UNMEASURABLE verdict, the loop
+# was burning iterations on physically-implausible measurements rather
+# than tunable parameters — relabel the abort_reason from "max_iter"
+# to "topology" so the post-mortem points at the topology/spec, not
+# at iteration budget. The streak must hold at termination (a single
+# non-violating iter resets it), so a transient measurement glitch
+# mid-run does not trip the relabel.
+TOPOLOGY_SANITY_VIOLATION_LIMIT = 3
+_SANITY_VIOLATION_PREFIX = "UNMEASURABLE (suspect:"
+
+
+def _has_sanity_violation(pass_fail: dict | None) -> bool:
+    """True iff any verdict in ``pass_fail`` is a sanity-range UNMEASURABLE.
+
+    ``spec_evaluator._verdict`` emits ``"UNMEASURABLE (suspect: value <X> <
+    sanity lo <Y>)"`` / ``"... > sanity hi ..."`` when a metric value is
+    outside the sanity range — physically implausible, blame the topology
+    or the spec, not the parameters. Distinct from ``"UNMEASURABLE (no
+    value)"`` / ``"UNMEASURABLE (<DumpStatus>)"`` / ``"UNMEASURABLE
+    (<reducer reason>)"`` which point at instrumentation/measurement
+    issues. Used by the topology streak counter in both backends.
+    """
+    if not pass_fail:
+        return False
+    for v in pass_fail.values():
+        if isinstance(v, str) and v.startswith(_SANITY_VIOLATION_PREFIX):
+            return True
+    return False
 
 # LLM-response JSON schema (see docs/llm_protocol.md).
 _VALID_RESPONSE_KEYS = frozenset({
@@ -260,6 +292,16 @@ class CircuitAgent:
         Stop conditions (``abort_reason``):
             - ``None`` (converged=True) — every metric PASS in one iteration.
             - ``"max_iter"``             — ``max_iter`` hit without PASS.
+            - ``"topology"``             — ``max_iter`` hit AND the last
+                                            ``TOPOLOGY_SANITY_VIOLATION_LIMIT``
+                                            consecutive iterations all
+                                            produced a sanity-range
+                                            UNMEASURABLE verdict; the
+                                            iteration budget was spent on
+                                            physically-implausible
+                                            measurements, so the topology
+                                            or the spec is the culprit,
+                                            not parameter tuning.
             - ``"safeguard"``            — ``amp_hold_ratio < 0.3`` for 3
                                             consecutive iterations.
             - ``"stuck_identical_vars"`` — identical design_vars 2× while
@@ -542,6 +584,7 @@ class CircuitAgent:
         abort_reason: str | None = None
         safeguard_streak = 0
         stuck_streak = 0
+        topology_streak = 0
 
         for i in range(max_iter):
             logger.info("=== Iteration %d/%d ===", i + 1, max_iter)
@@ -914,6 +957,14 @@ class CircuitAgent:
             last_measurements = measurements
             last_pass_fail = pass_fail
 
+            # T8.8: track sanity-range UNMEASURABLE streak. Reset on any
+            # iter without a "suspect:" verdict so a transient glitch
+            # cannot strand a converging run with a topology label.
+            if _has_sanity_violation(pass_fail):
+                topology_streak += 1
+            else:
+                topology_streak = 0
+
             if met:
                 logger.info("Specifications met at iteration %d", i + 1)
                 converged = True
@@ -1001,8 +1052,19 @@ class CircuitAgent:
             messages.append({"role": "assistant", "content": response})
             _append_transcript(i + 1, "assistant", response)
         else:
-            abort_reason = "max_iter"
-            logger.warning("Did not converge within %d iterations.", max_iter)
+            if topology_streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT:
+                abort_reason = "topology"
+                logger.warning(
+                    "TOPOLOGY: last %d iterations all produced sanity-range "
+                    "UNMEASURABLE verdicts — iteration budget exhausted on "
+                    "physically-implausible measurements; topology or spec "
+                    "mismatch, not a tuning issue.", topology_streak,
+                )
+            else:
+                abort_reason = "max_iter"
+                logger.warning(
+                    "Did not converge within %d iterations.", max_iter,
+                )
 
         writeback_status = self._run_writeback(accumulated_vars)
 
@@ -1574,3 +1636,526 @@ def _format_sim_summary(sim_result: dict) -> str:
         return "```json\n" + json.dumps(sim_result, indent=2, default=str) + "\n```"
     except (TypeError, ValueError):
         return repr(sim_result)
+
+
+# ====================================================================== #
+#  HSpice closed-loop agent (T8.3, 2026-04-25)
+# ====================================================================== #
+#
+#  ``HspiceAgent`` is the HSpice peer of ``CircuitAgent``: same
+#  request/response protocol with the LLM, same JSON contract, but the
+#  per-iteration mechanics swap out OCEAN/Maestro for HSpice over ssh.
+#  No SafeBridge, no SKILL daemon, no Maestro writeback -- the only
+#  remote state mutated between iterations is the ``.PARAM`` block of
+#  one file (whichever ``hspice.param_rewrite_target`` names).
+#
+#  The class is deliberately self-contained and does NOT inherit from
+#  ``CircuitAgent``: the two share the LLM transcript style and the
+#  JSON envelope but nothing else, and forcing common machinery would
+#  drag SafeBridge into HSpice runs that should not need it.
+
+import yaml                        # noqa: E402  -- spec block extraction
+
+from .hspice_resolver import (     # noqa: E402
+    EvaluationResult,
+    HspiceMetricNotFoundError,
+    evaluate_hspice,
+)
+from .hspice_worker import (       # noqa: E402
+    HspiceRunResult,
+    HspiceWorker,
+    HspiceWorkerError,
+    HspiceWorkerScriptError,
+    HspiceWorkerSpawnError,
+    HspiceWorkerTimeout,
+)
+
+
+_HSPICE_TARGETS: frozenset[str] = frozenset({"netlist", "testbench"})
+
+
+def extract_hspice_spec_blocks(spec_text: str) -> tuple[list[dict], dict]:
+    """Pull the HSpice-specific yaml fences out of a spec markdown.
+
+    A spec for the HSpice backend carries two yaml fences:
+
+      * a ``metrics:`` block (HSpice-only -- no signals/windows because
+        ``.measure`` already encodes the time window inside the .sp);
+      * an ``hspice:`` block carrying file paths, topcell name, options,
+        and the ``param_rewrite_target`` selector.
+
+    Returns ``(metrics, hspice_cfg)``. Raises ``ValueError`` if either
+    fence is missing or malformed -- callers should treat this as a
+    spec-author error and abort before any remote round-trip.
+    """
+    if not isinstance(spec_text, str):
+        raise ValueError("spec_text must be a str")
+    metrics: list[dict] | None = None
+    hspice_cfg: dict | None = None
+    for match in re.finditer(
+        r"```(?:yaml|yml)\s*\n(.*?)\n```", spec_text,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            data = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if metrics is None and isinstance(data.get("metrics"), list):
+            metrics = data["metrics"]
+        if hspice_cfg is None and isinstance(data.get("hspice"), dict):
+            hspice_cfg = data["hspice"]
+    if metrics is None:
+        raise ValueError(
+            "HSpice spec is missing a yaml fence with a 'metrics:' list"
+        )
+    if hspice_cfg is None:
+        raise ValueError(
+            "HSpice spec is missing a yaml fence with an 'hspice:' block"
+        )
+    target = hspice_cfg.get("param_rewrite_target", "testbench")
+    if target not in _HSPICE_TARGETS:
+        raise ValueError(
+            f"hspice.param_rewrite_target must be one of "
+            f"{sorted(_HSPICE_TARGETS)}; got {target!r}"
+        )
+    return metrics, hspice_cfg
+
+
+@dataclass
+class HspiceIterationRecord:
+    iteration: int
+    design_vars: dict
+    measurements: dict
+    pass_fail: dict
+    meets_spec: bool
+    llm_reasoning: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+
+class HspiceAgent:
+    """LLM-driven closed-loop optimizer for the HSpice backend.
+
+    Per iteration:
+      1. Parse the LLM's previous JSON response, validate against the
+         spec's design-var whitelist + value-format rules.
+      2. Merge new ``design_vars`` into ``accumulated_vars``.
+      3. Patch the REMOTE param-rewrite-target .sp in place via
+         :class:`src.remote_patch.RemotePatcher` (atomic remote write;
+         one-time backup; rewrite executes on cobi -- the local
+         scrubbed copy never goes back over ssh).
+      4. Run HSpice on the remote testbench via the supplied
+         :class:`HspiceWorker`.
+      5. Resolve metrics through :func:`hspice_resolver.evaluate_hspice`.
+      6. Build the next-turn LLM prompt with verdicts and history.
+
+    Stop conditions (mirror :class:`CircuitAgent`):
+      * ``None`` (converged=True) -- every metric PASS.
+      * ``"max_iter"``           -- ran out of iterations.
+      * ``"topology"``           -- ran out of iterations AND the last
+                                    ``TOPOLOGY_SANITY_VIOLATION_LIMIT``
+                                    consecutive iterations all produced
+                                    a sanity-range UNMEASURABLE verdict;
+                                    points at the topology / spec rather
+                                    than parameter tuning.
+      * ``"contract_violation"`` -- LLM emitted a bad schema after one
+                                    repair attempt.
+      * ``"hspice_failure"``     -- ssh / HSpice transport or script
+                                    error that the worker raised.
+      * ``"rewrite_failure"``    -- :class:`ParamRewriteError` from the
+                                    .sp rewriter (e.g. LLM proposed a
+                                    key the netlist's .PARAM block
+                                    does not declare).
+    """
+
+    def __init__(
+        self,
+        llm: LLMClient,
+        worker: HspiceWorker,
+        spec_text: str,
+        spec_metrics: list[dict],
+        whitelist: Iterable[str],
+        remote_target_path: str,
+        remote_run_path: str,
+    ) -> None:
+        self.llm = llm
+        self.worker = worker
+        self.spec_text = spec_text
+        self.spec_metrics = list(spec_metrics)
+        # Whitelist is normalised to a lowercased frozenset -- the
+        # rewriter and the contract validator both compare case-
+        # insensitively, and a frozenset reads cleanly in error
+        # messages and survives accidental mutation.
+        self.whitelist: frozenset[str] = frozenset(
+            str(k).lower() for k in whitelist
+        )
+        if not self.whitelist:
+            raise ValueError(
+                "HspiceAgent requires a non-empty design_vars whitelist"
+            )
+        self.remote_target_path = remote_target_path
+        self.remote_run_path = remote_run_path
+        # T8.3-fix: rewrite executes on the remote box (see
+        # src.remote_patch). The local scrubbed copy is intentionally
+        # NOT shipped back -- pushing it would overwrite the original
+        # PDK file with `<redacted>` placeholders.
+        self._remote_patcher = RemotePatcher(
+            ssh_args=worker.cfg.ssh_base_args(),
+            timeout_s=worker.cfg.ssh_connect_timeout_s + 30,
+        )
+        self.history: list[HspiceIterationRecord] = []
+
+    # ------------------------------------------------------------------ #
+    #  Public entrypoint
+    # ------------------------------------------------------------------ #
+
+    def run(
+        self,
+        max_iter: int = 20,
+        transcript_path: str | Path | None = None,
+    ) -> dict:
+        """Run the closed-loop optimization against an HSpice testbench.
+
+        Returns a dict with ``measurements``, ``pass_fail``,
+        ``design_vars``, ``converged``, and ``abort_reason`` -- shape
+        compatible with :meth:`CircuitAgent.run` so downstream
+        reporting code can treat both backends uniformly. There is no
+        ``writeback_status`` key: HSpice writes its design-var values
+        directly into the .sp on the remote, which IS the writeback.
+        """
+        transcript_file: Path | None = None
+        if transcript_path is not None:
+            transcript_file = Path(transcript_path)
+            transcript_file.parent.mkdir(parents=True, exist_ok=True)
+            transcript_file.write_text("", encoding="utf-8")
+            logger.info("LLM transcript: %s", transcript_file)
+
+        def _append_transcript(iteration: int, role: str, content: str) -> None:
+            if transcript_file is None:
+                return
+            try:
+                entry = {
+                    "iteration": iteration,
+                    "role": role,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "content": content,
+                }
+                with transcript_file.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except OSError as exc:
+                logger.warning(
+                    "Transcript append failed (%s); continuing.",
+                    type(exc).__name__,
+                )
+
+        messages = [{
+            "role": "user",
+            "content": self._first_prompt(),
+        }]
+        _append_transcript(0, "user", messages[0]["content"])
+        response = self.llm.chat(messages)
+        messages.append({"role": "assistant", "content": response})
+        _append_transcript(0, "assistant", response)
+
+        accumulated_vars: dict[str, Any] = {}
+        last_measurements: dict = {}
+        last_pass_fail: dict = {}
+        converged = False
+        abort_reason: str | None = None
+        topology_streak = 0
+
+        for i in range(max_iter):
+            logger.info("=== HSpice iteration %d/%d ===", i + 1, max_iter)
+
+            parsed = CircuitAgent._parse_llm_response(response)
+            repair_reason = self._check_contract_violation(parsed)
+            if repair_reason:
+                logger.warning(
+                    "Contract violation (iter %d): %s -- sending repair prompt",
+                    i + 1, repair_reason,
+                )
+                repair_msg = (
+                    f"Your previous response violated HARD CONSTRAINTS: "
+                    f"{repair_reason}. Please re-emit using EXACTLY the "
+                    f"keys and variable names from HARD CONSTRAINTS."
+                )
+                messages.append({"role": "user", "content": repair_msg})
+                _append_transcript(i + 1, "user", repair_msg)
+                response = self.llm.chat(messages)
+                messages.append({"role": "assistant", "content": response})
+                _append_transcript(i + 1, "assistant", response)
+                parsed = CircuitAgent._parse_llm_response(response)
+                if self._check_contract_violation(parsed):
+                    abort_reason = "contract_violation"
+                    break
+
+            new_vars = parsed.get("design_vars", {}) or {}
+            reasoning = parsed.get("reasoning", "") or ""
+
+            if not new_vars and i == 0:
+                logger.warning(
+                    "LLM proposed no design_vars on iteration 1; "
+                    "HSpice cannot iterate without an initial proposal."
+                )
+                abort_reason = "no_changes"
+                break
+            accumulated_vars.update(new_vars)
+
+            try:
+                patch_result = self._remote_patcher.patch(
+                    self.remote_target_path,
+                    accumulated_vars,
+                    self.whitelist,
+                )
+            except ParamRewriteError as exc:
+                # ParamRewriteError can be raised LOCALLY by the
+                # remote patcher's pre-validation (whitelist check
+                # could be added there in the future). Today it would
+                # only fire from a direct local validation -- the
+                # remote-side equivalent surfaces as RemotePatchError
+                # below ("FAIL: rewrite_error ..."). Treat both as
+                # rewrite_failure for stop-condition reporting.
+                logger.error(
+                    "design_vars rejected (iter %d): %s", i + 1, exc,
+                )
+                abort_reason = "rewrite_failure"
+                break
+            except RemotePatchError as exc:
+                # Remote-side failure: ssh transport problem, remote
+                # rewriter error, or unexpected exception. The message
+                # has already been sanitized by RemotePatcher (single
+                # chokepoint at _sanitize_remote_stderr).
+                logger.error(
+                    "remote patch failed (iter %d): %s", i + 1, exc,
+                )
+                # Distinguish rewrite_error (LLM proposal problem) from
+                # transport / unexpected (operator should investigate).
+                if "rewrite_error" in str(exc):
+                    abort_reason = "rewrite_failure"
+                else:
+                    abort_reason = "hspice_failure"
+                break
+            logger.info(
+                "remote patch iter=%d keys=%d backup=%s noop=%s",
+                i + 1, patch_result.keys_patched,
+                patch_result.backup_path or "(none)",
+                patch_result.noop,
+            )
+
+            try:
+                run_result = self.worker.run(self.remote_run_path)
+            except HspiceWorkerTimeout as exc:
+                logger.error("HSpice timeout (iter %d): %s", i + 1, exc)
+                abort_reason = "hspice_failure"
+                break
+            except (HspiceWorkerSpawnError, HspiceWorkerScriptError) as exc:
+                logger.error(
+                    "HSpice transport/script failure (iter %d): %s",
+                    i + 1, exc,
+                )
+                abort_reason = "hspice_failure"
+                break
+
+            try:
+                evaluation = evaluate_hspice(
+                    run_result.mt_files, self.spec_metrics,
+                )
+            except HspiceMetricNotFoundError as exc:
+                logger.error(
+                    "Metric %r missing from .mt<k> tables (iter %d); "
+                    "fix the spec name or the .measure directive.",
+                    exc.metric_name, i + 1,
+                )
+                abort_reason = "hspice_failure"
+                break
+
+            measurements = dict(evaluation.measurements)
+            pass_fail = dict(evaluation.pass_fail)
+            met = bool(pass_fail) and all(
+                str(v).strip().upper().startswith("PASS")
+                for v in pass_fail.values()
+            )
+            self.history.append(HspiceIterationRecord(
+                iteration=i + 1,
+                design_vars=dict(accumulated_vars),
+                measurements=measurements,
+                pass_fail=pass_fail,
+                meets_spec=met,
+                llm_reasoning=reasoning,
+            ))
+            last_measurements = measurements
+            last_pass_fail = pass_fail
+
+            # T8.8: track sanity-range UNMEASURABLE streak. Reset on any
+            # iter without a "suspect:" verdict so a transient measurement
+            # glitch cannot strand a converging run with a topology label.
+            if _has_sanity_violation(pass_fail):
+                topology_streak += 1
+            else:
+                topology_streak = 0
+
+            if met:
+                logger.info("Specifications met at HSpice iteration %d", i + 1)
+                converged = True
+                break
+
+            next_prompt = self._next_prompt(
+                i + 1, evaluation, run_result,
+            )
+            messages.append({"role": "user", "content": next_prompt})
+            _append_transcript(i + 1, "user", next_prompt)
+            response = self.llm.chat(messages)
+            messages.append({"role": "assistant", "content": response})
+            _append_transcript(i + 1, "assistant", response)
+        else:
+            if topology_streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT:
+                abort_reason = "topology"
+                logger.warning(
+                    "TOPOLOGY: last %d HSpice iterations all produced "
+                    "sanity-range UNMEASURABLE verdicts -- iteration budget "
+                    "exhausted on physically-implausible measurements; "
+                    "topology or spec mismatch, not a tuning issue.",
+                    topology_streak,
+                )
+            else:
+                abort_reason = "max_iter"
+                logger.warning(
+                    "HSpice loop did not converge within %d iterations.",
+                    max_iter,
+                )
+
+        return {
+            "measurements": last_measurements,
+            "pass_fail": last_pass_fail,
+            "design_vars": accumulated_vars,
+            "converged": converged,
+            "abort_reason": abort_reason,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Prompt assembly
+    # ------------------------------------------------------------------ #
+
+    def _first_prompt(self) -> str:
+        whitelist_sorted = sorted(self.whitelist)
+        return (
+            "You are an analog-design optimization agent. The target "
+            "specification is pinned below. At each iteration you will "
+            "receive HSpice .mt<k> measurement results; respond with ONE "
+            "fenced JSON block carrying `measurements`, `pass_fail`, "
+            "`reasoning`, and `design_vars`.\n\n"
+            "## HARD CONSTRAINTS (violating these triggers a single repair "
+            "retry, then the loop aborts)\n"
+            "- **Valid top-level JSON keys**: design_vars, iteration, "
+            "measurements, pass_fail, reasoning\n"
+            "- **Valid `design_vars` variable names** (case-insensitive): "
+            f"{', '.join(whitelist_sorted)}\n"
+            "- **Value format**: bare numbers OR engineering suffixes "
+            "(e.g. `75p`, `0.8`, `2`, `1.5n`). Do NOT use physical units "
+            "like mA/pF/nH/GHz. The rewriter will preserve the .sp's "
+            "existing suffix when you supply a bare number.\n"
+            "- The platform rewrites the FIRST `.PARAM` block of the "
+            "spec-designated .sp file in place; `.alter` blocks downstream "
+            "are intentionally left alone (they encode the test sweep).\n\n"
+            f"## Target Specification\n{self.spec_text}\n\n"
+            "Emit the first JSON block now -- pick a reasonable starting "
+            "point inside the ranges in the spec's design-variable table."
+        )
+
+    def _next_prompt(
+        self,
+        iteration: int,
+        evaluation: EvaluationResult,
+        run_result: HspiceRunResult,
+    ) -> str:
+        verdict_lines = [
+            f"- {name}: {evaluation.pass_fail.get(name, '?')} "
+            f"(values={evaluation.measurements.get(name)})"
+            for name in evaluation.pass_fail
+        ]
+        history_brief = self._format_history_brief()
+        return (
+            f"## Iteration {iteration} HSpice results\n"
+            f"- run_dir: {run_result.run_dir_remote}\n"
+            f"- hspice_rc: {run_result.returncode}\n"
+            f"- mt_tables: {sorted(run_result.mt_files.keys())}\n\n"
+            f"## Metrics\n" + "\n".join(verdict_lines) + "\n\n"
+            f"## History\n{history_brief}\n\n"
+            "Emit the next JSON block. The platform recomputes "
+            "`measurements` and `pass_fail` from the .mt<k> tables next "
+            "turn -- focus on `reasoning` and `design_vars`. Propose a "
+            "delta on a whitelisted variable that moves a FAIL metric "
+            "toward its pass range. Repeat the same design_vars only if "
+            "every metric already PASSes; the agent stops on its own."
+        )
+
+    def _format_history_brief(self) -> str:
+        if not self.history:
+            return "No previous iterations."
+        lines: list[str] = []
+        for rec in self.history[-5:]:
+            status = "MET" if rec.meets_spec else "NOT MET"
+            metric_brief = {
+                k: v[0] if isinstance(v, list) and v else v
+                for k, v in rec.measurements.items()
+            }
+            lines.append(
+                f"- Iter {rec.iteration} [{status}] "
+                f"vars={rec.design_vars} metrics={metric_brief}"
+            )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
+    #  Schema validation (HSpice variant of the OCEAN one above)
+    # ------------------------------------------------------------------ #
+
+    def _check_contract_violation(self, parsed: dict) -> str | None:
+        """Same shape as :meth:`CircuitAgent._check_contract_violation`
+        but resolves the design-var whitelist against the per-spec
+        ``self.whitelist`` instead of the module-level OCEAN whitelist.
+        """
+        problems: list[str] = []
+        bad_keys = set(parsed.keys()) - _VALID_RESPONSE_KEYS
+        if bad_keys:
+            problems.append(f"unknown top-level key(s): {sorted(bad_keys)}")
+        missing = _REQUIRED_RESPONSE_KEYS - set(parsed.keys())
+        if missing:
+            problems.append(
+                f"missing required top-level key(s): {sorted(missing)}"
+            )
+        for key, expected in _RESPONSE_KEY_TYPES.items():
+            if key in parsed and not isinstance(parsed[key], expected):
+                actual = type(parsed[key]).__name__
+                exp_name = (
+                    expected.__name__ if isinstance(expected, type)
+                    else "|".join(t.__name__ for t in expected)
+                )
+                problems.append(
+                    f"'{key}' has wrong type: got {actual}, expected {exp_name}"
+                )
+        new_vars = parsed.get("design_vars")
+        if new_vars and isinstance(new_vars, dict):
+            bad_names = {
+                k for k in new_vars if str(k).lower() not in self.whitelist
+            }
+            if bad_names:
+                problems.append(
+                    f"invalid design_vars key(s): {sorted(bad_names)}. "
+                    f"Valid names (case-insensitive): {sorted(self.whitelist)}"
+                )
+            for k, v in new_vars.items():
+                if isinstance(v, str) and _FORBIDDEN_UNIT_RE.search(v):
+                    problems.append(
+                        f"design_vars['{k}'] = '{v}' contains a physical "
+                        f"unit -- use bare numbers or engineering suffixes"
+                    )
+        return "; ".join(problems) if problems else None
+
+    # ------------------------------------------------------------------ #
+    #  T8.3-fix: the previous _push_target_to_remote was REMOVED (it
+    #  shipped the locally-scrubbed .sp body back to the remote and
+    #  overwrote the original PDK file). The replacement -- remote
+    #  in-place patch via src.remote_patch.RemotePatcher -- lives in
+    #  __init__'s self._remote_patcher and is invoked from run().
+    # ------------------------------------------------------------------ #
