@@ -49,15 +49,64 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Safe Analog Design Agent - LLM-driven circuit optimization"
     )
-    parser.add_argument("--lib", required=True, help="Virtuoso library name")
-    parser.add_argument("--cell", required=True, help="Cell name to optimize")
+    parser.add_argument(
+        "--sim-backend",
+        choices=["spectre", "hspice"],
+        default="spectre",
+        help=(
+            "Simulation backend. 'spectre' (default) drives OCEAN / Maestro "
+            "via SafeBridge + SKILL and runs the CircuitAgent LLM loop. "
+            "'hspice' runs HSpice directly over ssh against a remote .sp "
+            "netlist, parses the .mt<k> tables through parse_mt0, and reports "
+            "pass/fail via evaluate_hspice — single-shot (no LLM iteration), "
+            "intended for regression runs and smoke coverage on circuits "
+            "that have an HSpice testbench authored alongside the Maestro one."
+        ),
+    )
+    parser.add_argument(
+        "--testbench",
+        default=None,
+        help=(
+            "Remote POSIX path (or filename relative to --remote-spec-root "
+            "in --hspice-loop mode) of the HSpice testbench .sp -- the "
+            "ENTRY file HSpice executes (`hspice ./<basename>.sp`). REQUIRED "
+            "when --sim-backend=hspice. NOTE: this is the RUN target. In "
+            "--hspice-loop mode the file that gets REWRITTEN with new "
+            "design vars each iter is determined by the spec's "
+            "`hspice.param_rewrite_target` field, NOT this flag."
+        ),
+    )
+    parser.add_argument(
+        "--netlist",
+        default=None,
+        help=(
+            "DEPRECATED alias for --testbench (same semantic, kept for "
+            "backward compat). Use --testbench instead -- the name "
+            "`--netlist` mis-suggests this is the rewrite target, but "
+            "it is the RUN target (the .sp HSpice executes)."
+        ),
+    )
+    parser.add_argument(
+        "--lib",
+        required=False,
+        default=None,
+        help="Virtuoso library name (required for --sim-backend=spectre)",
+    )
+    parser.add_argument(
+        "--cell",
+        required=False,
+        default=None,
+        help="Cell name to optimize (required for --sim-backend=spectre)",
+    )
     parser.add_argument(
         "--tb-cell",
-        required=True,
+        required=False,
+        default=None,
         help=(
-            "Maestro testbench cell name (e.g. LC_VCO_tb). Must be a cell "
-            "in the same library as --cell with a pre-configured Maestro "
-            "session; OCEAN drives it via safeOceanRun."
+            "Maestro testbench cell name (e.g. LC_VCO_tb) — required for "
+            "--sim-backend=spectre. Must be a cell in the same library as "
+            "--cell with a pre-configured Maestro session; OCEAN drives it "
+            "via safeOceanRun."
         ),
     )
     parser.add_argument(
@@ -150,9 +199,71 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--hspice-loop",
+        action="store_true",
+        help=(
+            "T8.3 (2026-04-25): switch the HSpice backend from single-shot "
+            "to closed-loop LLM-driven optimization (mirrors the OCEAN "
+            "agent flow). Requires the spec to carry both a `metrics:` "
+            "yaml fence AND an `hspice:` yaml fence with a "
+            "`param_rewrite_target` field; requires --spec-root, "
+            "--remote-spec-root, and --testbench (the .sp HSpice "
+            "executes each iteration; `--netlist` is a deprecated "
+            "alias). The REWRITE target -- the file mutated with new "
+            "design vars before each push -- is independent: it comes "
+            "from the spec's `hspice.param_rewrite_target` field "
+            "(value `netlist` or `testbench`, resolved against "
+            "`hspice.netlist:` / `hspice.testbench:` filenames in the "
+            "same fence), pushed to <remote-spec-root>/<filename> via "
+            "ssh each iter. Default off so existing single-shot "
+            "regression callers are untouched."
+        ),
+    )
+    parser.add_argument(
+        "--spec-root",
+        default=None,
+        help=(
+            "Local directory containing the .sp files referenced by "
+            "spec.hspice.{netlist,testbench}. Required for --hspice-loop "
+            "(the rewriter mutates the local copy of the rewrite target "
+            "before each push). Defaults to the directory containing "
+            "--spec when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--remote-spec-root",
+        default=None,
+        help=(
+            "POSIX directory on the remote host where the spec's .sp "
+            "files live. Required for --hspice-loop. The push step "
+            "writes <remote-spec-root>/<param_rewrite_target_filename>."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose logging"
     )
     args = parser.parse_args()
+
+    # --testbench is the canonical run-target flag; --netlist is kept as
+    # a deprecated alias because the latter name misleadingly suggests
+    # it controls the rewrite target (which actually comes from the
+    # spec's hspice.param_rewrite_target). Merge into args.netlist so
+    # downstream code stays untouched.
+    if args.testbench and args.netlist:
+        parser.error(
+            "specify either --testbench or --netlist (deprecated alias), "
+            "not both"
+        )
+    if args.testbench:
+        args.netlist = args.testbench
+    elif args.netlist:
+        print(
+            "WARNING: --netlist is deprecated; use --testbench instead. "
+            "Same semantic: the .sp HSpice executes as entry point. The "
+            "REWRITE target is independent and comes from the spec's "
+            "hspice.param_rewrite_target field.",
+            file=sys.stderr,
+        )
 
     # MSYS / Git Bash rewrites POSIX roots like `/home/...` and
     # `/project/...` into `C:/msys64/home/...` before Python sees argv,
@@ -161,11 +272,285 @@ def parse_args() -> argparse.Namespace:
     # `MSYS_NO_PATHCONV=1` every invocation. Only activates on the known
     # mangled prefix; legit Windows paths are untouched.
     _MSYS_PREFIX = "C:/msys64"
-    for _attr in ("scs_path", "remote_skill_dir"):
+    for _attr in ("scs_path", "remote_skill_dir", "netlist", "remote_spec_root"):
         _val = getattr(args, _attr, None)
         if isinstance(_val, str) and _val.startswith(_MSYS_PREFIX + "/"):
             setattr(args, _attr, _val[len(_MSYS_PREFIX):])
+
+    # Backend-gated required-args validation. We can't use argparse's
+    # ``required=True`` because the requirement depends on another flag.
+    if args.sim_backend == "spectre":
+        missing = [
+            n for n, v in (
+                ("--lib", args.lib),
+                ("--cell", args.cell),
+                ("--tb-cell", args.tb_cell),
+            ) if not v
+        ]
+        if missing:
+            parser.error(
+                f"--sim-backend=spectre requires: {', '.join(missing)}"
+            )
+    elif args.sim_backend == "hspice":
+        if not args.netlist:
+            parser.error(
+                "--sim-backend=hspice requires --testbench (the entry .sp "
+                "HSpice executes); `--netlist` is accepted as a deprecated "
+                "alias"
+            )
     return args
+
+
+def _run_hspice(
+    args: argparse.Namespace,
+    spec_block: dict | None,
+    logger: logging.Logger,
+) -> int:
+    """Single-shot HSpice flow.
+
+    Returns:
+        0  — every metric PASS
+        1  — spec / config error (no YAML block, missing metrics)
+        2  — HspiceWorker transport or script error
+        3  — metric-name lookup failed (spec author or netlist bug)
+        4  — simulation ran and parsed but at least one metric FAIL /
+             UNMEASURABLE
+    """
+    # Imported lazily so the spectre code path (which dominates CI)
+    # doesn't pay the cost of importing the HSpice modules on every
+    # invocation, and so tests can monkey-patch ``worker_from_env`` on
+    # the ``src.hspice_worker`` module namespace.
+    from src import hspice_resolver, hspice_worker
+
+    if spec_block is None:
+        logger.error(
+            "--sim-backend=hspice requires a ```yaml signals/windows/"
+            "metrics``` block in the spec; none was found. JSON specs "
+            "are not supported for the HSpice backend."
+        )
+        return 1
+
+    metrics = spec_block.get("metrics") or []
+    if not metrics:
+        logger.error("Spec YAML block has no 'metrics' entries; nothing to check.")
+        return 1
+
+    try:
+        worker = hspice_worker.worker_from_env()
+    except hspice_worker.HspiceWorkerError as exc:
+        logger.error("HspiceWorker config error: %s", exc)
+        return 1
+    logger.info(
+        "HspiceWorker ready (host=%s, hspice_bin=%s, "
+        "hard_ceiling=%.0fs idle_timeout=%.0fs)",
+        worker.cfg.remote_host,
+        worker.cfg.hspice_bin,
+        worker.cfg.hard_ceiling_s,
+        worker.cfg.idle_timeout_s,
+    )
+    # Log only the basename — the full path may contain injection-probe
+    # strings (leading-dash options, shell metachars) that T3's path
+    # validation in ``HspiceWorker.run`` will reject. We don't want to
+    # echo those verbatim into run logs before the ValueError fires.
+    logger.info(
+        "Running HSpice on remote netlist (basename=%s)",
+        Path(args.netlist).name,
+    )
+
+    try:
+        run_result = worker.run(args.netlist)
+    except ValueError:
+        # T3 path defense: shlex-unsafe or shape-invalid ``--netlist``
+        # raises ``ValueError`` *before* any remote spawn. Treat as a
+        # user-input config error (rc=1), not a worker transport issue.
+        # Do NOT re-raise — that would leak a bare traceback to the
+        # top-level run_agent caller and confuse the operator.
+        #
+        # Privacy: ``HspiceWorker`` embeds the offending path into the
+        # exception message (e.g. ``...got '/tmp/secret/-evil.sp'``),
+        # which defeats the basename-only log policy we apply on the
+        # happy path. Drop the payload and log a category-only message
+        # — the operator still knows *what* went wrong; the raw path
+        # (which may itself be the injection probe) does not hit logs.
+        logger.error(
+            "Invalid --netlist argument: must be an absolute POSIX .sp "
+            "path accepted by HspiceWorker (see T3 path validation rules)."
+        )
+        return 1
+    except hspice_worker.HspiceWorkerTimeout as exc:
+        logger.error("HSpice timeout: %s", exc)
+        return 2
+    except hspice_worker.HspiceWorkerSpawnError as exc:
+        logger.error("HSpice spawn/transport error: %s", exc)
+        return 2
+    except hspice_worker.HspiceWorkerScriptError as exc:
+        logger.error("HSpice script error: %s", exc)
+        return 2
+
+    logger.info(
+        "HSpice rc=%d; parsed %d .mt<k> table(s) from %s",
+        run_result.returncode,
+        len(run_result.mt_files),
+        run_result.run_dir_remote,
+    )
+
+    try:
+        evaluation = hspice_resolver.evaluate_hspice(
+            run_result.mt_files, metrics,
+        )
+    except hspice_resolver.HspiceMetricNotFoundError as exc:
+        # Privacy: T4 designed ``HspiceMetricNotFoundError.__str__`` to
+        # report only the count of available columns, not their names
+        # (column names can leak node identifiers from a customer's
+        # netlist). Keep that contract here — log the metric name and
+        # the count, never ``exc.available``.
+        logger.error(
+            "Metric %r not found in any .mt<k> column (%d distinct "
+            "columns seen across tables). Fix the spec metric name "
+            "or the netlist .measure directive.",
+            exc.metric_name,
+            len(exc.available),
+        )
+        return 3
+
+    print("\n" + "=" * 60)
+    print("HSPICE RESULTS")
+    print("=" * 60)
+    print(f"  netlist          : {args.netlist}")
+    print(f"  run_dir          : {run_result.run_dir_remote}")
+    print(f"  hspice_rc        : {run_result.returncode}")
+    print(f"  mt_tables        : {sorted(run_result.mt_files.keys())}")
+    print()
+    print("Measurements (list per metric across alters/rows):")
+    for name, values in evaluation.measurements.items():
+        print(f"  {name}: {values}")
+    print()
+    print("Pass/Fail:")
+    for name, verdict in evaluation.pass_fail.items():
+        print(f"  {name}: {verdict}")
+    all_pass = bool(evaluation.pass_fail) and all(
+        v == "PASS" for v in evaluation.pass_fail.values()
+    )
+    print()
+    print(f"  overall          : {'PASS' if all_pass else 'FAIL'}")
+    return 0 if all_pass else 4
+
+
+def _run_hspice_loop(
+    args: argparse.Namespace,
+    spec_text: str,
+    spec_path: Path,
+    logger: logging.Logger,
+) -> int:
+    """Closed-loop HSpice flow (T8.3).
+
+    Returns:
+        0 — converged (every metric PASS).
+        1 — spec / config error caught before any remote round-trip.
+        2 — HspiceWorker transport / script failure during the loop.
+        4 — loop ran to ``--max-iter`` without converging, or aborted
+            on a contract / rewrite failure.
+    """
+    from src.agent import (
+        HspiceAgent,
+        _load_allowed_design_vars,
+        extract_hspice_spec_blocks,
+    )
+    from src import hspice_worker
+
+    if not isinstance(spec_text, str):
+        logger.error("--hspice-loop requires a Markdown spec; got JSON.")
+        return 1
+    if not args.remote_spec_root:
+        logger.error("--hspice-loop requires --remote-spec-root.")
+        return 1
+    if not args.netlist:
+        logger.error(
+            "--hspice-loop requires --testbench (the .sp HSpice executes; "
+            "`--netlist` is accepted as a deprecated alias)."
+        )
+        return 1
+    spec_root = Path(args.spec_root) if args.spec_root else spec_path.parent
+    if not spec_root.is_dir():
+        logger.error("--spec-root not a directory: %s", spec_root)
+        return 1
+
+    try:
+        metrics, hspice_cfg = extract_hspice_spec_blocks(spec_text)
+    except ValueError as exc:
+        logger.error("HSpice spec parse error: %s", exc)
+        return 1
+
+    try:
+        whitelist = _load_allowed_design_vars(spec_path)
+    except RuntimeError as exc:
+        logger.error("Design-var whitelist parse error: %s", exc)
+        return 1
+
+    target_kind = hspice_cfg["param_rewrite_target"]
+    target_filename = hspice_cfg.get(target_kind)
+    if not isinstance(target_filename, str) or not target_filename:
+        logger.error(
+            "spec.hspice.%s is empty -- cannot resolve rewrite target.",
+            target_kind,
+        )
+        return 1
+    remote_target_path = (
+        args.remote_spec_root.rstrip("/") + "/" + target_filename
+    )
+    # T8.3-fix: local_target_path is no longer passed into HspiceAgent
+    # (the rewrite executes on the remote box; the local scrubbed
+    # copy never goes back). Computed here only for the operator log
+    # line that records what would be patched.
+    local_target_path = spec_root / target_filename
+    logger.info(
+        "HSpice loop: rewrite target=%s (kind=%s); local=%s remote=%s; "
+        "run target=%s",
+        target_filename, target_kind,
+        local_target_path, remote_target_path, args.netlist,
+    )
+
+    try:
+        worker = hspice_worker.worker_from_env()
+    except hspice_worker.HspiceWorkerError as exc:
+        logger.error("HspiceWorker config error: %s", exc)
+        return 1
+
+    llm = create_llm_client(provider=args.llm, model=args.model)
+    agent = HspiceAgent(
+        llm=llm,
+        worker=worker,
+        spec_text=spec_text,
+        spec_metrics=metrics,
+        whitelist=whitelist,
+        remote_target_path=remote_target_path,
+        remote_run_path=args.remote_spec_root.rstrip("/") + "/" + args.netlist,
+    )
+
+    transcript_path = Path(args.spec).parent / "logs" / (
+        f"hspice_transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+    )
+    result = agent.run(
+        max_iter=args.max_iter,
+        transcript_path=transcript_path,
+    )
+
+    print("\n" + "=" * 60)
+    print("HSPICE LOOP RESULTS")
+    print("=" * 60)
+    print(f"  iterations       : {len(agent.history)}")
+    print(f"  converged        : {result['converged']}")
+    print(f"  abort_reason     : {result['abort_reason']}")
+    print(f"  final design_vars: {result['design_vars']}")
+    print()
+    print("Pass/Fail:")
+    for name, verdict in result["pass_fail"].items():
+        print(f"  {name}: {verdict}")
+    if result["converged"]:
+        return 0
+    if result["abort_reason"] == "hspice_failure":
+        return 2
+    return 4
 
 
 def main() -> int:
@@ -225,6 +610,7 @@ def main() -> int:
     # *before* any Virtuoso connection or OCEAN round-trip. Catches the
     # ptp-vs-amplitude / unreachable-threshold class of bugs that used
     # to only manifest as "No crossing found" during the loop.
+    _spec_block = None
     if isinstance(spec, str):
         try:
             _spec_block = spec_evaluator.extract_eval_block(spec)
@@ -243,6 +629,19 @@ def main() -> int:
                     "before any OCEAN round-trip.", _n_issues,
                 )
                 return 1
+
+    # Backend dispatch. Two HSpice modes:
+    #   --hspice-loop OFF (default): single-shot regression flow --
+    #     simulates the supplied .sp once, parses .mt<k>, prints
+    #     pass/fail. No LLM iteration, no Virtuoso plumbing.
+    #   --hspice-loop ON  (T8.3): closed-loop optimization via
+    #     HspiceAgent -- LLM proposes design_vars, sp_rewrite mutates
+    #     the spec's param_rewrite_target .sp, the rewritten file is
+    #     pushed to the remote, HSpice runs, metrics resolve, repeat.
+    if args.sim_backend == "hspice":
+        if args.hspice_loop:
+            return _run_hspice_loop(args, spec, spec_path, logger)
+        return _run_hspice(args, _spec_block, logger)
 
     pdk_map_path = Path(args.pdk_map)
     if not pdk_map_path.exists():

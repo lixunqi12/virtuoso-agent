@@ -15,6 +15,12 @@ logs/*.py
 logs/*.pid
 !logs/.gitkeep
 
+# HSpice agent transcript logs — written by the run loop next to the
+# spec being driven. Carry raw scrubbed-output for debugging; gitignored
+# so they never end up in the public repo, allowlisted so the P0 gate
+# doesn't trip on local artifacts.
+config/logs/
+
 # Quarantined foundry-audit artifacts (strict — never commit)
 .quarantine/
 
@@ -24,6 +30,12 @@ tmp/
 # Local working output dirs (schematic dumps, spec scaffolds, misc runs).
 out/
 specs_work/
+
+# Per-DUT spec markdowns — each developer drafts their own; the public
+# repo only ships the LC_VCO references. Project-specific specs (and any
+# *_spec.md draft tied to a current circuit) stay local.
+config/delay_test_spec.md
+config/matching_test_spec.md
 
 # Historical draft-review doc (contains real usernames and host)
 docs/stage0_draft_review.md
@@ -50,6 +62,12 @@ config/.sync.local
 *.key
 *.pem
 .ssh/
+
+# PDK scrub pattern extension — real foundry tokens live here, never commit.
+# Ship the sanitized config/hspice_scrub_patterns.template.yaml instead and
+# have each dev copy it to *.private.yaml to fill in real values.
+config/hspice_scrub_patterns.private.yaml
+config/hspice_scrub_patterns.yaml
 
 # =========================================================================
 # Python
