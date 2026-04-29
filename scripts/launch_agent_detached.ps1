@@ -16,12 +16,18 @@ if (-not $RemoteSkillDir) {
     $RemoteSkillDir = '/project/<user>/tool/virtuoso_bridge_lite/skill'
 }
 
+# Project name under projects/<name>/ — set env var VIRTUOSO_PROJECT, or hard-code below.
+$ProjectName = $env:VIRTUOSO_PROJECT
+if (-not $ProjectName) {
+    $ProjectName = '<your-project>'
+}
+
 $runArgs = @(
     'scripts/run_agent.py',
-    '--lib', 'pll',
-    '--cell', 'LC_VCO',
-    '--tb-cell', 'LC_VCO_tb',
-    '--spec', 'config/LC_VCO_spec.md',
+    '--lib', '<your-lib>',
+    '--cell', '<your-cell>',
+    '--tb-cell', '<your-tb-cell>',
+    '--spec', "projects/$ProjectName/constraints/spec.md",
     '--max-iter', '5',
     '--remote-skill-dir', $RemoteSkillDir,
     '--auto-bias-ic'

@@ -1,8 +1,14 @@
-# LC_VCO Optimization Spec — Concept Validation @ 20 GHz
+# Default Spec — Worked LC-Tank Oscillator Example @ 20 GHz
 
-> **Platform contract**: circuit-agent reads this file and passes its
-> content to the LLM as the target-spec prompt. Every number below is
-> authoritative.
+> This file is the **default spec** shipped with the repo and serves
+> as a worked example of the 5-section spec format. Copy it to
+> `projects/<your-project>/constraints/spec.md` and edit the fields
+> below for your DUT. The numbers describe a generic LC-tank
+> oscillator at 20 GHz; they are not tied to any specific design.
+>
+> **Platform contract**: circuit-agent reads the active spec and passes
+> its content to the LLM as the target-spec prompt. Every number below
+> is authoritative for whichever spec is loaded.
 >
 > Supporting docs (generic, not circuit-specific):
 > `docs/spec_authoring_rules.md` (pass-range rules) ·
@@ -12,7 +18,7 @@
 
 ## 1. Design under test
 
-- Library / Cell: `pll / LC_VCO`; Testbench cell: `pll / LC_VCO_tb`
+- Library / Cell: `<your-lib> / <your-cell>`; Testbench cell: `<your-lib> / <your-tb-cell>`
 - Process: 16nm FinFET (PDK placeholder), ideal L/C/R, PDK MOS; VDD = 0.8 V
 - Topology: cross-coupled NMOS (M0/M1) + tail (M2) + diode mirror (M3) +
   MOS varactors (M4/M9) + on-chip differential inductor L_diff (506 pH)

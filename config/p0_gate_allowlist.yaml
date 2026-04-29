@@ -79,3 +79,10 @@ path_prefixes:
   # third-party log line. Allowlisted so the P0 gate doesn't trip on
   # local-only artifacts; .gitignore prevents them being committed.
   - config/logs/
+
+  # Per-project artifacts (gitignored — see .gitignore `projects/*`).
+  # Each project subdir holds the local copy of the spec, the scrubbed
+  # netlist read back from the remote host, simulation outputs, and run
+  # logs. None of this ships to GitHub; allowlisted so the local P0
+  # gate stays quiet while the developer iterates.
+  - projects/

@@ -8,7 +8,7 @@ scrub_sp; only the scrubbed text ever touches local disk.
 Usage:
     python scripts/scrub_remote_sp.py \
         --remote /project/.../dut_tb.sp \
-        --output specs_work/dut_tb.scrubbed.sp
+        --output projects/<name>/circuit/dut_tb.scrubbed.sp
 
 SSH host / user are read from config/.env (VB_REMOTE_HOST, VB_REMOTE_USER).
 """

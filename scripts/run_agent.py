@@ -41,6 +41,7 @@ from src.agent import CircuitAgent
 from src.llm_client import create_llm_client
 from src.ocean_worker import worker_from_env
 from src.plan_auto import PlanAuto, parse_startup_from_spec
+from src.project import resolve_project
 from src.safe_bridge import SafeBridge
 from src import spec_evaluator, spec_validator
 
@@ -237,6 +238,20 @@ def parse_args() -> argparse.Namespace:
             "POSIX directory on the remote host where the spec's .sp "
             "files live. Required for --hspice-loop. The push step "
             "writes <remote-spec-root>/<param_rewrite_target_filename>."
+        ),
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help=(
+            "Project name (lowercase letters/digits/underscore). "
+            "When given, agent run logs and "
+            "the hspice transcript are written under "
+            "projects/<name>/logs/{agent,hspice}/. When omitted, the "
+            "project is inferred from --spec if it lives under "
+            "projects/<name>/constraints/; otherwise falls back to the "
+            "reserved _scratch project. The DEFAULT_PROJECT environment "
+            "variable acts as a tiebreaker before _scratch."
         ),
     )
     parser.add_argument(
@@ -527,9 +542,17 @@ def _run_hspice_loop(
         remote_run_path=args.remote_spec_root.rstrip("/") + "/" + args.netlist,
     )
 
-    transcript_path = Path(args.spec).parent / "logs" / (
+    project = resolve_project(
+        args.project,
+        spec_path=args.spec,
+        default=os.environ.get("DEFAULT_PROJECT") or "_scratch",
+        repo_root=PROJECT_ROOT,
+    )
+    project.ensure()
+    transcript_path = project.logs_hspice_dir / (
         f"hspice_transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
     )
+    logger.info("HSpice transcript: %s", transcript_path)
     result = agent.run(
         max_iter=args.max_iter,
         transcript_path=transcript_path,
@@ -556,8 +579,14 @@ def _run_hspice_loop(
 def main() -> int:
     args = parse_args()
 
-    log_dir = PROJECT_ROOT / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    project = resolve_project(
+        args.project,
+        spec_path=args.spec,
+        default=os.environ.get("DEFAULT_PROJECT") or "_scratch",
+        repo_root=PROJECT_ROOT,
+    )
+    project.ensure()
+    log_dir = project.logs_agent_dir
     _ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     log_path = log_dir / f"run_{_ts}.log"
     transcript_path = log_dir / f"transcript_{_ts}.jsonl"
@@ -573,6 +602,7 @@ def main() -> int:
         ],
     )
     logger = logging.getLogger("run_agent")
+    logger.info("Project: %s (root=%s)", project.name, project.root)
     logger.info("Run log: %s", log_path)
 
     env_file = args.env_file or str(PROJECT_ROOT / "config" / ".env")

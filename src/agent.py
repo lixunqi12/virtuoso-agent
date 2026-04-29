@@ -3,7 +3,7 @@
 Response format, iteration flow, and stop conditions are defined in
 ``docs/llm_protocol.md``; per-spec design variables and metrics are
 loaded at import time from the target spec Markdown (default:
-``config/LC_VCO_spec.md``, overridable via ``VIRTUOSO_SPEC_PATH`` /
+``projects/<name>/constraints/spec.md``, overridable via ``VIRTUOSO_SPEC_PATH`` /
 legacy ``LC_VCO_SPEC_PATH``).
 """
 
@@ -140,7 +140,7 @@ def _load_allowed_design_vars(spec_path: Path) -> tuple[str, ...]:
     return tuple(var_names)
 
 
-_DEFAULT_SPEC_PATH = Path(__file__).resolve().parent.parent / "config" / "LC_VCO_spec.md"
+_DEFAULT_SPEC_PATH = Path(__file__).resolve().parent.parent / "config" / "default_spec.md"
 # VIRTUOSO_SPEC_PATH is the generic override; LC_VCO_SPEC_PATH is a
 # legacy alias kept so existing call sites / tests keep working.
 _SPEC_PATH = Path(
@@ -213,7 +213,7 @@ class CircuitAgent:
 
         ``spec`` accepts either:
           - a Markdown **string** (preferred): the raw target-spec text
-            (e.g. ``config/LC_VCO_spec.md``). Embedded directly into the
+            (e.g. ``projects/<name>/constraints/spec.md``). Embedded directly into the
             first LLM prompt so the topology narrative, design-variable
             table, and eval-block YAML flow through with their original
             Markdown structure preserved.

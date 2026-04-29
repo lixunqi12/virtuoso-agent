@@ -7,7 +7,7 @@ names, metrics, or ranges are baked in. The DUT / testbench cell names
 and the discovered pin / desVar / analysis lists are the only cell-
 specific content that survives into the output.
 
-See ``config/LC_VCO_spec.md`` for a worked example of the same 5-section
+See ``projects/<name>/constraints/spec.md`` for a worked example of the same 5-section
 structure after a human has filled it in.
 """
 
