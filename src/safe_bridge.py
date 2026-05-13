@@ -277,6 +277,18 @@ def _scrub(value: Any) -> Any:
     return value
 
 
+def scrub(value: Any) -> Any:
+    """Public wrapper around :func:`_scrub` for cross-module use.
+
+    Same redaction semantics as ``_scrub`` (foundry tokens, abs/UNC
+    paths). Callers outside this module — notably
+    ``llm_client.py`` scrubbing ``reasoning_content`` before it is
+    replayed into LLM conversation history — should use this name
+    rather than reaching into the underscore-prefixed implementation.
+    """
+    return _scrub(value)
+
+
 def _validate_name(name: str, label: str = "name") -> None:
     """Validate a lib/cell/instance name against injection attacks."""
     if not _NAME_RE.fullmatch(name):

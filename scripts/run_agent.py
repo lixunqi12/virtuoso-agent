@@ -46,6 +46,26 @@ from src.safe_bridge import SafeBridge
 from src import spec_evaluator, spec_validator
 
 
+# Valid --llm CLI strings. MUST stay in sync with the factory dispatch
+# table in `src.llm_client.create_llm_client`. Exported as a module-level
+# constant so `tests/test_run_agent_argparse.py` can verify every
+# `llm` key in `scripts.run_benchmark.CHECKPOINTS` is registered here —
+# regression guard against the 2026-05-12 D4 class bug where new clients
+# (openai / mimo / deepseek) landed in llm_client.py + run_benchmark
+# CHECKPOINTS but their CLI string was missing from this list, causing
+# 15/33 grid cells to die at `argparse: invalid choice`.
+LLM_CHOICES: list[str] = [
+    "claude",
+    "gemini",
+    "kimi",
+    "minimax",
+    "openai",
+    "mimo",
+    "deepseek",
+    "ollama",
+]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Safe Analog Design Agent - LLM-driven circuit optimization"
@@ -122,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm",
-        choices=["claude", "gemini", "kimi", "minimax", "ollama"],
+        choices=LLM_CHOICES,
         default=None,
         help=(
             "LLM provider. If omitted, falls back to DEFAULT_LLM in .env "

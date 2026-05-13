@@ -349,16 +349,26 @@ class CircuitAgent:
         if plan_auto is not None:
             logger.info(plan_auto.describe())
 
-        def _append_transcript(iteration: int, role: str, content: str) -> None:
+        def _append_transcript(
+            iteration: int,
+            role: str,
+            content: str,
+            usage: dict[str, Any] | None = None,
+        ) -> None:
             if transcript_file is None:
                 return
             try:
-                entry = {
+                entry: dict[str, Any] = {
                     "iteration": iteration,
                     "role": role,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "content": content,
                 }
+                # Type-check rather than truthiness — a MagicMock from a
+                # unit test that mocks self.llm would otherwise leak in
+                # and break json.dumps.
+                if isinstance(usage, dict):
+                    entry["usage"] = usage
                 with transcript_file.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             except OSError as exc:
@@ -467,7 +477,10 @@ class CircuitAgent:
         _append_transcript(0, "user", messages[0]["content"])
         response = self.llm.chat(messages)
         messages.append({"role": "assistant", "content": response})
-        _append_transcript(0, "assistant", response)
+        _append_transcript(
+            0, "assistant", response,
+            usage=getattr(self.llm, "last_usage", None),
+        )
 
         # Stage 1 rev 6 (2026-04-18): auto-discover Maestro design
         # variables via the bridge if scs_path was given. Baseline
@@ -1050,7 +1063,10 @@ class CircuitAgent:
             _append_transcript(i + 1, "user", next_prompt)
             response = self.llm.chat(messages)
             messages.append({"role": "assistant", "content": response})
-            _append_transcript(i + 1, "assistant", response)
+            _append_transcript(
+                i + 1, "assistant", response,
+                usage=getattr(self.llm, "last_usage", None),
+            )
         else:
             if topology_streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT:
                 abort_reason = "topology"
@@ -1831,16 +1847,26 @@ class HspiceAgent:
             transcript_file.write_text("", encoding="utf-8")
             logger.info("LLM transcript: %s", transcript_file)
 
-        def _append_transcript(iteration: int, role: str, content: str) -> None:
+        def _append_transcript(
+            iteration: int,
+            role: str,
+            content: str,
+            usage: dict[str, Any] | None = None,
+        ) -> None:
             if transcript_file is None:
                 return
             try:
-                entry = {
+                entry: dict[str, Any] = {
                     "iteration": iteration,
                     "role": role,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "content": content,
                 }
+                # Type-check rather than truthiness — a MagicMock from a
+                # unit test that mocks self.llm would otherwise leak in
+                # and break json.dumps.
+                if isinstance(usage, dict):
+                    entry["usage"] = usage
                 with transcript_file.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             except OSError as exc:
@@ -1856,7 +1882,10 @@ class HspiceAgent:
         _append_transcript(0, "user", messages[0]["content"])
         response = self.llm.chat(messages)
         messages.append({"role": "assistant", "content": response})
-        _append_transcript(0, "assistant", response)
+        _append_transcript(
+            0, "assistant", response,
+            usage=getattr(self.llm, "last_usage", None),
+        )
 
         accumulated_vars: dict[str, Any] = {}
         last_measurements: dict = {}
@@ -1884,7 +1913,10 @@ class HspiceAgent:
                 _append_transcript(i + 1, "user", repair_msg)
                 response = self.llm.chat(messages)
                 messages.append({"role": "assistant", "content": response})
-                _append_transcript(i + 1, "assistant", response)
+                _append_transcript(
+                    i + 1, "assistant", response,
+                    usage=getattr(self.llm, "last_usage", None),
+                )
                 parsed = CircuitAgent._parse_llm_response(response)
                 if self._check_contract_violation(parsed):
                     abort_reason = "contract_violation"
@@ -2007,7 +2039,10 @@ class HspiceAgent:
             _append_transcript(i + 1, "user", next_prompt)
             response = self.llm.chat(messages)
             messages.append({"role": "assistant", "content": response})
-            _append_transcript(i + 1, "assistant", response)
+            _append_transcript(
+                i + 1, "assistant", response,
+                usage=getattr(self.llm, "last_usage", None),
+            )
         else:
             if topology_streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT:
                 abort_reason = "topology"
