@@ -1128,3 +1128,43 @@ class TestDryRunRunsValidators:
         ]):
             with pytest.raises(ValueError, match="YAML boolean"):
                 cli_module.main()
+
+
+class TestMaestroExprQuotedNetRefs:
+    @pytest.mark.parametrize('expr', [
+        'VT("/Vout_p")',
+        '(VT("/Vp") - VT("/Vn"))',
+        'clip(VT("/Vp") 1e-7 2e-7)',
+        'peakToPeak(clip((VT("/Vout_p") - VT("/Vout_n")) 1.5e-07 2e-07))',
+        'IT("/I0/M2/D")',
+        'average(abs(clip(IT("/I0/M2/D") 1.5e-07 2e-07)))',
+        'getData("/Vout_p")',
+    ])
+    def test_quoted_net_ref_tokens_are_allowed(
+        self, bridge, writer_mocks, expr,
+    ):
+        bridge.add_maestro_output(name='x', expr=expr)
+        kwargs = writer_mocks['add_output'].call_args.kwargs
+        assert kwargs['expr'] == expr
+        assert kwargs['signal_name'] == ''
+
+    @pytest.mark.parametrize('expr', [
+        'VT("/Vp") + "evil"',
+        'VT("hello world")',
+        'VT("/Vp\\";rm -rf /")',
+        'VT("../etc/passwd")',
+        'system("/cmd")',
+        'getq("/foo")',
+        'VT("/Vp" "/Vn")',
+        '"VT"("/Vp")',
+        '|VT|("/Vp")',
+        "VT('/Vp')",
+        '"x"',
+        'VT("/' + ('a' * 257) + '")',
+    ])
+    def test_non_net_ref_string_literals_still_rejected(
+        self, bridge, writer_mocks, expr,
+    ):
+        with pytest.raises(ValueError):
+            bridge.add_maestro_output(name='x', expr=expr)
+        assert not writer_mocks['add_output'].called

@@ -339,7 +339,7 @@ _MAESTRO_OUTPUT_TYPES = frozenset({"", "signal", "expr"})
 # pinning the new function).
 _MAESTRO_EXPR_ALLOWED_FUNCS = frozenset({
     # Probes / waveform constructors
-    "VT", "IT", "VS", "IS", "VF", "IF", "v", "i",
+    "VT", "IT", "VS", "IS", "VF", "IF", "v", "i", "getData",
     # Sample / span readouts
     "value", "valueOf", "average", "mean", "stddev",
     "rms", "integ", "deriv",
@@ -469,6 +469,35 @@ _SKILL_INLINE_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB — our largest .il is ~60 KB
 # the SKILL-side safeOcean_validSigName / validProbePath / validKind.
 _SIG_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]{0,31}\Z")
 _PROBE_PATH_RE = re.compile(r"\A(/[A-Za-z_][A-Za-z0-9_]*){1,8}\Z")
+
+# T2 (2026-05-18): quoted net refs are the only string literals allowed
+# inside Maestro calculator expressions. The path source is derived from
+# _PROBE_PATH_RE so signal/probe validation has one regex owner.
+#
+# IMPORTANT for future contributors: every function added here MUST also
+# be added to _MAESTRO_EXPR_ALLOWED_FUNCS below. The function-call scan
+# in _validate_maestro_expr runs on the *original* expr (not the
+# stripped one), so a name that only appears in this set will get its
+# quoted-token form past the forbidden-char gate but then get rejected
+# by the call-allow-list — confusing failure mode. Keep both in sync.
+_MAESTRO_EXPR_NET_REF_FUNCS = frozenset({
+    "VT", "IT", "v", "i", "VS", "IS", "getData",
+})
+_MAESTRO_EXPR_NET_REF_PATH_MAX_LEN = 128
+_MAESTRO_EXPR_NET_REF_PLACEHOLDER = "__NETREF__"
+_MAESTRO_EXPR_NET_REF_PATH_RE_SOURCE = (
+    _PROBE_PATH_RE.pattern.removeprefix(r"\A").removesuffix(r"\Z")
+)
+_MAESTRO_EXPR_NET_REF_PATH_RE_SOURCE = (
+    _MAESTRO_EXPR_NET_REF_PATH_RE_SOURCE.replace("(", "(?:", 1)
+)
+_MAESTRO_EXPR_NET_REF_FUNC_RE_SOURCE = "|".join(
+    sorted(_MAESTRO_EXPR_NET_REF_FUNCS, key=len, reverse=True)
+)
+_MAESTRO_EXPR_NET_REF_RE = re.compile(
+    rf'\b({_MAESTRO_EXPR_NET_REF_FUNC_RE_SOURCE})'
+    rf'\("({_MAESTRO_EXPR_NET_REF_PATH_RE_SOURCE})"\)'
+)
 _OCEAN_SIGNAL_KINDS = frozenset({"V", "I", "Vdiff", "Vsum_half"})
 _OCEAN_CROSS_DIRS = frozenset({"rising", "falling", "either"})
 # Kinds whose waveform is built from exactly N probe paths. Used by PC
@@ -2590,38 +2619,61 @@ class SafeBridge:
                     "Maestro output expr contains disallowed control char "
                     f"(len={len(expr)}, code=0x{code:02x})."
                 )
+        net_refs = _MAESTRO_EXPR_NET_REF_RE.findall(expr)
+        for fn, path in net_refs:
+            if fn not in _MAESTRO_EXPR_NET_REF_FUNCS:
+                raise ValueError(
+                    f"Maestro output expr contains unsupported net-ref "
+                    f"function {fn!r}."
+                )
+            if not _PROBE_PATH_RE.fullmatch(path):
+                raise ValueError(
+                    "Maestro output expr contains invalid net-ref path "
+                    f"(len={len(path)})."
+                )
+            if len(path) > _MAESTRO_EXPR_NET_REF_PATH_MAX_LEN:
+                raise ValueError(
+                    "Maestro output expr net-ref path too long "
+                    f"(len={len(path)}, "
+                    f"max={_MAESTRO_EXPR_NET_REF_PATH_MAX_LEN})."
+                )
+        expr_stripped = _MAESTRO_EXPR_NET_REF_RE.sub(
+            _MAESTRO_EXPR_NET_REF_PLACEHOLDER, expr,
+        )
         # Quote / backslash / backtick / pipe / apostrophe would let the
         # user terminate the SKILL string literal or invoke a reader macro.
+        # Valid quoted net-ref tokens have been replaced above; any quote
+        # left in expr_stripped is therefore an illegal string literal.
         # R3 (2026-05-14, codex_reviewer_v4 P0): the pipe ``|`` and
         # apostrophe ``'`` are SKILL/Lisp reader-syntax markers that the
         # allow-list scan below does NOT see because they don't match
         # ``identifier(``. Specifically:
-        #   * ``|foo bar|(...)`` — escaped-symbol reader; turns the
+        #   * ``|foo bar|(...)`` - escaped-symbol reader; turns the
         #     enclosed text into a symbol name, bypassing the allow-list
         #     entirely (e.g. ``|system|("rm -rf /")``).
-        #   * ``'(getq cv prop)`` — quote macro; produces a literal form
+        #   * ``'(getq cv prop)`` - quote macro; produces a literal form
         #     that the SKILL evaluator may still introspect.
         # Backtick (already blocked) is the third reader macro of this
         # family. Reject all three at the char-blocklist gate so they
         # never reach the allow-list scan.
         for bad in ('"', "\\", "`", "|", "'"):
-            if bad in expr:
+            if bad in expr_stripped:
                 raise ValueError(
                     f"Maestro output expr contains forbidden character "
                     f"{bad!r} (len={len(expr)})."
                 )
         # Semicolon would let the user splice a second SKILL form after
         # the writer's closing paren. Comma is harmless but @ ! # $ are
-        # all reader macros / quoters in SKILL/Lisp — reject preemptively.
+        # all reader macros / quoters in SKILL/Lisp - reject preemptively.
         # R3 P3 (2026-05-14): ``!`` is included to match the comment.
         # SKILL ``!=`` is a legitimate comparison operator in general
         # SKILL, but the OCEAN measure-expression allow-list contains no
         # conditional / comparison functions (no ``if``, ``cond``,
         # ``equal``, ``unequal``), so ``!=`` cannot appear in a legal
-        # measure expression here — blocking ``!`` loses no expressive
+        # measure expression here - blocking ``!`` loses no expressive
         # power and forecloses one more reader-macro family.
         for bad in (";", "@", "!", "$", "#", "?"):
-            if bad in expr:
+            if bad in expr_stripped:
                 raise ValueError(
                     f"Maestro output expr contains forbidden character "
                     f"{bad!r} (len={len(expr)})."

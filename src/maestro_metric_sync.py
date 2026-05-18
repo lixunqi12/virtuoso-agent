@@ -90,24 +90,24 @@ def _waveform_expr(signal_entry: dict) -> str | None:
     # is f-string-spliced into the OCEAN expression below. Without the
     # ``_PROBE_PATH_RE`` check (reused from safe_bridge — single source
     # of truth), a crafted path like ``/V) 0.0 1e-09)) + average(clip(
-    # VT(/SECRET`` would close the ``VT(...)`` form and inject extra
+    # VT("/SECRET")`` would close the ``VT(...)`` form and inject extra
     # measurements, breaking the spec-containment invariant. Same RE
     # SafeBridge applies before it ships paths to SKILL, so anything
     # the dump pipeline accepts will also clear this gate.
     if not all(_PROBE_PATH_RE.match(p) for p in paths):
         return None
     if kind == "V":
-        return f"VT({paths[0]})"
+        return f'VT("{paths[0]}")'
     if kind == "I":
-        return f"IT({paths[0]})"
+        return f'IT("{paths[0]}")'
     if kind == "Vdiff":
         if len(paths) < 2:
             return None
-        return f"(VT({paths[0]}) - VT({paths[1]}))"
+        return f'(VT("{paths[0]}") - VT("{paths[1]}"))'
     if kind == "Vsum_half":
         if len(paths) < 2:
             return None
-        return f"((VT({paths[0]}) + VT({paths[1]})) / 2.0)"
+        return f'((VT("{paths[0]}") + VT("{paths[1]}")) / 2.0)'
     return None
 
 
