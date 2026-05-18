@@ -3091,13 +3091,23 @@ class SafeBridge:
             len(resolved_test), len(name), output_type,
             bool(signal_name), bool(expr),
         )
+        # T2.1 (2026-05-18): SKILL string-literal escape for expr.
+        # virtuoso_bridge.virtuoso.maestro.writer.add_output splices
+        # expr into `?expr "{expr}"` without escaping; the inner quotes
+        # in net-ref tokens like VT("/Vp") then prematurely terminate
+        # the outer SKILL string literal (real-Maestro lineread/read
+        # syntax error). _validate_maestro_expr already rejects '\', so
+        # the only '"' chars in expr are inside whitelisted net-ref
+        # tokens; replacing them with \" yields valid SKILL string
+        # contents that unescape back to the original expr remote-side.
+        skill_expr = expr.replace('"', r'\"') if expr else expr
         raw = _mae_writer.add_output(
             self.client,
             name,
             resolved_test,
             output_type=output_type,
             signal_name=signal_name,
-            expr=expr,
+            expr=skill_expr,
             session=session,
         )
         # R2 P1-2 / R3 P2: record AFTER writer returns so a writer

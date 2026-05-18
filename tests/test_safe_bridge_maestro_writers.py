@@ -1145,7 +1145,10 @@ class TestMaestroExprQuotedNetRefs:
     ):
         bridge.add_maestro_output(name='x', expr=expr)
         kwargs = writer_mocks['add_output'].call_args.kwargs
-        assert kwargs['expr'] == expr
+        # T2.1: SafeBridge SKILL-escapes `"` → `\"` before handing expr
+        # to virtuoso_bridge writer, which splices it into the outer
+        # `?expr "..."` SKILL string literal.
+        assert kwargs['expr'] == expr.replace('"', r'\"')
         assert kwargs['signal_name'] == ''
 
     @pytest.mark.parametrize('expr', [
@@ -1168,3 +1171,27 @@ class TestMaestroExprQuotedNetRefs:
         with pytest.raises(ValueError):
             bridge.add_maestro_output(name='x', expr=expr)
         assert not writer_mocks['add_output'].called
+
+    def test_quote_chars_skill_escaped_before_writer(
+        self, bridge, writer_mocks,
+    ):
+        """Every `"` in expr must reach writer as `\\"` so the outer
+        SKILL `?expr "..."` literal does not terminate early."""
+        bridge.add_maestro_output(
+            name='vdiff_pp',
+            expr='peakToPeak(clip((VT("/Vp") - VT("/Vn")) 1e-7 2e-7))',
+        )
+        forwarded = writer_mocks['add_output'].call_args.kwargs['expr']
+        assert '"' not in forwarded.replace(r'\"', '')
+        assert forwarded.count(r'\"') == 4
+
+    def test_quote_free_expr_passes_through_unchanged(
+        self, bridge, writer_mocks,
+    ):
+        """Legacy quote-free exprs (no net-ref tokens) must not be
+        touched by the escape — backwards-compat for any caller still
+        using bareword signal refs the validator happens to accept."""
+        expr = 'average(clip(IT(/I0/D) 1e-7 2e-7))'
+        bridge.add_maestro_output(name='id_avg', expr=expr)
+        forwarded = writer_mocks['add_output'].call_args.kwargs['expr']
+        assert forwarded == expr

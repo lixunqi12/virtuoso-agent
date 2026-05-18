@@ -131,8 +131,9 @@ class TestStatTemplates:
         assert expr.startswith(f"{fn}(clip("), expr
         # Window bounds appear as floats in scientific form
         assert "0.0" in expr and "2e-07" in expr, expr
-        # Vdiff renders as (VT(/p) - VT(/n))
-        assert '(VT("/Vout_p") - VT("/Vout_n"))' in expr, expr
+        # Vdiff renders as (VT("/p") - VT("/n")) with SafeBridge SKILL
+        # escape applied to the inner quotes (T2.1).
+        assert r'(VT(\"/Vout_p\") - VT(\"/Vout_n\"))' in expr, expr
 
     def test_mean_abs_uses_average_of_abs(self, bridge, writer_mocks):
         block = _eval_block_simple(stat="mean_abs")
@@ -163,7 +164,7 @@ class TestSignalKinds:
         }
         sync_spec_metrics_to_maestro(bridge, block)
         expr = writer_mocks["add_output"].call_args.kwargs["expr"]
-        assert 'VT("/Vout")' in expr
+        assert r'VT(\"/Vout\")' in expr
         assert "IT(" not in expr
         assert " - " not in expr
 
@@ -180,13 +181,13 @@ class TestSignalKinds:
         }
         sync_spec_metrics_to_maestro(bridge, block)
         expr = writer_mocks["add_output"].call_args.kwargs["expr"]
-        assert 'IT("/I0/M2/D")' in expr
+        assert r'IT(\"/I0/M2/D\")' in expr
 
     def test_kind_Vdiff_subtracts_two_paths(self, bridge, writer_mocks):
         block = _eval_block_simple()
         sync_spec_metrics_to_maestro(bridge, block)
         expr = writer_mocks["add_output"].call_args.kwargs["expr"]
-        assert '(VT("/Vout_p") - VT("/Vout_n"))' in expr
+        assert r'(VT(\"/Vout_p\") - VT(\"/Vout_n\"))' in expr
 
     def test_kind_Vsum_half_averages_two_paths(self, bridge, writer_mocks):
         block = {
@@ -202,7 +203,7 @@ class TestSignalKinds:
         }
         sync_spec_metrics_to_maestro(bridge, block)
         expr = writer_mocks["add_output"].call_args.kwargs["expr"]
-        assert '((VT("/Vp") + VT("/Vn")) / 2.0)' in expr
+        assert r'((VT(\"/Vp\") + VT(\"/Vn\")) / 2.0)' in expr
 
 
 # --------------------------------------------------------------------- #
@@ -595,7 +596,7 @@ class TestPathInjectionContainment:
         expr = writer_mocks["add_output"].call_args.kwargs["expr"]
         # The exact path appears once inside VT(...) — no truncation,
         # no extra parens injected.
-        assert 'VT("/core/vco/tank/Vout")' in expr
+        assert r'VT(\"/core/vco/tank/Vout\")' in expr
 
     def test_too_deep_hierarchy_path_is_warn_skipped(
         self, bridge, writer_mocks
