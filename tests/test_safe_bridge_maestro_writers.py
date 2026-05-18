@@ -1195,3 +1195,101 @@ class TestMaestroExprQuotedNetRefs:
         bridge.add_maestro_output(name='id_avg', expr=expr)
         forwarded = writer_mocks['add_output'].call_args.kwargs['expr']
         assert forwarded == expr
+
+
+# ---------------------------------------------------------------- #
+#  T3: out-bound DoS cap on cobi-returned strings
+# ---------------------------------------------------------------- #
+
+
+class TestRemoteOutputSizeCap:
+    """The PC-side cap (`_cap_remote_output`) closes the out-bound DoS
+    gap that the in-bound 128-char cap (`_RF_STRING_MAX_LEN`) does not
+    cover: a misbehaving cobi returning hundreds of MB of SKILL output
+    would otherwise flow unchecked into _scrub / log / LLM context.
+    Cap rejects loudly so the caller can investigate the upstream
+    cause rather than silently truncating away evidence of a bug."""
+
+    def test_helper_passes_through_short_string(self):
+        from src.safe_bridge import _cap_remote_output
+        assert _cap_remote_output("ok", label="t") == "ok"
+
+    def test_helper_passes_through_non_string(self):
+        from src.safe_bridge import _cap_remote_output
+        # dict / list / int / None — only string-shaped DoS is in scope
+        assert _cap_remote_output({"a": 1}, label="t") == {"a": 1}
+        assert _cap_remote_output([1, 2, 3], label="t") == [1, 2, 3]
+        assert _cap_remote_output(None, label="t") is None
+        assert _cap_remote_output(42, label="t") == 42
+
+    def test_helper_passes_through_at_cap_boundary(self):
+        from src.safe_bridge import (
+            _REMOTE_OUTPUT_MAX_CHARS, _cap_remote_output,
+        )
+        # Exactly at cap → allowed.
+        s = "x" * _REMOTE_OUTPUT_MAX_CHARS
+        assert _cap_remote_output(s, label="t") is s
+
+    def test_helper_rejects_over_cap_string(self):
+        from src.safe_bridge import (
+            _REMOTE_OUTPUT_MAX_CHARS, _cap_remote_output,
+        )
+        s = "x" * (_REMOTE_OUTPUT_MAX_CHARS + 1)
+        with pytest.raises(ValueError, match="exceeds cap"):
+            _cap_remote_output(s, label="probe_xyz")
+
+    def test_helper_error_message_includes_label(self):
+        from src.safe_bridge import (
+            _REMOTE_OUTPUT_MAX_CHARS, _cap_remote_output,
+        )
+        s = "x" * (_REMOTE_OUTPUT_MAX_CHARS + 1)
+        with pytest.raises(ValueError, match="my_call_site_label"):
+            _cap_remote_output(s, label="my_call_site_label")
+
+    def test_add_output_rejects_over_cap_writer_return(
+        self, bridge, writer_mocks,
+    ):
+        """Sample hookup: confirm add_maestro_output wires through the
+        cap (one of 6 _mae_writer.* sites + 3 direct getattr sites)."""
+        from src.safe_bridge import _REMOTE_OUTPUT_MAX_CHARS
+        writer_mocks['add_output'].return_value = (
+            "x" * (_REMOTE_OUTPUT_MAX_CHARS + 1)
+        )
+        with pytest.raises(ValueError, match="add_maestro_output"):
+            bridge.add_maestro_output(
+                name='vp', expr='peakToPeak(VT("/Vp"))',
+            )
+
+    def test_set_analysis_rejects_over_cap_writer_return(
+        self, bridge, writer_mocks,
+    ):
+        """Second sample hookup, covers set_analysis path."""
+        from src.safe_bridge import _REMOTE_OUTPUT_MAX_CHARS
+        writer_mocks['set_analysis'].return_value = (
+            "x" * (_REMOTE_OUTPUT_MAX_CHARS + 1)
+        )
+        with pytest.raises(ValueError, match="set_maestro_analysis"):
+            bridge.set_maestro_analysis(
+                analysis="tran",
+                options={"start": "0", "stop": "200n"},
+            )
+
+    def test_set_spec_rejects_over_cap_writer_return(
+        self, bridge, writer_mocks,
+    ):
+        from src.safe_bridge import _REMOTE_OUTPUT_MAX_CHARS
+        writer_mocks['set_spec'].return_value = (
+            "x" * (_REMOTE_OUTPUT_MAX_CHARS + 1)
+        )
+        with pytest.raises(ValueError, match="set_maestro_spec"):
+            bridge.set_maestro_spec(name='m', gt=0.5)
+
+    def test_normal_writer_return_still_works(
+        self, bridge, writer_mocks,
+    ):
+        """Sanity: under-cap writer returns must NOT be affected."""
+        bridge.add_maestro_output(
+            name='vp', expr='peakToPeak(VT("/Vp"))',
+        )
+        # No raise — writer return was the fixture default ('ok-output',
+        # 9 chars), well under cap.

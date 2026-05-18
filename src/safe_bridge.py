@@ -221,6 +221,17 @@ _MAESTRO_ALLOWED_ANALYSES = _OCEAN_ALLOWED_ANALYSES | frozenset({
 # string value below is either a finite enum or a validated safe token/probe.
 _RF_STRING_MAX_LEN = 128
 _RF_FOUNDRY_REDACTED = "<redacted: matches foundry-leak pattern>"
+
+# Cobi → PC return-value size cap. Defends against unbounded-string
+# DoS: a malicious / buggy remote returning hundreds of MB of SKILL
+# output would otherwise feed straight into _scrub, log formatters,
+# and ultimately the LLM context — exhausting memory on PC and tokens
+# on the LLM. Maestro / SKILL ops invoked by this module return at
+# most a few tens of KB in normal operation; 1 MiB chars is ~100x
+# typical with wide margin for legitimate large reads. Anything over
+# this cap is presumed adversarial or buggy and rejected loudly (raise)
+# rather than silently truncated, so the caller can investigate.
+_REMOTE_OUTPUT_MAX_CHARS = 1 << 20
 _PSS_ALLOWED_OPTIONS = frozenset({
     "fund", "freq", "harms", "tstab", "errpreset",
     "oscillator", "autonomous", "fundname", "skipdc", "maxstep",
@@ -545,6 +556,27 @@ def scrub(value: Any) -> Any:
     rather than reaching into the underscore-prefixed implementation.
     """
     return _scrub(value)
+
+
+def _cap_remote_output(value: Any, *, label: str) -> Any:
+    """Reject cobi-returned string values larger than the size cap.
+
+    Closes the out-bound DoS gap noted alongside the in-bound 128-char
+    input cap (``_RF_STRING_MAX_LEN``): without this, a misbehaving
+    remote could return arbitrarily large SKILL output which would
+    flow unchecked into :func:`_scrub`, log formatters, and the LLM
+    context. Non-string values pass through unchanged (cap only bounds
+    string-shaped DoS; dict/list payloads are checked by their own
+    structural validators downstream).
+    """
+    if isinstance(value, str) and len(value) > _REMOTE_OUTPUT_MAX_CHARS:
+        raise ValueError(
+            f"{label}: cobi return size {len(value)} chars exceeds cap "
+            f"{_REMOTE_OUTPUT_MAX_CHARS}; refusing to ingest (possible "
+            "DoS or PDK-leak surface — investigate remote behavior "
+            "rather than raising the cap)."
+        )
+    return value
 
 
 def _validate_name(name: str, label: str = "name") -> None:
@@ -2527,7 +2559,10 @@ class SafeBridge:
                 f"_list_remote_maestro_tests SKILL probe failed: "
                 f"{_scrub(str(err0))}"
             )
-        raw = getattr(result, "output", "") or ""
+        raw = _cap_remote_output(
+            getattr(result, "output", "") or "",
+            label="_list_remote_maestro_tests",
+        )
         if not raw or raw.strip() in ("nil", '""'):
             return set()
         return {
@@ -2910,14 +2945,17 @@ class SafeBridge:
             "cell_len=%d, view=%s, simulator=%s)",
             len(resolved_test), len(lib), len(cell), view, simulator,
         )
-        raw = _mae_writer.create_test(
-            self.client,
-            resolved_test,
-            lib=lib,
-            cell=cell,
-            view=view,
-            simulator=simulator,
-            session=session,
+        raw = _cap_remote_output(
+            _mae_writer.create_test(
+                self.client,
+                resolved_test,
+                lib=lib,
+                cell=cell,
+                view=view,
+                simulator=simulator,
+                session=session,
+            ),
+            label="create_maestro_test",
         )
         # Record AFTER the writer returns — if create_test raised, the
         # remote-side row was not created and we shouldn't dedup against
@@ -3001,13 +3039,16 @@ class SafeBridge:
             "model_section_len=%d, num_vars=%d)",
             len(name), bool(model_file), len(model_section), len(var_pairs),
         )
-        raw = _mae_writer.setup_corner(
-            self.client,
-            name,
-            model_file=model_file,
-            model_section=model_section,
-            variables=var_pairs or None,
-            session=session,
+        raw = _cap_remote_output(
+            _mae_writer.setup_corner(
+                self.client,
+                name,
+                model_file=model_file,
+                model_section=model_section,
+                variables=var_pairs or None,
+                session=session,
+            ),
+            label="setup_maestro_corner",
         )
         return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
 
@@ -3101,14 +3142,17 @@ class SafeBridge:
         # tokens; replacing them with \" yields valid SKILL string
         # contents that unescape back to the original expr remote-side.
         skill_expr = expr.replace('"', r'\"') if expr else expr
-        raw = _mae_writer.add_output(
-            self.client,
-            name,
-            resolved_test,
-            output_type=output_type,
-            signal_name=signal_name,
-            expr=skill_expr,
-            session=session,
+        raw = _cap_remote_output(
+            _mae_writer.add_output(
+                self.client,
+                name,
+                resolved_test,
+                output_type=output_type,
+                signal_name=signal_name,
+                expr=skill_expr,
+                session=session,
+            ),
+            label="add_maestro_output",
         )
         # R2 P1-2 / R3 P2: record AFTER writer returns so a writer
         # exception does not poison the dedup set. Both Option I sync
@@ -3156,13 +3200,16 @@ class SafeBridge:
             "has_lt=%s, has_gt=%s)",
             len(resolved_test), len(name), bool(lt_str), bool(gt_str),
         )
-        raw = _mae_writer.set_spec(
-            self.client,
-            name,
-            resolved_test,
-            lt=lt_str,
-            gt=gt_str,
-            session=session,
+        raw = _cap_remote_output(
+            _mae_writer.set_spec(
+                self.client,
+                name,
+                resolved_test,
+                lt=lt_str,
+                gt=gt_str,
+                session=session,
+            ),
+            label="set_maestro_spec",
         )
         return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
 
@@ -3267,13 +3314,16 @@ class SafeBridge:
             "enable=%s, num_opts=%d)",
             len(resolved_test), analysis, enable, len(pairs),
         )
-        raw = _mae_writer.set_analysis(
-            self.client,
-            resolved_test,
-            analysis,
-            enable=enable,
-            options=options_str,
-            session=session,
+        raw = _cap_remote_output(
+            _mae_writer.set_analysis(
+                self.client,
+                resolved_test,
+                analysis,
+                enable=enable,
+                options=options_str,
+                session=session,
+            ),
+            label="set_maestro_analysis",
         )
         configured = self._configured_maestro_analyses.setdefault(
             resolved_test, set(),
@@ -3309,11 +3359,14 @@ class SafeBridge:
             "output_dir_len=%d)",
             len(resolved_test), len(corner), len(output_dir),
         )
-        raw = _mae_writer.create_netlist_for_corner(
-            self.client,
-            resolved_test,
-            corner,
-            output_dir,
+        raw = _cap_remote_output(
+            _mae_writer.create_netlist_for_corner(
+                self.client,
+                resolved_test,
+                corner,
+                output_dir,
+            ),
+            label="create_netlist_for_corner",
         )
         return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
 
@@ -3403,7 +3456,10 @@ class SafeBridge:
         # Check for SKILL-side failure: the call returns a Viva plot
         # handle on success.  *Error*, nil, or empty output means the
         # plot failed (wrong PSF path, no tran data, etc.).
-        output = getattr(result, "output", "") or ""
+        output = _cap_remote_output(
+            getattr(result, "output", "") or "",
+            label="_plot_waveform",
+        )
         ok = getattr(result, "ok", True)
         if not ok:
             errors = getattr(result, "errors", [])
@@ -3629,7 +3685,10 @@ class SafeBridge:
                 )
             return result
 
-        payload = getattr(result, "output", result)
+        payload = _cap_remote_output(
+            getattr(result, "output", result),
+            label="_skill_helper_dispatch",
+        )
         if isinstance(payload, dict):
             if "error" in payload:
                 raise RuntimeError(
