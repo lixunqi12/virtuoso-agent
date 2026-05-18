@@ -343,26 +343,29 @@ def sync_spec_metrics_to_maestro(
             continue
 
         # Pass bounds (optional). spec_evaluator validates ``pass`` as
-        # [lo, hi] where either may be None. SafeBridge requires at
-        # least one of lt/gt to be set.
+        # [lo, hi] where either may be None. Maestro's maeSetSpec only
+        # accepts one bound per call ("More than one spec type passed"),
+        # so a double-bounded range must be issued as two separate calls.
         pass_range = metric.get("pass")
         if isinstance(pass_range, (list, tuple)) and len(pass_range) == 2:
             lo, hi = pass_range
-            bound_kwargs: dict[str, Any] = {}
+            bounds: list[tuple[str, Any]] = []
             if isinstance(lo, (int, float)) and not isinstance(lo, bool):
-                bound_kwargs["gt"] = _format_skill_number(lo)
+                bounds.append(("gt", lo))
             if isinstance(hi, (int, float)) and not isinstance(hi, bool):
-                bound_kwargs["lt"] = _format_skill_number(hi)
-            if bound_kwargs:
+                bounds.append(("lt", hi))
+            for kind, value in bounds:
                 try:
                     bridge.set_maestro_spec(
-                        name=name, test=test, **bound_kwargs,
+                        name=name, test=test,
+                        **{kind: _format_skill_number(value)},
                     )
                 except Exception as exc:  # noqa: BLE001 — fail-soft
                     log.warning(
-                        "maestro_metric_sync: set_maestro_spec for %r "
-                        "failed (%s: %s); output landed without bounds.",
-                        name, type(exc).__name__, exc,
+                        "maestro_metric_sync: set_maestro_spec(%s) for "
+                        "%r failed (%s: %s); output landed without that "
+                        "bound.",
+                        kind, name, type(exc).__name__, exc,
                     )
                     # Output itself succeeded — keep it in ``added``.
 

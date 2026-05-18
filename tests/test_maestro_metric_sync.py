@@ -226,15 +226,24 @@ class TestScaleAndPassBounds:
         # No outer multiplication wrapper
         assert expr.startswith("frequency(clip(")
 
-    def test_pass_both_bounds_forwards_lt_and_gt(
+    def test_pass_both_bounds_split_into_two_calls(
         self, bridge, writer_mocks
     ):
+        # maeSetSpec rejects multi-bound calls; sync must issue two
+        # separate set_spec calls (one ?gt, one ?lt).
         block = _eval_block_simple(stat="freq_Hz", pass_=[19.5, 20.5])
         sync_spec_metrics_to_maestro(bridge, block)
-        assert writer_mocks["set_spec"].called
-        kwargs = writer_mocks["set_spec"].call_args.kwargs
-        assert kwargs["gt"] == "19.5"
-        assert kwargs["lt"] == "20.5"
+        assert writer_mocks["set_spec"].call_count == 2
+        kwargs_seen = [c.kwargs for c in writer_mocks["set_spec"].call_args_list]
+        gt_calls = [k for k in kwargs_seen if k.get("gt")]
+        lt_calls = [k for k in kwargs_seen if k.get("lt")]
+        assert len(gt_calls) == 1 and gt_calls[0]["gt"] == "19.5"
+        assert len(lt_calls) == 1 and lt_calls[0]["lt"] == "20.5"
+        # Each call must carry only one bound kind (no mixed gt+lt).
+        for k in kwargs_seen:
+            has_gt = bool(k.get("gt"))
+            has_lt = bool(k.get("lt"))
+            assert has_gt ^ has_lt
 
     def test_pass_lo_only_forwards_gt_not_lt(
         self, bridge, writer_mocks
@@ -451,9 +460,11 @@ class TestIdempotency:
         out1 = sync_spec_metrics_to_maestro(bridge, block)
         out2 = sync_spec_metrics_to_maestro(bridge, block)
         assert out1["added"] == out2["added"] == ["m"]
-        # Each call invoked add_output and set_spec once.
+        # Each sync invokes add_output once and set_spec twice
+        # (double-bounded range → one ?gt + one ?lt call), so two
+        # invocations land 2 adds and 4 spec calls.
         assert writer_mocks["add_output"].call_count == 2
-        assert writer_mocks["set_spec"].call_count == 2
+        assert writer_mocks["set_spec"].call_count == 4
 
 
 # --------------------------------------------------------------------- #
