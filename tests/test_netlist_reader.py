@@ -511,7 +511,7 @@ class TestReadSchematicCli:
                 "--netlist", str(NETLIST),
                 "--testbench", str(TESTBENCH),
             ],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", timeout=60,
         )
         assert result.returncode == 0, (
             f"CLI exited {result.returncode}; stderr={result.stderr[:500]}"
