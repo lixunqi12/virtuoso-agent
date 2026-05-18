@@ -855,8 +855,11 @@ class TestRepairFlowE2E:
         )
 
     def test_bad_bad_aborts_without_sim(self, tmp_path):
-        """Two consecutive bad responses → abort, no simulation."""
+        """Track C v2 raised the repair cap from 1 to 3 (see
+        _CONTRACT_REPAIR_MAX in src/agent.py): 4 consecutive bad
+        responses (initial + 3 repair attempts) → abort, no sim."""
         import json
+        from src.agent import _CONTRACT_REPAIR_MAX
 
         bad_resp1 = json.dumps({
             "design_parameters": {"I_bias_mA": 1.0},
@@ -866,9 +869,19 @@ class TestRepairFlowE2E:
             "design_vars": {"V_dd": "1.2V"},
             "expected_outcome": "more headroom",
         })
+        bad_resp3 = json.dumps({
+            "design_vars": {"BogusName": "10"},
+            "extra_key": "still wrong",
+        })
+        bad_resp4 = json.dumps({
+            "design_vars": {"target_frequency": "20"},
+            "still_wrong": True,
+        })
         agent, llm = self._make_agent_with_responses(
             bad_resp1,  # initial chat → bad
-            bad_resp2,  # repair retry → still bad
+            bad_resp2,  # repair attempt 1 → still bad
+            bad_resp3,  # repair attempt 2 → still bad
+            bad_resp4,  # repair attempt 3 → still bad, abort here
         )
         result = agent.run(
             "pll", "LC_VCO", "LC_VCO_tb",
@@ -876,8 +889,8 @@ class TestRepairFlowE2E:
             scs_path="/fake/input.scs",
             transcript_path=str(tmp_path / "t.jsonl"),
         )
-        # LLM called exactly twice: initial + one repair
-        assert llm.chat.call_count == 2
+        # LLM called initial + cap repair attempts.
+        assert llm.chat.call_count == 1 + _CONTRACT_REPAIR_MAX
         # No simulation should have run
         assert agent.bridge.run_ocean_sim.call_count == 0
         # Should abort with contract_violation reason

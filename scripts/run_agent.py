@@ -277,6 +277,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "D11 transferability scaffold (2026-05-14): walk argparse + "
+            "spec load + project resolve + spec-evaluator validation, "
+            "then exit 0 BEFORE any LLM client construction, Virtuoso "
+            "bridge connect, or remote round-trip. Use to verify a new "
+            "projects/<name>/constraints/spec.md is wired correctly "
+            "without burning vendor tokens or touching cobi. Compatible "
+            "with both --sim-backend=spectre and --sim-backend=hspice; "
+            "stops at the same boundary for either."
+        ),
+    )
     args = parser.parse_args()
 
     # --testbench is the canonical run-target flag; --netlist is kept as
@@ -679,6 +693,35 @@ def main() -> int:
                     "before any OCEAN round-trip.", _n_issues,
                 )
                 return 1
+
+    # D11 transferability scaffold (2026-05-14): --dry-run stops here,
+    # AFTER spec parse + project resolve + (optional) feasibility check
+    # but BEFORE any LLM client construction, Virtuoso bridge connect,
+    # or remote round-trip. Lets a new projects/<name>/constraints/
+    # spec.md be smoke-tested on a non-cobi box without burning vendor
+    # tokens or requiring the SKILL daemon. Compatible with both
+    # backends: stops at the same boundary for spectre and hspice.
+    if args.dry_run:
+        print("\n" + "=" * 60)
+        print("DRY-RUN — exiting before LLM / bridge / remote calls")
+        print("=" * 60)
+        print(f"  project          : {project.name} (root={project.root})")
+        print(f"  spec             : {spec_path} ({len(spec_text)} chars)")
+        print(f"  spec eval block  : {'parsed OK' if _spec_block else 'absent (LLM-judged fallback)'}")
+        print(f"  llm provider     : {args.llm} (NOT constructed)")
+        print(f"  sim backend      : {args.sim_backend}")
+        if args.sim_backend == "spectre":
+            print(f"  lib/cell/tb_cell : {args.lib}/{args.cell}/{args.tb_cell}")
+            print(f"  analysis         : {args.analysis}")
+            print(f"  remote_skill_dir : {args.remote_skill_dir or '<unset>'}")
+        else:
+            print(f"  testbench        : {args.netlist}")
+            print(f"  remote_spec_root : {args.remote_spec_root or '<unset>'}")
+            print(f"  hspice_loop      : {args.hspice_loop}")
+        print(f"  max_iter         : {args.max_iter}")
+        print(f"  transcript path  : {transcript_path}")
+        print("\nDRY-RUN OK — wiring verified. Re-run without --dry-run to fire.")
+        return 0
 
     # Backend dispatch. Two HSpice modes:
     #   --hspice-loop OFF (default): single-shot regression flow --

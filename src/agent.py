@@ -23,6 +23,11 @@ from typing import Any, Iterable
 from . import spec_evaluator
 from .failure_codes import DumpStatus
 from .llm_client import LLMClient
+from .maestro_metric_sync import sync_spec_metrics_to_maestro
+from .maestro_setup import (
+    apply_maestro_setup,
+    validate_maestro_setup_block as _validate_maestro_setup_block,
+)
 from .ocean_worker import (
     OceanWorker,
     OceanWorkerError,
@@ -71,12 +76,23 @@ def _has_sanity_violation(pass_fail: dict | None) -> bool:
     return False
 
 # LLM-response JSON schema (see docs/llm_protocol.md).
+#
+# Track C v2 (2026-05-15): four optional structural blocks may appear
+# alongside the legacy four required fields. Their internal shape is
+# validated by ``maestro_setup.validate_maestro_setup_block``; the
+# top-level type gate here only verifies they're lists (the per-entry
+# validation is delegated so this module doesn't drift out of sync with
+# the SafeBridge writer signatures).
 _VALID_RESPONSE_KEYS = frozenset({
     "iteration", "measurements", "pass_fail", "reasoning", "design_vars",
+    # Track C v2 (optional, structural-only on iter 0 / rescope path):
+    "tests", "analyses", "outputs", "corners",
 })
 # Required top-level keys — absence is a schema violation.
 # `iteration` is advisory (platform controls the counter), so it's
-# intentionally optional.
+# intentionally optional. The Track C v2 structural blocks are
+# intentionally NOT required so an LLM that emits only design_vars
+# (the legacy contract) keeps passing.
 _REQUIRED_RESPONSE_KEYS = frozenset({
     "measurements", "pass_fail", "reasoning", "design_vars",
 })
@@ -87,7 +103,20 @@ _RESPONSE_KEY_TYPES: dict[str, type | tuple[type, ...]] = {
     "pass_fail":    dict,
     "reasoning":    str,
     "design_vars":  dict,
+    # Track C v2: top-level type gate only — the per-entry shape is
+    # validated in ``maestro_setup.validate_maestro_setup_block``.
+    "tests":     list,
+    "analyses":  list,
+    "outputs":   list,
+    "corners":   list,
 }
+
+# Track C v2: cap how many times we'll re-prompt the LLM after a
+# contract violation. The legacy flow only repaired once; the v2 brief
+# raises that to 3 (per leader) so a structural-block typo doesn't
+# burn an iter on the first try. After 3 failed attempts, abort the
+# iter with ``contract_violation``.
+_CONTRACT_REPAIR_MAX = 3
 
 
 _DESIGN_VAR_SECTION_RE = re.compile(
@@ -590,6 +619,31 @@ class CircuitAgent:
                 type(exc).__name__, exc,
             )
 
+        # Track C Option I (2026-05-14): mirror spec.metrics into the
+        # Maestro Outputs Setup so an interactive Maestro user sees the
+        # same per-metric formulas the PC evaluator computes from the
+        # PSF dump. Authoring convenience only — the PC-side eval block
+        # remains the authoritative pass/fail source, so every failure
+        # mode here is fail-soft (try/except wraps the whole call).
+        # Skipped when no eval_block is present (legacy LLM-judged
+        # flow) — there are no PC-computed metrics to mirror.
+        if self.eval_block is not None:
+            try:
+                sync_summary = sync_spec_metrics_to_maestro(
+                    self.bridge, self.eval_block, logger=logger,
+                )
+                logger.info(
+                    "Maestro Outputs sync: %d added, %d skipped.",
+                    len(sync_summary["added"]),
+                    len(sync_summary["skipped"]),
+                )
+            except Exception as exc:  # noqa: BLE001 — fail-soft
+                logger.warning(
+                    "Maestro Outputs sync failed at startup (%s: %s); "
+                    "continuing without it. PC-side metrics still "
+                    "authoritative.", type(exc).__name__, exc,
+                )
+
         accumulated_vars: dict[str, Any] = dict(baseline_vars)
         last_measurements: dict = {}
         last_pass_fail: dict = {}
@@ -603,13 +657,25 @@ class CircuitAgent:
             logger.info("=== Iteration %d/%d ===", i + 1, max_iter)
 
             parsed = self._parse_llm_response(response)
-            # One-shot repair: if response violates §4 contract, send a
-            # corrective message and re-request once.
+            # Repair loop: if the response violates the §4 contract,
+            # send a corrective message and re-request. Track C v2
+            # raised the cap from 1 to ``_CONTRACT_REPAIR_MAX`` (3) so
+            # a structural-block typo in the new ``tests/analyses/
+            # outputs/corners`` payload doesn't burn an iter on the
+            # first try. After all attempts fail, abort the iter.
+            # TODO(post-MLCAD): record ``repair_attempts`` count in
+            # ``IterationRecord`` (claude P3 NIT) so the audit log
+            # reflects how many corrective prompts a given iter
+            # consumed. Currently only the final pass/fail surfaces.
             repair_reason = self._check_contract_violation(parsed)
-            if repair_reason:
+            repair_attempts = 0
+            while repair_reason and repair_attempts < _CONTRACT_REPAIR_MAX:
+                repair_attempts += 1
                 logger.warning(
-                    "Contract violation (iter %d): %s — sending repair prompt",
-                    i + 1, repair_reason,
+                    "Contract violation (iter %d, attempt %d/%d): "
+                    "%s — sending repair prompt",
+                    i + 1, repair_attempts, _CONTRACT_REPAIR_MAX,
+                    repair_reason,
                 )
                 # response is already the last assistant message in
                 # messages (appended by the previous iteration or the
@@ -623,15 +689,53 @@ class CircuitAgent:
                 response = self.llm.chat(messages)
                 messages.append({"role": "assistant", "content": response})
                 parsed = self._parse_llm_response(response)
-                # If still violating after repair, abort this iteration.
-                repair_reason_2 = self._check_contract_violation(parsed)
-                if repair_reason_2:
-                    logger.warning(
-                        "Contract violation persists after repair (iter %d): "
-                        "%s — aborting.", i + 1, repair_reason_2,
+                repair_reason = self._check_contract_violation(parsed)
+            if repair_reason:
+                logger.warning(
+                    "Contract violation persists after %d repair "
+                    "attempts (iter %d): %s — aborting iter.",
+                    _CONTRACT_REPAIR_MAX, i + 1, repair_reason,
+                )
+                abort_reason = "contract_violation"
+                break
+
+            # Track C v2 (2026-05-15): if the LLM emitted any structural
+            # Maestro blocks (tests / analyses / outputs / corners),
+            # apply them through the bridge BEFORE running the
+            # simulation. Per leader: tests/analyses/corners are only
+            # honored on iter 0 (the initial setup phase) — later iters
+            # only accept outputs / design_vars. This prevents an LLM
+            # mid-loop from accidentally restructuring the testbench
+            # under us. Application is fail-soft per entry; the
+            # design_vars path remains the authoritative pass/fail
+            # surface.
+            # TODO(post-MLCAD): HSpice dispatch path currently shares
+            # ``_check_contract_violation`` so v2 keys are *accepted* but
+            # never applied (this block only runs for the Spectre /
+            # Maestro path). Decide whether to (a) explicitly reject
+            # v2 keys with a clear repair-prompt in the HSpice branch,
+            # or (b) share the v2 apply path with HSpice once the
+            # HSpice backend grows an equivalent Outputs Setup. Codex P3.
+            setup_payload = self._slice_maestro_setup_payload(
+                parsed, iter_idx=i, log=logger,
+            )
+            if setup_payload:
+                try:
+                    setup_summary = apply_maestro_setup(
+                        self.bridge, setup_payload, logger=logger,
                     )
-                    abort_reason = "contract_violation"
-                    break
+                    logger.info(
+                        "Maestro setup applied (iter %d): %s",
+                        i + 1,
+                        {k: len(v) for k, v in setup_summary["applied"].items()},
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-soft
+                    logger.warning(
+                        "apply_maestro_setup raised at iter %d "
+                        "(%s: %s); continuing — design_vars path "
+                        "is authoritative.",
+                        i + 1, type(exc).__name__, exc,
+                    )
 
             new_vars = parsed.get("design_vars", {}) or {}
             llm_measurements = parsed.get("measurements", {}) or {}
@@ -1189,7 +1293,53 @@ class CircuitAgent:
                         f"unit — use engineering suffixes (u/n/p/f/k/M/G)"
                     )
 
+        # 6. Track C v2 — per-entry shape of the four structural blocks.
+        #    Delegated so this validator doesn't need to know the
+        #    SafeBridge writer signatures (DRY against maestro_setup).
+        setup_problem = _validate_maestro_setup_block(parsed)
+        if setup_problem:
+            problems.append(setup_problem)
+
         return "; ".join(problems) if problems else None
+
+    @staticmethod
+    def _slice_maestro_setup_payload(
+        parsed: dict, *, iter_idx: int, log: logging.Logger,
+    ) -> dict | None:
+        """Compute the v2 Maestro-setup payload to dispatch this iter.
+
+        Iter 0 forwards the full set of structural blocks the LLM sent.
+        Iter > 0 only forwards ``outputs`` (additive new measurements)
+        — proposed ``tests`` / ``analyses`` / ``corners`` are stripped
+        and a WARNING logged so the LLM's intent is visible without
+        actually restructuring the live testbench.
+
+        Returns the payload to hand to ``apply_maestro_setup``, or
+        ``None`` when there's nothing to apply (no structural keys
+        present, or iter > 0 with only stripped keys).
+
+        Extracted out of ``run()`` as a pure helper (Track C v2 R2
+        P2-3) so the iter-gating slice can be unit-tested without
+        spinning up the full agent loop.
+        """
+        setup_keys_present = {
+            k for k in ("tests", "analyses", "outputs", "corners")
+            if isinstance(parsed.get(k), list) and parsed[k]
+        }
+        if not setup_keys_present:
+            return None
+        if iter_idx == 0:
+            return parsed
+        rejected = setup_keys_present - {"outputs"}
+        if rejected:
+            log.warning(
+                "iter %d: LLM proposed structural changes (%s) "
+                "past iter 0 — only 'outputs' is honored after setup; "
+                "ignoring the rest.",
+                iter_idx + 1, sorted(rejected),
+            )
+        payload = {k: parsed[k] for k in ("outputs",) if k in parsed}
+        return payload or None
 
     @staticmethod
     def _all_pass(pass_fail: dict) -> bool:

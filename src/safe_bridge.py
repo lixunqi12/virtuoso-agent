@@ -15,12 +15,15 @@ import copy
 import json
 import logging
 import math
+import os
+import posixpath
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 from virtuoso_bridge import VirtuosoClient
+from virtuoso_bridge.virtuoso.maestro import writer as _mae_writer
 # Stage 1 rev 2 (2026-04-18): SpectreSimulator import removed along with
 # the bridge.simulate() direct Spectre path. Per user directive
 # ("OCEAN ???????????"), Direction C (OCEAN) is now the single
@@ -78,8 +81,8 @@ _REGION_LABELS = {
 # The prefix seeds below correspond to foundry device families that
 # must never appear outside this line.
 _FOUNDRY_LEAK_RE = re.compile(
-    r"\b(?:nch_|pch_|cfmom|rppoly|rm1_|tsmc|tcbn)\w*",
-    re.IGNORECASE,
+    r"\b(?i:nch_|pch_|cfmom|rppoly|rm1_|tsmc|tcbn|rxnp|vsubs)\w*"
+    r"|\b(?i:nmos|pmos)(?!(?:_[LlSsHh][Vv][Tt])?\b)\w+",
 )
 _ABS_WIN_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s'\"<>|*?]*")
 # UNC paths like \\server\share\... must be stripped before the drive-letter
@@ -205,6 +208,232 @@ _BLOCKED_PARAM_WORDS = frozenset({
 # the SKILL-side constant; the SKILL side remains the semantic gate.
 _OCEAN_ALLOWED_ANALYSES = frozenset({"tran", "ac", "dc", "noise", "xf", "stb"})
 
+# Track C T1 (2026-05-17): Maestro can configure RF analyses that are not
+# currently driven by safeOceanRun. Keep the OCEAN set above SKILL-synced, and
+# use this wider set only for Maestro setup writeback.
+_MAESTRO_ALLOWED_ANALYSES = _OCEAN_ALLOWED_ANALYSES | frozenset({
+    "pss", "pnoise",
+})
+
+# RF analysis options intentionally use a finite per-analysis key set. The
+# older tran/ac/dc/noise/xf/stb path remains permissive for backward
+# compatibility, but pss/pnoise need string-valued knobs, so every accepted
+# string value below is either a finite enum or a validated safe token/probe.
+_RF_STRING_MAX_LEN = 128
+_RF_FOUNDRY_REDACTED = "<redacted: matches foundry-leak pattern>"
+_PSS_ALLOWED_OPTIONS = frozenset({
+    "fund", "freq", "harms", "tstab", "errpreset",
+    "oscillator", "autonomous", "fundname", "skipdc", "maxstep",
+})
+_PNOISE_ALLOWED_OPTIONS = frozenset({
+    "start", "stop", "dec", "lin", "maxsideband",
+    "relativeharmonic", "refsideband", "sweeptype",
+    "output", "input", "oprobe", "iprobe", "p", "n", "noisetype",
+})
+_MAESTRO_RF_ANALYSIS_OPTIONS: dict[str, frozenset[str]] = {
+    "pss": _PSS_ALLOWED_OPTIONS,
+    "pnoise": _PNOISE_ALLOWED_OPTIONS,
+}
+_MAESTRO_RF_REQUIRED_OPTIONS: dict[str, frozenset[str]] = {
+    "pss": frozenset({"fund"}),
+    "pnoise": frozenset({"noisetype"}),
+}
+_MAESTRO_RF_ENUM_OPTIONS: dict[tuple[str, str], frozenset[str]] = {
+    ("pss", "errpreset"): frozenset({"conservative", "moderate", "liberal"}),
+    ("pss", "oscillator"): frozenset({"yes", "no"}),
+    ("pss", "autonomous"): frozenset({"yes", "no"}),
+    ("pss", "skipdc"): frozenset({"yes", "no"}),
+    ("pnoise", "sweeptype"): frozenset({"absolute", "relative"}),
+    ("pnoise", "noisetype"): frozenset({"sources", "jitter", "timeaverage"}),
+}
+_MAESTRO_RF_TOKEN_OPTIONS = frozenset({
+    ("pss", "fundname"),
+    ("pnoise", "output"),
+    ("pnoise", "input"),
+    ("pnoise", "oprobe"),
+    ("pnoise", "iprobe"),
+    ("pnoise", "p"),
+    ("pnoise", "n"),
+})
+_MAESTRO_RF_INT_RANGES: dict[tuple[str, str], tuple[int, int]] = {
+    ("pss", "harms"): (1, 64),
+    ("pnoise", "maxsideband"): (0, 64),
+    ("pnoise", "refsideband"): (-64, 64),
+    ("pnoise", "relativeharmonic"): (-64, 64),
+    ("pnoise", "dec"): (1, 1000),
+    ("pnoise", "lin"): (1, 100000),
+}
+# R3 (2026-05-17): physical sanity ranges for RF frequency/time atoms.
+# These are intentionally broad enough for analog/RF design exploration while
+# still rejecting zero/negative values and pathological magnitudes that can
+# bloat SKILL payloads or represent non-physical setup knobs.
+_MAESTRO_RF_POSITIVE_RANGES: dict[tuple[str, str], tuple[float, float]] = {
+    ("pss", "fund"): (1e-3, 1e15),
+    ("pss", "freq"): (1e-3, 1e15),
+    ("pss", "tstab"): (1e-18, 1e6),
+    ("pss", "maxstep"): (1e-18, 1e6),
+    ("pnoise", "start"): (1e-6, 1e15),
+    ("pnoise", "stop"): (1e-6, 1e15),
+}
+_RF_NUMERIC_RE = re.compile(
+    r"\A([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)([A-Za-z]*)\Z"
+)
+_RF_ENGINEERING_SUFFIX_SCALE = {
+    "": 1.0,
+    "f": 1e-15,
+    "p": 1e-12,
+    "n": 1e-9,
+    "u": 1e-6,
+    "m": 1e-3,
+    "k": 1e3,
+    "K": 1e3,
+    "meg": 1e6,
+    "Meg": 1e6,
+    "MEG": 1e6,
+    "M": 1e6,
+    "g": 1e9,
+    "G": 1e9,
+    "t": 1e12,
+    "T": 1e12,
+}
+
+
+# Track C v2 (2026-05-15): simulator whitelist for ``create_maestro_test``.
+# Bounded set chosen with the leader: the four production simulators we
+# actually drive through Maestro today. Adding e.g. ``aimspice`` or
+# ``HSIM`` is fine in principle but each addition needs a deliberate
+# review — an LLM that proposes a simulator outside this set should fail
+# closed rather than silently fall through to the remote SKILL default.
+_MAESTRO_SIMULATOR_ALLOWED = frozenset(
+    {"spectre", "spectreVerilog", "hspice", "auCdl"}
+)
+# Cellview names per CDB (``schematic`` / ``schematic_view`` / ``symbol``
+# / ``config`` / ``calibre``). Use the existing ``_NAME_RE`` since CDB
+# disallows anything outside ``[A-Za-z0-9_.-]`` in a cellview name.
+
+# Maestro test-name pattern. Maestro emits tests as ``<lib>:<cell>:<n>`` or
+# bare ``<cell>``; colon must be allowed alongside the strict-name charset.
+# Keeps the surface tight enough that no whitespace / quote / SKILL
+# metacharacter can slip into ``maeAddOutput("...", "...", ...)``.
+_MAESTRO_TEST_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-:]+$")
+
+# Maestro output names — identifier-like, never reach SKILL primitives.
+_MAESTRO_OUTPUT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+# Allowed Maestro output_type values per virtuoso-bridge writer.add_output.
+# Empty string means "let Maestro infer" (signal vs expr); the writer omits
+# the ?outputType keyword in that case.
+_MAESTRO_OUTPUT_TYPES = frozenset({"", "signal", "expr"})
+
+# Allow-list of OCEAN / Calculator function names permitted in a
+# user-supplied Maestro output expression. R1 (2026-05-14) switched
+# ``_validate_maestro_expr`` from deny-list to allow-list per dual-review:
+# a deny-list cannot bound an unbounded set of SKILL primitives (codex R1
+# called out 11 missing tokens — getq/process/lambda/apply/funcall/defun/
+# procedure/prog/puts/fileSeek/dbWriteCellView — and the next audit would
+# find more). Every identifier immediately followed by ``(`` in the expr
+# MUST be in this set; anything else is rejected. The set is intentionally
+# small and covers the OCEAN waveform-/measure-/math-function vocabulary
+# documented in cdsdoc "OCEAN Reference > Waveform Calculator Functions";
+# adding a new entry requires a deliberate edit here (and ideally a test
+# pinning the new function).
+_MAESTRO_EXPR_ALLOWED_FUNCS = frozenset({
+    # Probes / waveform constructors
+    "VT", "IT", "VS", "IS", "VF", "IF", "v", "i",
+    # Sample / span readouts
+    "value", "valueOf", "average", "mean", "stddev",
+    "rms", "integ", "deriv",
+    "ymax", "ymin", "ymaxlocal", "yminlocal",
+    "xmax", "xmin", "xval", "yval",
+    "peakToPeak", "swing",
+    # Time-domain measures
+    "frequency", "freq", "period", "dutyCycle", "delay", "cross",
+    "riseTime", "fallTime", "settlingTime", "slewRate",
+    "pulseWidth", "overshoot", "undershoot",
+    # AC / frequency-domain
+    "db20", "db10", "dB", "dB10", "dB20",
+    "mag", "phase", "ph", "phaseDeg", "phaseRad",
+    "real", "imag",
+    "gainBwProd", "gainMargin", "phaseMargin", "unityGainFreq",
+    # Noise-specific OCEAN measures (PSS pnoise outputs use these)
+    "phaseNoise", "noiseSummary",
+    # Math / reduction (SKILL function form of operators)
+    "abs", "max", "min", "sqrt", "log", "log10", "exp",
+    "sin", "cos", "tan", "asin", "acos", "atan2",
+    "sinh", "cosh", "tanh",
+    "floor", "ceil", "round",
+    "plus", "minus", "times", "quotient",
+    # SKILL data constructors that may legitimately appear inside an
+    # OCEAN expression argument (e.g. ``value(list("/V") 1n)`` — rare,
+    # but cheaper to allow than to special-case).
+    "list",
+    # Windowing — clip a waveform to a [tStart, tEnd] sub-range.
+    # Track C Option I needs this so spec.metrics windows can be
+    # mirrored into Maestro Outputs as
+    # ``<stat>(clip(<wf> <tStart> <tEnd>))``. Pure waveform op
+    # (no I/O, no eval), so allow-listing it is safe.
+    "clip",
+})
+
+# Outer length cap on user-supplied OCEAN expressions. Real measure
+# expressions like ``value(frequency(VT(/Vout)) 100n)`` are well under
+# 256 chars; 1024 leaves room for legitimate compound expressions while
+# bounding worst-case scanner cost.
+_MAESTRO_EXPR_MAX_LEN = 1024
+
+# R1 R2 (2026-05-14): absolute-path roots permitted as the prefix of a
+# ``create_netlist_for_corner`` output_dir. The R1 default
+# (``~/simulation/`` + ``~/.virtuoso-agent/``) was rejected on review:
+#  * real cobi-style project paths live under ``/proj/...`` or
+#    ``/project/<user>/...``, neither of which would have matched.
+#  * tilde is a shell-expansion artifact and may or may not be expanded
+#    by SKILL / SSH before the path reaches the FS layer, which would
+#    leave SafeBridge unable to reason about the actual target.
+# We therefore require an absolute POSIX path beginning with one of the
+# roots below. Tilde is now forbidden anywhere in the string (position 0
+# included). Env override ``VIRTUOSO_AGENT_REMOTE_OUTPUT_ROOTS`` adds
+# extra roots at validation time; each comma-separated entry must start
+# and end with ``/`` so a malformed value cannot accidentally widen the
+# allow-list to ``/`` itself.
+_MAESTRO_REMOTE_OUTPUT_ROOTS: tuple[str, ...] = (
+    "/tmp/",
+    "/var/tmp/",
+    "/scratch/",
+    "/proj/",
+    "/project/",
+    "/home/",
+)
+
+
+def _resolve_remote_output_roots() -> tuple[str, ...]:
+    """Return the active output-root allow-list (baseline + env override).
+
+    Reads ``VIRTUOSO_AGENT_REMOTE_OUTPUT_ROOTS`` lazily on each call so
+    tests can patch the env without re-importing the module. Each
+    comma-separated entry MUST start and end with ``/`` — a malformed
+    entry raises ValueError rather than silently widening the allow-list.
+    """
+    extra: list[str] = []
+    raw = os.environ.get("VIRTUOSO_AGENT_REMOTE_OUTPUT_ROOTS", "")
+    if raw:
+        for entry in raw.split(","):
+            piece = entry.strip()
+            if not piece:
+                continue
+            if not piece.startswith("/") or not piece.endswith("/"):
+                raise ValueError(
+                    "VIRTUOSO_AGENT_REMOTE_OUTPUT_ROOTS entry must be an "
+                    f"absolute POSIX path bracketed by '/' (got len={len(piece)})."
+                )
+            extra.append(piece)
+    return _MAESTRO_REMOTE_OUTPUT_ROOTS + tuple(extra)
+
+# Function-call scanner for the expr allow-list. Matches an identifier
+# immediately followed by ``(`` (optional whitespace). ASCII-only by
+# construction because ``_validate_maestro_expr`` rejects non-ASCII expr
+# strings up front.
+_MAESTRO_EXPR_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+
 # Stage 1 rev 11 (2026-04-19): enum-valued kwargs permitted on analysis
 # specs. _format_param_value / _PARAM_ATOM_RE accept only numeric literals
 # (e.g. "200n", "5e-7"), so non-numeric strings like skipdc=yes were being
@@ -290,12 +519,235 @@ def scrub(value: Any) -> Any:
 
 
 def _validate_name(name: str, label: str = "name") -> None:
-    """Validate a lib/cell/instance name against injection attacks."""
+    """Validate a lib/cell/instance name against injection attacks.
+
+    Track C v2 R2 (2026-05-15): hard length cap of 128 chars (CDB
+    identifier upper bound; Maestro/Cadence rejects longer names
+    server-side anyway). The cap defends against unbounded-string DoS
+    where the SKILL transport / log-formatter might choke on a
+    multi-megabyte LLM-supplied identifier — bound the input here so
+    every downstream consumer sees a sane size.
+    """
+    if not isinstance(name, str):
+        raise ValueError(
+            f"Invalid {label} (type={type(name).__name__}); "
+            "must be a string."
+        )
+    if len(name) > 128:
+        raise ValueError(
+            f"Invalid {label} length ({len(name)} > 128 cap). "
+            "Cadence CDB identifiers are bounded; reject upstream."
+        )
     if not _NAME_RE.fullmatch(name):
         raise ValueError(
             f"Invalid {label} (len={len(name)}). "
             "Only alphanumeric, underscore, dot, and hyphen are allowed."
         )
+
+
+def _format_param_atom_value(value: Any) -> str:
+    if isinstance(value, bool):
+        raise ValueError("Boolean parameter values are not allowed")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Non-finite parameter values are not allowed")
+        return format(value, ".12g")
+    if isinstance(value, str):
+        if value != value.strip() or not _PARAM_ATOM_RE.fullmatch(value):
+            raise ValueError(
+                "Unsafe parameter value "
+                f"(type=str len={len(value)}). "
+                "Only numeric literals or engineering-unit strings are allowed."
+            )
+        return value
+    raise ValueError(
+        f"Unsupported parameter value type: {type(value).__name__}"
+    )
+
+
+def _validate_rf_string_value(value: str, *, label: str) -> None:
+    if len(value) > _RF_STRING_MAX_LEN:
+        raise ValueError(
+            f"{label} string length {len(value)} exceeds max "
+            f"{_RF_STRING_MAX_LEN}."
+        )
+    if _FOUNDRY_LEAK_RE.search(value):
+        raise ValueError(f"{label} contains {_RF_FOUNDRY_REDACTED}.")
+
+
+def _format_maestro_analysis_token_value(value: Any, *, label: str) -> str:
+    """Format a safe string token/probe for RF analysis options."""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{label} must be a string token; got "
+            f"type={type(value).__name__}"
+        )
+    _validate_rf_string_value(value, label=label)
+    if not value:
+        raise ValueError(f"{label} must be non-empty string (len<=128)")
+    if _SAFE_NET_NAME_RE.fullmatch(value) or _PROBE_PATH_RE.fullmatch(value):
+        return value
+    _validate_name(value, label)
+    return value
+
+
+def _validate_maestro_analysis_option_key(analysis: str, key: Any) -> str:
+    if not isinstance(key, str) or not _SAFE_PARAM_NAME_RE.fullmatch(key):
+        raise ValueError(
+            f"Invalid analysis option key (len={len(key) if isinstance(key, str) else -1}). "
+            "Must match ^[a-zA-Z][a-zA-Z0-9_]{0,31}$."
+        )
+    key_lower = key.lower()
+    allowed = _MAESTRO_RF_ANALYSIS_OPTIONS.get(analysis)
+    if allowed is not None and key_lower not in allowed:
+        raise ValueError(
+            f"Analysis {_scrub(repr(analysis))} option "
+            f"{_scrub(repr(key))} is not allowed. "
+            f"Allowed options: {sorted(allowed)}"
+        )
+    return key_lower
+
+
+def _format_rf_bounded_int(value: Any, *, label: str, lo: int, hi: int) -> str:
+    if isinstance(value, bool):
+        raise ValueError(f"Boolean parameter values are not allowed for {label}.")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(
+                f"{label} must be finite and in accepted range [{lo}, {hi}]; "
+                f"got {value!r}."
+            )
+        if not value.is_integer():
+            raise ValueError(
+                f"{label} must be an integer in accepted range [{lo}, {hi}]; "
+                f"got {value!r}."
+            )
+        parsed = int(value)
+    elif isinstance(value, str):
+        _validate_rf_string_value(value, label=label)
+        if not re.fullmatch(r"[+-]?\d+", value):
+            raise ValueError(
+                f"{label} must be an integer in accepted range [{lo}, {hi}]; "
+                f"got {_scrub(repr(value))}."
+            )
+        parsed = int(value, 10)
+    else:
+        raise ValueError(
+            f"{label} must be an integer in accepted range [{lo}, {hi}]; "
+            f"got type={type(value).__name__}."
+        )
+    if parsed < lo or parsed > hi:
+        raise ValueError(
+            f"{label} value {parsed!r} outside accepted range [{lo}, {hi}]."
+        )
+    return str(parsed)
+
+
+def _parse_rf_bounded_positive_number(
+    value: Any, *, label: str, lo: float, hi: float,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"Boolean parameter values are not allowed for {label}.")
+    if isinstance(value, (int, float)):
+        try:
+            parsed = float(value)
+        except OverflowError:
+            parsed = math.inf if value > 0 else -math.inf
+    elif isinstance(value, str):
+        _validate_rf_string_value(value, label=label)
+        match = _RF_NUMERIC_RE.fullmatch(value)
+        if not match:
+            raise ValueError(
+                f"{label} must be a finite number in accepted range "
+                f"[{lo}, {hi}]."
+            )
+        base, suffix = match.groups()
+        if suffix not in _RF_ENGINEERING_SUFFIX_SCALE:
+            raise ValueError(
+                f"{label} has unsupported unit suffix (len={len(suffix)})."
+            )
+        parsed = float(base) * _RF_ENGINEERING_SUFFIX_SCALE[suffix]
+    else:
+        raise ValueError(
+            f"{label} must be a finite number in accepted range [{lo}, {hi}]; "
+            f"got type={type(value).__name__}."
+        )
+    if not math.isfinite(parsed) or parsed < lo or parsed > hi:
+        raise ValueError(
+            f"{label} value {parsed!r} outside accepted range [{lo}, {hi}]."
+        )
+    return parsed
+
+
+def _ensure_rf_atom_length(atom: str, *, label: str) -> str:
+    if len(atom) > _RF_STRING_MAX_LEN:
+        raise ValueError(
+            f"{label} formatted length {len(atom)} exceeds "
+            f"{_RF_STRING_MAX_LEN} character cap."
+        )
+    return atom
+
+
+def _format_rf_bounded_positive_number(
+    value: Any, *, label: str, lo: float, hi: float,
+) -> str:
+    _parse_rf_bounded_positive_number(value, label=label, lo=lo, hi=hi)
+    return _ensure_rf_atom_length(_format_param_atom_value(value), label=label)
+
+
+def _format_maestro_analysis_option_value(
+    analysis: str, key: str, value: Any,
+) -> str:
+    """Format one Maestro analysis option with RF-specific string gates."""
+    key_lower = _validate_maestro_analysis_option_key(analysis, key)
+    label = f"{analysis}.{key_lower}"
+    if analysis in _MAESTRO_RF_ANALYSIS_OPTIONS:
+        if isinstance(value, str):
+            _validate_rf_string_value(value, label=label)
+
+        enum_vals = _MAESTRO_RF_ENUM_OPTIONS.get((analysis, key_lower))
+        if enum_vals is not None:
+            if not isinstance(value, str) or value not in enum_vals:
+                raise ValueError(
+                    f"Invalid {analysis}.{key_lower} value; allowed: "
+                    f"{sorted(enum_vals)}"
+                )
+            return _ensure_rf_atom_length(value, label=label)
+
+        if (analysis, key_lower) in _MAESTRO_RF_TOKEN_OPTIONS:
+            return _ensure_rf_atom_length(
+                _format_maestro_analysis_token_value(value, label=label),
+                label=label,
+            )
+
+        int_range = _MAESTRO_RF_INT_RANGES.get((analysis, key_lower))
+        if int_range is not None:
+            lo, hi = int_range
+            return _ensure_rf_atom_length(
+                _format_rf_bounded_int(value, label=label, lo=lo, hi=hi),
+                label=label,
+            )
+
+        positive_range = _MAESTRO_RF_POSITIVE_RANGES.get((analysis, key_lower))
+        if positive_range is not None:
+            lo, hi = positive_range
+            return _format_rf_bounded_positive_number(
+                value, label=label, lo=lo, hi=hi,
+            )
+
+    enum_vals = _OCEAN_ENUM_KWARGS.get(key_lower)
+    if enum_vals is not None:
+        if not isinstance(value, str) or value not in enum_vals:
+            raise ValueError(
+                f"Invalid {key!r} value; allowed: {sorted(enum_vals)}"
+            )
+        return _ensure_rf_atom_length(value, label=label)
+
+    return _ensure_rf_atom_length(_format_param_atom_value(value), label=label)
 
 
 def _sanitize_scaffold_cell(raw: dict) -> dict:
@@ -404,6 +856,32 @@ class SafeBridge:
         self._scope_lib: str | None = None
         self._scope_cell: str | None = None
         self._scope_tb_cell: str | None = None
+        # Track C v2 (2026-05-15): set of Maestro test names this bridge
+        # has already created via ``create_maestro_test``. PC-side cache
+        # to short-circuit the same-name attempt within one bridge before
+        # we even probe the remote. The authoritative dedup gate is the
+        # ``_list_remote_maestro_tests`` SKILL probe that runs on every
+        # create — this set just makes the no-op path cheap.
+        self._created_maestro_tests: set[str] = set()
+        # Track C v2 R2/R3 (2026-05-15): set of ``(name, resolved_test,
+        # session)`` triples this bridge has issued ``maeAddOutput``
+        # for, regardless of caller (Option I sync OR v2
+        # ``apply_maestro_setup``). The R2 implementation keyed on bare
+        # name and so collapsed legitimate same-name-different-test
+        # outputs into a single bucket (codex R3 P2 — see
+        # ``test_outputs_dedup_disambiguates_by_test``). The tuple key
+        # treats two Maestro tests' "VOUT_rms" rows as independent.
+        # The PC-side cache is short-circuit only; the authoritative
+        # state lives in Maestro server-side. New SafeBridge instances
+        # start with an empty set even if the remote already has
+        # outputs — that's a known trade-off; the v2-wins remove-add
+        # path handles the case where the v2 dispatcher proposes a
+        # name the *bridge* hasn't seen but the *remote* has.
+        self._added_maestro_outputs: set[tuple[str, str, str]] = set()
+        # Track C T1 R2/R3 (2026-05-17): local per-bridge cache only,
+        # not authoritative; it guards same-session LLM ordering mistakes,
+        # while Maestro itself remains the final missing-pss arbiter.
+        self._configured_maestro_analyses: dict[str, set[str]] = {}
         # Stage 1 rev 12 (2026-04-20): PSF directory from the most recent
         # ``run_ocean_sim``. Captured *before* _scrub() redacts absolute
         # paths so the OceanWorker subprocess can openResults(psfDir) on
@@ -1916,6 +2394,867 @@ class SafeBridge:
         )
         return _scrub(result_json)
 
+    # ------------------------------------------------------------------ #
+    #  Maestro Outputs Setup writers (add_output / set_spec /
+    #  set_analysis / create_netlist_for_corner)
+    #
+    #  These wrap virtuoso_bridge.virtuoso.maestro.writer.* — the SKILL
+    #  expression is built inside virtuoso-bridge and dispatched through
+    #  client.execute_skill(), bypassing SafeBridge._execute_skill_json's
+    #  entrypoint allow-list. Each method therefore performs its own
+    #  PDK-safe input validation BEFORE the writer is called, and scrubs
+    #  the return value before it leaves the bridge.
+    # ------------------------------------------------------------------ #
+
+    def _resolve_maestro_test(self, test: str | None) -> str:
+        """Return the Maestro test name to use, defaulting to scoped tb_cell."""
+        if test is None:
+            if self._scope_tb_cell is None:
+                raise RuntimeError(
+                    "test name not supplied and set_scope(..., tb_cell=...) "
+                    "has not been called; cannot infer the Maestro test name."
+                )
+            test = self._scope_tb_cell
+        if not isinstance(test, str) or not test:
+            raise ValueError("Maestro test name must be a non-empty string")
+        if len(test) > 128 or not _MAESTRO_TEST_NAME_RE.fullmatch(test):
+            raise ValueError(
+                f"Invalid Maestro test name (len={len(test)}). "
+                "Only [A-Za-z0-9_.:-] is allowed."
+            )
+        return test
+
+    @staticmethod
+    def _validate_maestro_session(session: str) -> None:
+        """Permit empty (let SKILL pick) or strict identifier-with-dot/dash."""
+        if session == "":
+            return
+        if not isinstance(session, str) or len(session) > 128:
+            raise ValueError(
+                f"Maestro session must be a string (len<=128); "
+                f"got type={type(session).__name__}"
+            )
+        if not _MAESTRO_TEST_NAME_RE.fullmatch(session):
+            raise ValueError(
+                "Maestro session contains forbidden characters "
+                "(only [A-Za-z0-9_.:-] allowed)."
+            )
+
+    # ------------------------------------------------------------------
+    # Track C v2 R2 (2026-05-15): remote dedup probes for Maestro setup
+    # ------------------------------------------------------------------
+
+    def _list_remote_maestro_tests(self, session: str = "") -> set[str]:
+        """Return the set of test names that currently exist in the
+        target Maestro session, as reported by ``maeGetSetup``.
+
+        Parser layout (defense in depth, three filter stages):
+
+          1. Extract every quoted token from the SKILL raw output.
+          2. Keep only tokens matching the strict test-name whitelist
+             ``_MAESTRO_TEST_NAME_RE``.
+          3. Drop anything matching ``_FOUNDRY_LEAK_RE`` — foundry
+             device-family prefixes (``nch_``, ``pch_``, ``tsmc``…)
+             would mean either the Maestro raw output leaked PDK
+             content into our parser, or a malicious caller named a
+             test with a foundry prefix; either way it has no business
+             driving the dedup gate.
+
+        virtuoso-bridge 0.4.0 does NOT expose a structured
+        ``maeGetTests`` primitive — only ``_get_test`` (first test) +
+        the raw ``maeGetSetup`` blob. R3 P2 (2026-05-15) confirmed
+        with the 0.4.0 source that no structured probe exists; the
+        ``maeGetResultTests`` primitive in reader.py operates on
+        post-sim results, not pre-sim setup. Until virtuoso-bridge
+        ships a structured probe we keep the three-stage regex parser
+        and document it honestly.
+
+        Known limitation: the SKILL output blob may contain quoted
+        tokens that are NOT test names (analysis primitives like
+        ``"tran"``, session metadata, etc.). Stage 2 drops anything
+        outside the test-name alphabet but cannot semantically
+        distinguish "a test the user happens to have named
+        ``tran``" from "the SKILL output leaked the analysis token
+        ``tran``". This is acceptable because (a) naming a Maestro
+        test ``tran`` is a degenerate user choice we don't need to
+        support, and (b) a false-positive dedup just forces the LLM
+        to pick a different name on the next iter, which is the same
+        outcome it would have had if the name really did collide.
+
+        Re-raises any SKILL transport error so the caller (``create_maestro_test``)
+        propagates it to the LLM — a partially-known remote state is
+        worse than a hard failure, since the LLM can recover by retrying
+        next iteration. The session string is already pinned by
+        ``_validate_maestro_session``; ``maeGetSetup`` itself is a
+        read-only query, no writes.
+        """
+        self._validate_maestro_session(session)
+        s_arg = f' ?session "{session}"' if session else ""
+        expr = f"maeGetSetup({s_arg.lstrip()})" if session else "maeGetSetup()"
+        result = self.client.execute_skill(expr)
+        if getattr(result, "errors", None):
+            err0 = result.errors[0]
+            raise RuntimeError(
+                f"_list_remote_maestro_tests SKILL probe failed: "
+                f"{_scrub(str(err0))}"
+            )
+        raw = getattr(result, "output", "") or ""
+        if not raw or raw.strip() in ("nil", '""'):
+            return set()
+        return {
+            m for m in re.findall(r'"([^"]+)"', raw)
+            if _MAESTRO_TEST_NAME_RE.fullmatch(m)
+            and not _FOUNDRY_LEAK_RE.search(m)
+        }
+
+    def _delete_maestro_output_remote(
+        self, name: str, *, test: str | None = None, session: str = "",
+    ) -> None:
+        """Remove a Maestro Outputs Setup row by ``(name, test)``.
+
+        Wraps the ``maeDeleteOutput`` SKILL primitive (not exposed by
+        virtuoso-bridge 0.4.0). Used by ``apply_maestro_setup`` when the
+        v2 dispatcher detects an outputs-block entry whose name was
+        already added by Option I sync — the v2 expr wins, so we drop
+        the prior row before re-adding.
+
+        R3 (2026-05-15): ``test`` is now ``str | None``. ``None`` /
+        omitted means "resolve via scoped tb_cell" (matches the
+        ``add_maestro_output`` default-test contract). The R2
+        implementation forced callers to pass an explicit non-empty
+        string, which silently broke the LLM-common case where
+        ``outputs`` entries don't carry a ``test`` field — the v2
+        wins logic in ``apply_maestro_setup`` would resolve to ``""``,
+        ``_resolve_maestro_test`` would raise, the fail-soft branch
+        swallowed it, and ``add_maestro_output`` then issued a
+        duplicate row.
+
+        Inputs go through the same gates as ``add_maestro_output``:
+        ``name`` validated by ``_MAESTRO_OUTPUT_NAME_RE``, ``test``
+        (after default resolution) by ``_resolve_maestro_test``,
+        ``session`` by ``_validate_maestro_session``. Failure raises;
+        caller decides whether to fall back.
+        """
+        if not isinstance(name, str) or not _MAESTRO_OUTPUT_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"Invalid Maestro output name for delete "
+                f"(len={len(name) if isinstance(name, str) else -1})."
+            )
+        resolved_test = self._resolve_maestro_test(test)
+        self._validate_maestro_session(session)
+        s_arg = f' ?session "{session}"' if session else ""
+        expr = (
+            f'maeDeleteOutput("{name}" "{resolved_test}"{s_arg})'
+        )
+        logger.info(
+            "[DIAG] _delete_maestro_output_remote (name_len=%d, test_len=%d)",
+            len(name), len(resolved_test),
+        )
+        result = self.client.execute_skill(expr)
+        if getattr(result, "errors", None):
+            raise RuntimeError(
+                f"maeDeleteOutput failed: {_scrub(str(result.errors[0]))}"
+            )
+
+    @staticmethod
+    def _validate_maestro_expr(expr: str) -> None:
+        """Reject anything in a user-supplied Maestro output expression
+        that is not on the OCEAN/calculator function allow-list, plus the
+        usual quote / control-char / foundry-leak defenses.
+
+        R1 (2026-05-14): switched from deny-list to allow-list per dual
+        review. ``re.findall(_MAESTRO_EXPR_CALL_RE, expr)`` enumerates
+        every ``identifier(`` token; if any one is not in
+        :data:`_MAESTRO_EXPR_ALLOWED_FUNCS`, the expr is rejected.
+        Quote / backslash / backtick remain forbidden so the string
+        cannot break the ``f'?expr "{expr}"'`` interpolation in
+        virtuoso_bridge writer.add_output.
+        """
+        if not isinstance(expr, str) or not expr:
+            raise ValueError("Maestro output expr must be a non-empty string")
+        if len(expr) > _MAESTRO_EXPR_MAX_LEN:
+            raise ValueError(
+                f"Maestro output expr too long (len={len(expr)}, "
+                f"max={_MAESTRO_EXPR_MAX_LEN})."
+            )
+        if not expr.isascii():
+            raise ValueError(
+                f"Maestro output expr must be pure ASCII (len={len(expr)})."
+            )
+        for ch in expr:
+            code = ord(ch)
+            # Reject all C0 controls (including \t/\n/\r — SKILL line-folds
+            # don't belong in a single-line measure expression) and DEL.
+            if code < 0x20 or code == 0x7F:
+                raise ValueError(
+                    "Maestro output expr contains disallowed control char "
+                    f"(len={len(expr)}, code=0x{code:02x})."
+                )
+        # Quote / backslash / backtick / pipe / apostrophe would let the
+        # user terminate the SKILL string literal or invoke a reader macro.
+        # R3 (2026-05-14, codex_reviewer_v4 P0): the pipe ``|`` and
+        # apostrophe ``'`` are SKILL/Lisp reader-syntax markers that the
+        # allow-list scan below does NOT see because they don't match
+        # ``identifier(``. Specifically:
+        #   * ``|foo bar|(...)`` — escaped-symbol reader; turns the
+        #     enclosed text into a symbol name, bypassing the allow-list
+        #     entirely (e.g. ``|system|("rm -rf /")``).
+        #   * ``'(getq cv prop)`` — quote macro; produces a literal form
+        #     that the SKILL evaluator may still introspect.
+        # Backtick (already blocked) is the third reader macro of this
+        # family. Reject all three at the char-blocklist gate so they
+        # never reach the allow-list scan.
+        for bad in ('"', "\\", "`", "|", "'"):
+            if bad in expr:
+                raise ValueError(
+                    f"Maestro output expr contains forbidden character "
+                    f"{bad!r} (len={len(expr)})."
+                )
+        # Semicolon would let the user splice a second SKILL form after
+        # the writer's closing paren. Comma is harmless but @ ! # $ are
+        # all reader macros / quoters in SKILL/Lisp — reject preemptively.
+        # R3 P3 (2026-05-14): ``!`` is included to match the comment.
+        # SKILL ``!=`` is a legitimate comparison operator in general
+        # SKILL, but the OCEAN measure-expression allow-list contains no
+        # conditional / comparison functions (no ``if``, ``cond``,
+        # ``equal``, ``unequal``), so ``!=`` cannot appear in a legal
+        # measure expression here — blocking ``!`` loses no expressive
+        # power and forecloses one more reader-macro family.
+        for bad in (";", "@", "!", "$", "#", "?"):
+            if bad in expr:
+                raise ValueError(
+                    f"Maestro output expr contains forbidden character "
+                    f"{bad!r} (len={len(expr)})."
+                )
+        if _FOUNDRY_LEAK_RE.search(expr):
+            raise ValueError(
+                f"Maestro output expr contains foundry-shaped token "
+                f"(len={len(expr)}); rewrite without PDK-specific names."
+            )
+        # Allow-list scan: every ``ident(`` in the expr must be a known
+        # OCEAN/calculator function. This replaces the prior deny-list,
+        # which by construction missed dozens of SKILL primitives
+        # (codex R1 enumerated 11 of them — getq / process / lambda /
+        # apply / funcall / defun / procedure / prog / puts / fileSeek /
+        # dbWriteCellView). Allow-list is the only defensible posture.
+        seen = set()
+        for fn in _MAESTRO_EXPR_CALL_RE.findall(expr):
+            if fn in seen:
+                continue
+            seen.add(fn)
+            if fn not in _MAESTRO_EXPR_ALLOWED_FUNCS:
+                raise ValueError(
+                    f"Maestro output expr calls disallowed function "
+                    f"{fn!r}. Allowed functions: "
+                    f"{sorted(_MAESTRO_EXPR_ALLOWED_FUNCS)}"
+                )
+
+    @staticmethod
+    def _validate_remote_output_dir(output_dir: str) -> None:
+        # TODO(post-MLCAD): docstring/name mismatch — this validator is
+        # now also used by ``setup_maestro_corner.model_file``. Either
+        # rename to ``_validate_remote_path`` or split into two
+        # purpose-specific gates. Non-blocking: the validation rules
+        # are identical for both call sites.
+        """Validate remote-side dir for ``create_netlist_for_corner``.
+
+        R1 R2 (2026-05-14): "absolute path + project-root prefix
+        allow-list + traversal reject + char whitelist + forbidden
+        system-root prefix list". Codex R1 flagged that the original
+        validator would accept ``../../etc/cadence_secret`` (no banned
+        chars, no foundry token, but a traversal); leader R1 review
+        further rejected the tilde-prefixed allow-list because real
+        cobi project paths live under ``/proj/...`` or ``/project/...``
+        which would have bounced. The current rule: absolute POSIX
+        path, tilde forbidden anywhere, must begin with one of
+        :data:`_MAESTRO_REMOTE_OUTPUT_ROOTS` (or an env-provided
+        addition), must NOT begin with any system / Cadence / PDK root,
+        must not contain ``..``.
+        """
+        if not isinstance(output_dir, str) or not output_dir:
+            raise ValueError("output_dir must be a non-empty string")
+        if len(output_dir) > 1024:
+            raise ValueError(f"output_dir too long (len={len(output_dir)})")
+        # R3 (2026-05-14, codex_reviewer_v4 P1): reject empty path
+        # components (``/tmp//foo``) BEFORE normalization, because
+        # ``posixpath.normpath`` would collapse them silently and let
+        # the suspicious input slip through with a clean-looking final
+        # path. The redundant ``//`` form has no legitimate use and
+        # often shows up in path-confusion attacks or downstream string
+        # concatenation bugs — fail loud.
+        if "//" in output_dir:
+            raise ValueError(
+                f"output_dir contains empty path component '//' "
+                f"(len={len(output_dir)})."
+            )
+        # R3 P1: canonicalize with ``posixpath.normpath`` so that any
+        # ``./`` segments or trailing slashes don't fool the later
+        # prefix-allow-list check. NOTE: this is purely syntactic; we
+        # do NOT call ``realpath`` because the path lives on the
+        # *remote* host (no FS access here) — symlink resolution is a
+        # known limitation; the prefix allow-list pins the visible
+        # path to a safe root, but a symlink on the remote side from
+        # ``/tmp/foo`` to ``/etc/secret`` cannot be detected here.
+        # Downstream consumers SHOULD assume content under the
+        # allow-listed roots is mounted via a controlled fstab and
+        # not via arbitrary user-writable symlinks.
+        normalized = posixpath.normpath(output_dir)
+        if normalized != output_dir:
+            raise ValueError(
+                f"output_dir is not in normalized form (len={len(output_dir)}); "
+                f"pass the canonical path (no redundant '.', trailing '/', etc.)."
+            )
+        # Character whitelist (first cheap gate) — rejects spaces, quotes,
+        # control chars, glob metacharacters, etc.
+        if not _SAFE_PSF_DIR_RE.fullmatch(output_dir):
+            raise ValueError(
+                f"output_dir contains forbidden characters (len={len(output_dir)}); "
+                "only [A-Za-z0-9_./~:-] is allowed."
+            )
+        # Traversal reject: any literal ``..`` segment, or any reference
+        # back into the absolute system paths Cadence install / process
+        # FS live under. We do these BEFORE the prefix-whitelist check so
+        # the error message is specific about *why* the path is rejected
+        # rather than just "prefix not in [...]".
+        # ``..`` as a path component (POSIX-style only — the character
+        # whitelist already excludes backslash) catches ``../foo`` and
+        # ``foo/../bar``. A leading ``..`` is also caught.
+        segments = output_dir.split("/")
+        if any(seg == ".." for seg in segments):
+            raise ValueError(
+                f"output_dir contains '..' traversal (len={len(output_dir)})."
+            )
+        # Absolute-path roots that would let the caller escape to system
+        # / Cadence / PDK install dirs. Allow-list below pins the prefix
+        # back to per-user simulation areas only.
+        forbidden_prefixes = (
+            "/proc/", "/sys/", "/dev/", "/etc/", "/root/",
+            "/bin/", "/sbin/", "/usr/", "/lib/", "/lib64/",
+            "/boot/", "/opt/", "/cadence/", "/cad/", "/pdk/",
+            "/eda/", "/tools/",
+        )
+        # Match either the full equality (``/proc``) or with trailing
+        # slash (``/proc/...``).
+        for fp in forbidden_prefixes:
+            if output_dir == fp.rstrip("/") or output_dir.startswith(fp):
+                raise ValueError(
+                    f"output_dir starts with forbidden system prefix "
+                    f"(len={len(output_dir)})."
+                )
+        # Tilde is forbidden anywhere: ``~`` is a shell-expansion glyph
+        # whose meaning depends on the consumer (the SKILL channel does
+        # NOT expand it, the SSH side might, and the remote FS may treat
+        # it as a literal). Requiring absolute paths removes that
+        # ambiguity entirely. Allow-list below pins the prefix to a
+        # bounded set of project-area roots.
+        if "~" in output_dir:
+            raise ValueError(
+                f"output_dir contains '~' (forbidden — pass an absolute path "
+                f"under one of {list(_MAESTRO_REMOTE_OUTPUT_ROOTS)} instead) "
+                f"(len={len(output_dir)})."
+            )
+        # Prefix allow-list: absolute paths only, under a bounded set of
+        # project / scratch / tmp roots. Includes the cobi-style real
+        # project paths (``/proj/...``, ``/project/<user>/...``) plus
+        # ``/home/`` / ``/tmp/`` / ``/var/tmp/`` / ``/scratch/`` for
+        # scratch areas. Env override
+        # ``VIRTUOSO_AGENT_REMOTE_OUTPUT_ROOTS`` adds extra roots — see
+        # :func:`_resolve_remote_output_roots`.
+        active_roots = _resolve_remote_output_roots()
+        if not any(output_dir.startswith(p) for p in active_roots):
+            raise ValueError(
+                f"output_dir must start with one of {list(active_roots)} "
+                f"(len={len(output_dir)})."
+            )
+        if _FOUNDRY_LEAK_RE.search(output_dir):
+            raise ValueError(
+                f"output_dir contains foundry-shaped token (len={len(output_dir)})."
+            )
+
+    def _require_scope_for_maestro(self, method: str) -> None:
+        """Maestro writers must be scope-bound with a tb_cell."""
+        if self._scope_lib is None or self._scope_cell is None:
+            raise RuntimeError(
+                f"{method} requires set_scope() to have been called first."
+            )
+        if self._scope_tb_cell is None:
+            raise RuntimeError(
+                f"{method} requires set_scope(..., tb_cell=...) to have "
+                "been called with the testbench cell."
+            )
+
+    def create_maestro_test(
+        self,
+        test: str,
+        *,
+        lib: str,
+        cell: str,
+        view: str = "schematic",
+        simulator: str = "spectre",
+        session: str = "",
+    ) -> str:
+        """Create a new Maestro test row.
+
+        Thin PDK-safe wrapper around
+        ``virtuoso_bridge.virtuoso.maestro.writer.create_test``. The
+        Maestro SKILL ``maeCreateTest`` silently overwrites an existing
+        row of the same name, which would let an LLM-driven setup wipe a
+        user's hand-authored test — this wrapper fails closed on a
+        duplicate name so the LLM gets a ValueError it can react to
+        (rename / skip / abort), per Track C v2 leader decision.
+
+        Track C v2 R2 (2026-05-15): the duplicate check is now
+        REMOTE-AUTHORITATIVE. The PC-side ``_created_maestro_tests``
+        set only short-circuits the same-bridge case; the
+        ``_list_remote_maestro_tests`` SKILL probe is consulted on every
+        call so a test created by a different bridge (or interactively
+        by the user before the agent attached) is also rejected. If the
+        probe itself raises, the failure propagates: a partial-knowledge
+        create is worse than a hard fail.
+
+        ``simulator`` is locked to ``_MAESTRO_SIMULATOR_ALLOWED`` —
+        anything outside the bounded set raises before the create_test
+        SKILL call so a bogus simulator can't reach remote-side.
+        """
+        self._require_scope_for_maestro("create_maestro_test")
+        # Reuse ``_resolve_maestro_test`` for the name validation gate
+        # (length cap + char whitelist). An explicit test must be
+        # supplied — defaulting to scoped tb_cell would defeat the
+        # whole point of the call (which is to create a NEW row).
+        if test is None:
+            raise ValueError("create_maestro_test requires an explicit test name")
+        resolved_test = self._resolve_maestro_test(test)
+        _validate_name(lib, "lib")
+        _validate_name(cell, "cell")
+        _validate_name(view, "view")
+        if not isinstance(simulator, str) or simulator not in _MAESTRO_SIMULATOR_ALLOWED:
+            raise ValueError(
+                f"Simulator must be one of {sorted(_MAESTRO_SIMULATOR_ALLOWED)}; "
+                f"got {_scrub(repr(simulator))}."
+            )
+        # PC-side cache short-circuit: same-bridge duplicate.
+        if resolved_test in self._created_maestro_tests:
+            raise ValueError(
+                f"Maestro test {_scrub(repr(resolved_test))} already "
+                f"created by this bridge; remove the duplicate from the "
+                f"LLM proposal or pick a different name."
+            )
+        self._validate_maestro_session(session)
+        # R2 P1-1: remote-authoritative dedup. Catches the cross-bridge
+        # / cross-session case (user authored a test interactively, or
+        # the prior agent run created tests this bridge instance never
+        # saw). If the SKILL probe itself raises, propagate — better to
+        # fail loudly than overwrite a row the LLM doesn't know exists.
+        remote_names = self._list_remote_maestro_tests(session)
+        if resolved_test in remote_names:
+            raise ValueError(
+                f"Maestro test {_scrub(repr(resolved_test))} already "
+                f"exists on remote Maestro session (created externally "
+                f"or in a prior bridge instance); LLM must pick a new "
+                f"name or explicitly delete the existing row first."
+            )
+        logger.info(
+            "[DIAG] create_maestro_test (test_len=%d, lib_len=%d, "
+            "cell_len=%d, view=%s, simulator=%s)",
+            len(resolved_test), len(lib), len(cell), view, simulator,
+        )
+        raw = _mae_writer.create_test(
+            self.client,
+            resolved_test,
+            lib=lib,
+            cell=cell,
+            view=view,
+            simulator=simulator,
+            session=session,
+        )
+        # Record AFTER the writer returns — if create_test raised, the
+        # remote-side row was not created and we shouldn't dedup against
+        # a phantom entry.
+        self._created_maestro_tests.add(resolved_test)
+        return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
+
+    def setup_maestro_corner(
+        self,
+        name: str,
+        *,
+        model_file: str = "",
+        model_section: str = "",
+        variables: dict[str, Any] | None = None,
+        session: str = "",
+    ) -> str:
+        """Create/configure a Maestro corner with optional model file + vars.
+
+        Thin PDK-safe wrapper around
+        ``virtuoso_bridge.virtuoso.maestro.writer.setup_corner``. The
+        underlying SKILL chain (``maeSetCorner`` + ``maeSetVar`` +
+        ``axlSetModelFile``) takes free-text strings — this wrapper
+        validates everything PC-side first so no quote / backslash /
+        SKILL primitive can reach remote-side interpolation.
+
+        ``model_file`` (when supplied) is validated as a remote absolute
+        path under the same allow-list ``create_netlist_for_corner``
+        uses. ``variables`` keys go through ``_SAFE_PARAM_NAME_RE`` and
+        values through ``_format_param_value``.
+        """
+        self._require_scope_for_maestro("setup_maestro_corner")
+        _validate_name(name, "corner")
+        if not isinstance(model_file, str):
+            raise TypeError(
+                f"model_file must be a string; got type={type(model_file).__name__}"
+            )
+        if model_file:
+            self._validate_remote_output_dir(model_file)
+        if not isinstance(model_section, str):
+            raise TypeError(
+                f"model_section must be a string; got "
+                f"type={type(model_section).__name__}"
+            )
+        if model_section:
+            _validate_name(model_section, "model_section")
+        if variables is not None and not isinstance(variables, dict):
+            raise TypeError(
+                f"variables must be a dict or None; got "
+                f"type={type(variables).__name__}"
+            )
+        var_pairs: dict[str, str] = {}
+        for key, value in (variables or {}).items():
+            if not isinstance(key, str) or not _SAFE_PARAM_NAME_RE.fullmatch(key):
+                raise ValueError(
+                    f"Invalid corner variable key (len={len(key) if isinstance(key, str) else -1}). "
+                    "Must match ^[a-zA-Z][a-zA-Z0-9_]{0,31}$."
+                )
+            value_str = self._format_param_value(value)
+            # Belt-and-suspenders tripwire (matches set_maestro_analysis):
+            # ``key`` is pinned by _SAFE_PARAM_NAME_RE; ``value_str`` is
+            # the output of _format_param_value (atom-level whitelist).
+            # If either of those upstream gates regresses we still catch
+            # the literal-quote chars here BEFORE the alist reaches SKILL.
+            # NOTE: ValueError not assert (python -O strips asserts).
+            # TODO(post-MLCAD): canary test that snapshots this tripwire's
+            # AST so a future refactor that accidentally drops the loop
+            # (e.g. extracting it into a helper that swallows the
+            # ValueError) is caught by CI. Claude P3 NIT — non-blocking
+            # because the tripwire is currently exercised by adversarial
+            # unit tests in test_track_c_v2_safe_bridge.py.
+            for forbidden in ('"', "\\", "`", "\n", "\r", "\t"):
+                if forbidden in key or forbidden in value_str:
+                    raise ValueError(
+                        f"corner variable contains forbidden char "
+                        f"(key_len={len(key)}, value_len={len(value_str)})"
+                    )
+            var_pairs[key] = value_str
+        self._validate_maestro_session(session)
+        logger.info(
+            "[DIAG] setup_maestro_corner (name_len=%d, has_model_file=%s, "
+            "model_section_len=%d, num_vars=%d)",
+            len(name), bool(model_file), len(model_section), len(var_pairs),
+        )
+        raw = _mae_writer.setup_corner(
+            self.client,
+            name,
+            model_file=model_file,
+            model_section=model_section,
+            variables=var_pairs or None,
+            session=session,
+        )
+        return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
+
+    def add_maestro_output(
+        self,
+        name: str,
+        *,
+        output_type: str = "",
+        signal_name: str = "",
+        expr: str = "",
+        test: str | None = None,
+        session: str = "",
+    ) -> str:
+        """Add an output row (waveform or expression) to the Maestro
+        Outputs Setup of the scoped testbench.
+
+        Thin PDK-safe wrapper around
+        ``virtuoso_bridge.virtuoso.maestro.writer.add_output``. The SKILL
+        ``maeAddOutput`` builder lives in virtuoso-bridge; this wrapper's
+        job is strict input validation so no foundry name, SKILL
+        primitive, or quote/backslash can reach the remote-side string
+        interpolation.
+
+        Requires ``set_scope(lib, cell, tb_cell=...)``. ``test`` defaults
+        to the scoped tb_cell (Maestro convention) when omitted.
+
+        Returns the raw SKILL output (scrubbed). Caller may use it for
+        downstream Maestro IDs but the agent / LLM should not parse it.
+        """
+        self._require_scope_for_maestro("add_maestro_output")
+        if not isinstance(name, str) or not _MAESTRO_OUTPUT_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"Invalid Maestro output name (len={len(name) if isinstance(name, str) else -1}). "
+                "Must match ^[A-Za-z][A-Za-z0-9_]{0,63}$."
+            )
+        if output_type not in _MAESTRO_OUTPUT_TYPES:
+            raise ValueError(
+                f"Invalid output_type {output_type!r}; allowed: "
+                f"{sorted(_MAESTRO_OUTPUT_TYPES)}"
+            )
+        if not signal_name and not expr:
+            raise ValueError(
+                "add_maestro_output requires either signal_name or expr."
+            )
+        if signal_name and expr:
+            raise ValueError(
+                "add_maestro_output accepts signal_name OR expr, not both."
+            )
+        if signal_name:
+            if not isinstance(signal_name, str) or len(signal_name) > 256:
+                raise ValueError(
+                    "signal_name must be a string (len<=256); got "
+                    f"type={type(signal_name).__name__}"
+                )
+            # OCEAN signal references can be hierarchical (``/I0/D``) or
+            # top-level (``/Vout``). Accept either shape.
+            #
+            # P2 (R1 2026-05-14): note the asymmetry vs ``expr`` — both
+            # ``_SAFE_NET_NAME_RE`` and ``_PROBE_PATH_RE`` are strict
+            # whitelist regexes that already bound the allowed alphabet
+            # to [A-Za-z0-9_] (plus the leading slash for net names),
+            # so a quote / backslash / backtick / ``;`` / etc. CANNOT
+            # appear in a string that passes either regex. We therefore
+            # do NOT need a second-pass character-blocklist for
+            # ``signal_name``; the regex IS the blocklist.
+            if not (
+                _SAFE_NET_NAME_RE.fullmatch(signal_name)
+                or _PROBE_PATH_RE.fullmatch(signal_name)
+            ):
+                raise ValueError(
+                    f"Invalid signal_name (len={len(signal_name)}). "
+                    "Must start with '/' and contain only safe identifier chars."
+                )
+        if expr:
+            self._validate_maestro_expr(expr)
+        resolved_test = self._resolve_maestro_test(test)
+        self._validate_maestro_session(session)
+        logger.info(
+            "[DIAG] add_maestro_output (test_len=%d, name_len=%d, "
+            "type=%r, has_signal=%s, has_expr=%s)",
+            len(resolved_test), len(name), output_type,
+            bool(signal_name), bool(expr),
+        )
+        raw = _mae_writer.add_output(
+            self.client,
+            name,
+            resolved_test,
+            output_type=output_type,
+            signal_name=signal_name,
+            expr=expr,
+            session=session,
+        )
+        # R2 P1-2 / R3 P2: record AFTER writer returns so a writer
+        # exception does not poison the dedup set. Both Option I sync
+        # and v2 dispatcher hit this code path, so a single canonical
+        # record site covers both producers. Key is the resolved tuple
+        # — two tests can each own an output called "VOUT_rms" and
+        # remain independent.
+        self._added_maestro_outputs.add(
+            (name, resolved_test, session),
+        )
+        return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
+
+    def set_maestro_spec(
+        self,
+        name: str,
+        *,
+        lt: Any = None,
+        gt: Any = None,
+        test: str | None = None,
+        session: str = "",
+    ) -> str:
+        """Attach pass/fail bounds to a Maestro output.
+
+        Thin PDK-safe wrapper around
+        ``virtuoso_bridge.virtuoso.maestro.writer.set_spec``. Both ``lt``
+        and ``gt`` are optional but at least one must be supplied;
+        each is validated through ``_format_param_value`` so only
+        numeric / engineering-unit literals (``500u``, ``1.2``,
+        ``2.5e-9``) can reach the remote-side SKILL string.
+        """
+        self._require_scope_for_maestro("set_maestro_spec")
+        if not isinstance(name, str) or not _MAESTRO_OUTPUT_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"Invalid Maestro output name (len={len(name) if isinstance(name, str) else -1}). "
+                "Must match ^[A-Za-z][A-Za-z0-9_]{0,63}$."
+            )
+        if lt is None and gt is None:
+            raise ValueError("set_maestro_spec requires at least one of lt/gt.")
+        lt_str = "" if lt is None else self._format_param_value(lt)
+        gt_str = "" if gt is None else self._format_param_value(gt)
+        resolved_test = self._resolve_maestro_test(test)
+        self._validate_maestro_session(session)
+        logger.info(
+            "[DIAG] set_maestro_spec (test_len=%d, name_len=%d, "
+            "has_lt=%s, has_gt=%s)",
+            len(resolved_test), len(name), bool(lt_str), bool(gt_str),
+        )
+        raw = _mae_writer.set_spec(
+            self.client,
+            name,
+            resolved_test,
+            lt=lt_str,
+            gt=gt_str,
+            session=session,
+        )
+        return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
+
+    @staticmethod
+    def _format_maestro_analysis_token_value(value: Any, *, label: str) -> str:
+        return _format_maestro_analysis_token_value(value, label=label)
+
+    def _format_maestro_analysis_option_value(
+        self, analysis: str, key: str, value: Any,
+    ) -> str:
+        return _format_maestro_analysis_option_value(analysis, key, value)
+
+    def set_maestro_analysis(
+        self,
+        analysis: str,
+        *,
+        enable: bool = True,
+        options: dict[str, Any] | None = None,
+        test: str | None = None,
+        session: str = "",
+    ) -> str:
+        """Enable / disable a Maestro analysis on the scoped test.
+
+        Thin PDK-safe wrapper around
+        ``virtuoso_bridge.virtuoso.maestro.writer.set_analysis``. The
+        Python writer accepts ``options`` as a pre-built SKILL alist
+        STRING (``'(("start" "0") ("stop" "200n"))'``) which is
+        injection-prone if forwarded verbatim. This wrapper instead
+        takes a dict, validates every key as ``_SAFE_PARAM_NAME_RE`` and
+        every value through ``_format_param_value``, and assembles the
+        alist string itself.
+        """
+        self._require_scope_for_maestro("set_maestro_analysis")
+        if not isinstance(analysis, str) or analysis not in _MAESTRO_ALLOWED_ANALYSES:
+            raise ValueError(
+                f"Analysis must be one of {sorted(_MAESTRO_ALLOWED_ANALYSES)}; "
+                f"got {_scrub(repr(analysis))}."
+            )
+        if not isinstance(enable, bool):
+            raise ValueError(
+                f"enable must be bool; got type={type(enable).__name__}"
+            )
+        # R3 (2026-05-14, codex_reviewer_v4 P2): type-check ``options``
+        # BEFORE the ``or {}`` fallback. The prior ``opts = options or
+        # {}`` silently coerced any falsy value — empty list, empty
+        # string, ``0``, ``False`` — into an empty dict, which then
+        # passed the dict isinstance check. Callers that pass the
+        # wrong type by mistake (e.g. ``options=[]`` instead of
+        # ``options={}``) should get a TypeError, not a silent no-op
+        # that hides their bug.
+        if options is not None and not isinstance(options, dict):
+            raise TypeError(
+                f"options must be a dict or None; got type="
+                f"{type(options).__name__}"
+            )
+        opts = options if options is not None else {}
+        resolved_test = self._resolve_maestro_test(test)
+        pairs: list[str] = []
+        for key, value in opts.items():
+            if not isinstance(key, str) or not _SAFE_PARAM_NAME_RE.fullmatch(key):
+                raise ValueError(
+                    f"Invalid analysis option key (len={len(key) if isinstance(key, str) else -1}). "
+                    "Must match ^[a-zA-Z][a-zA-Z0-9_]{0,31}$."
+                )
+            value_str = self._format_maestro_analysis_option_value(
+                analysis, key, value,
+            )
+            # R3 (2026-05-14, codex_reviewer_v4 P2): belt-and-suspenders
+            # tripwire. ``key`` is already pinned to
+            # ``_SAFE_PARAM_NAME_RE`` and ``value_str`` is either an
+            # enum literal from a finite set or the output of
+            # ``_format_param_value`` (which itself rejects any char
+            # outside ``_PARAM_ATOM_RE``). The two literal-quote chars
+            # below therefore cannot appear unless one of those upstream
+            # validators regresses; this check catches such a regression
+            # BEFORE the malformed alist reaches remote-side SKILL.
+            # NOTE: must be ``raise ValueError``, not ``assert``, because
+            # ``python -O`` strips asserts at compile time and the
+            # tripwire would silently disappear in optimized deploys.
+            for forbidden in ('"', "\\", "`", "\n", "\r", "\t"):
+                if forbidden in key:
+                    raise ValueError(
+                        f"alist key contains forbidden char (len={len(key)})"
+                    )
+                if forbidden in value_str:
+                    raise ValueError(
+                        f"alist value contains forbidden char "
+                        f"(len={len(value_str)})"
+                    )
+            pairs.append(f'("{key}" "{value_str}")')
+        options_str = "(" + " ".join(pairs) + ")" if pairs else ""
+        if analysis == "pnoise" and enable:
+            configured = self._configured_maestro_analyses.get(resolved_test, set())
+            if "pss" not in configured:
+                raise ValueError(
+                    "pnoise requires pss on the same test; set pss before "
+                    f"pnoise on test {resolved_test}"
+                )
+        self._validate_maestro_session(session)
+        logger.info(
+            "[DIAG] set_maestro_analysis (test_len=%d, analysis=%s, "
+            "enable=%s, num_opts=%d)",
+            len(resolved_test), analysis, enable, len(pairs),
+        )
+        raw = _mae_writer.set_analysis(
+            self.client,
+            resolved_test,
+            analysis,
+            enable=enable,
+            options=options_str,
+            session=session,
+        )
+        configured = self._configured_maestro_analyses.setdefault(
+            resolved_test, set(),
+        )
+        if enable:
+            configured.add(analysis)
+        else:
+            configured.discard(analysis)
+        return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
+
+    def create_netlist_for_corner(
+        self,
+        corner: str,
+        output_dir: str,
+        *,
+        test: str | None = None,
+    ) -> str:
+        """Export a standalone netlist for the named corner.
+
+        Thin PDK-safe wrapper around
+        ``virtuoso_bridge.virtuoso.maestro.writer.create_netlist_for_corner``.
+        ``output_dir`` is the remote-side directory where Maestro will
+        write the netlist; both ``corner`` and ``output_dir`` are
+        validated against the strict-char regexes before SKILL builds
+        the ``maeCreateNetlistForCorner`` string.
+        """
+        self._require_scope_for_maestro("create_netlist_for_corner")
+        _validate_name(corner, "corner")
+        self._validate_remote_output_dir(output_dir)
+        resolved_test = self._resolve_maestro_test(test)
+        logger.info(
+            "[DIAG] create_netlist_for_corner (test_len=%d, corner_len=%d, "
+            "output_dir_len=%d)",
+            len(resolved_test), len(corner), len(output_dir),
+        )
+        raw = _mae_writer.create_netlist_for_corner(
+            self.client,
+            resolved_test,
+            corner,
+            output_dir,
+        )
+        return _scrub(raw) if isinstance(raw, str) else _scrub(str(raw))
+
     @staticmethod
     def _log_manual_sync_table(
         design_vars: dict[str, Any],
@@ -2359,23 +3698,5 @@ class SafeBridge:
 
     @staticmethod
     def _format_param_value(value: Any) -> str:
-        if isinstance(value, bool):
-            raise ValueError("Boolean parameter values are not allowed")
-        if isinstance(value, int):
-            return str(value)
-        if isinstance(value, float):
-            if not math.isfinite(value):
-                raise ValueError("Non-finite parameter values are not allowed")
-            return format(value, ".12g")
-        if isinstance(value, str):
-            if value != value.strip() or not _PARAM_ATOM_RE.fullmatch(value):
-                raise ValueError(
-                    "Unsafe parameter value "
-                    f"(type=str len={len(value)}). "
-                    "Only numeric literals or engineering-unit strings are allowed."
-                )
-            return value
-        raise ValueError(
-            f"Unsupported parameter value type: {type(value).__name__}"
-        )
+        return _format_param_atom_value(value)
 
