@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import spec_evaluator
+from . import curve_searcher, spec_evaluator
 from .failure_codes import DumpStatus
 from .llm_client import LLMClient
 from .maestro_metric_sync import sync_spec_metrics_to_maestro
@@ -294,6 +294,13 @@ class CircuitAgent:
         # so re-reading it on every tuning retry is wasted SSH/SKILL
         # round-trips. None on cache miss, dict on hit.
         self._sweep_manifest_cache: dict[str, dict[int, float]] = {}
+        # Path-3 prep (2026-05-24): per-call cache populated by
+        # `_run_sweep_phase` so the optional curve-level searcher (off
+        # by default; gated by `curve_searcher_enabled` on `run()`)
+        # can summarize the f-Vctrl curve and rank candidates without
+        # re-reading the manifest or rerunning the sweep. None when no
+        # sweep has yet completed this run.
+        self._last_sweep_curve_state: dict | None = None
         # Path-2.5 R2 P3 NIT 3 (2026-05-19): tracks whether the
         # spec-derived Maestro Outputs Setup write has successfully
         # landed on the remote testbench. The derived payload is
@@ -337,6 +344,8 @@ class CircuitAgent:
         plan_auto: PlanAuto | None = None,
         sweep_results_root: str | None = None,
         maestro_test: str | None = None,
+        curve_searcher_enabled: bool = False,
+        curve_searcher_max_candidates: int = curve_searcher.DEFAULT_MAX_CANDIDATES,
     ) -> dict:
         """Run the closed-loop optimization against a Maestro testbench cell.
 
@@ -712,12 +721,26 @@ class CircuitAgent:
         safeguard_streak = 0
         stuck_streak = 0
         topology_streak = 0
+        # Path-3 prep (2026-05-24, R2 codex fix #2): clear any sweep
+        # curve state left over from a previous run() invocation on the
+        # same CircuitAgent instance, so a fresh run that hits an early
+        # sweep failure cannot inherit a leftover successful curve
+        # cache from the prior run.
+        self._last_sweep_curve_state = None
         # Path-2: sweep-phase state. `tuning_*` track the most recent
         # sweep verdicts so they can flow into the next-iteration prompt
         # AND into the run() return payload.
         tuning_retries = 0
         last_tuning_measurements: dict = {}
         last_tuning_pass_fail: dict = {}
+        # Path-3 prep (2026-05-24): optional curve-level searcher
+        # sensitivity-window state, carried across iterations so the
+        # next sweep-FAIL can compute observed dy/d(ln var). The
+        # `last_curve_summary_md` prompt section itself is reset at
+        # the TOP of each iteration (see fix #1 below) — do not init
+        # it here, the per-iter reset is the source of truth.
+        prev_tuning_measurements: dict = {}
+        prev_tuning_design_vars: dict = {}
         sweep_enabled = bool(
             sweep_results_root
             and self.eval_block
@@ -732,6 +755,15 @@ class CircuitAgent:
 
         for i in range(max_iter):
             logger.info("=== Iteration %d/%d ===", i + 1, max_iter)
+
+            # Path-3 prep (2026-05-24, R2 codex fix #1): reset the
+            # curve-searcher prompt section at the TOP of every iter so
+            # a summary built from iter N's sweep-FAIL cannot leak into
+            # iter N+1's prompt when iter N+1 takes a different branch
+            # (e.g. single-point FAIL before _run_sweep_phase runs).
+            # The section is repopulated only by the single-point-PASS
+            # + sweep-FAIL branch below.
+            last_curve_summary_md = ""
 
             parsed = self._parse_llm_response(response)
             # Path-2.5 (2026-05-19, R2 P1 codex blocker): when the
@@ -1225,6 +1257,32 @@ class CircuitAgent:
                         converged = True
                         self._log_final_converged_values(accumulated_vars)
                         break
+                    # Path-3 prep (2026-05-24): optional curve searcher.
+                    # Builds a structured f-Vctrl/Kvco/candidate summary
+                    # from the data `_run_sweep_phase` already produced
+                    # and appends it to the next-iter prompt. No new
+                    # SafeBridge / OCEAN / .tran fetch; pure-Python over
+                    # in-memory state. Returns "" when the searcher is
+                    # disabled, the sweep curve state is unavailable
+                    # (early-return sweep failure), or the safety gate
+                    # rejects the rendered text.
+                    if curve_searcher_enabled:
+                        last_curve_summary_md = (
+                            self._build_curve_searcher_section(
+                                tuning_measurements=tuning_meas,
+                                tuning_pass_fail=tuning_pf,
+                                design_vars=accumulated_vars,
+                                prev_design_vars=prev_tuning_design_vars,
+                                prev_tuning_measurements=(
+                                    prev_tuning_measurements
+                                ),
+                                max_candidates=(
+                                    curve_searcher_max_candidates
+                                ),
+                            )
+                        )
+                    prev_tuning_measurements = dict(tuning_meas)
+                    prev_tuning_design_vars = dict(accumulated_vars)
                     tuning_retries += 1
                     logger.info(
                         "Iter %d: single-point PASS but tuning FAIL "
@@ -1299,6 +1357,7 @@ class CircuitAgent:
                     f"## Iteration {i + 1} measurements (platform-computed)\n"
                     f"{eval_summary}\n\n"
                     f"{tuning_section}"
+                    f"{last_curve_summary_md}"
                     f"## Per-device DC op-point (tranOp @ t=0)\n"
                     f"{op_point_summary}\n\n"
                     f"## OCEAN run meta\n{sim_summary}\n\n"
@@ -1968,6 +2027,12 @@ class CircuitAgent:
         error) collapse to all-UNMEASURABLE so the agent can decide to
         retry rather than crash.
         """
+        # Path-3 prep (2026-05-24, R2 codex fix #2): clear the curve
+        # cache at entry, BEFORE any early-return path, so a sweep that
+        # fails at the manifest / dump / evaluate stage cannot leave the
+        # previous successful sweep's curve state in place for the
+        # optional searcher to consume.
+        self._last_sweep_curve_state = None
         if not self.eval_block:
             return {}, {}
         ensure_reason = self._ensure_sweep_manifest(sweep_results_root)
@@ -2074,6 +2139,15 @@ class CircuitAgent:
                     meas = {}
                 base_measurements_per_point.append(meas)
 
+        # Path-3 prep (2026-05-24): stash per-point + vctrl arrays so
+        # the optional curve searcher (off by default; opted in via
+        # `run(curve_searcher_enabled=True)`) can build its summary
+        # without re-reading the manifest or re-running the sweep.
+        # Side-effect only — public return shape is unchanged.
+        self._last_sweep_curve_state = {
+            "vctrls": list(vctrls),
+            "base_per_point": list(base_measurements_per_point),
+        }
         try:
             return spec_evaluator.evaluate_swept(
                 self.eval_block,
@@ -2084,6 +2158,62 @@ class CircuitAgent:
         except Exception as exc:  # noqa: BLE001
             logger.warning("evaluate_swept raised: %s", exc)
             return self._tuning_all_unmeasurable("evaluate_swept_failed")
+
+    # ------------------------------------------------------------------ #
+    #  Curve searcher prompt section (Path-3 prep, 2026-05-24)
+    # ------------------------------------------------------------------ #
+
+    def _build_curve_searcher_section(
+        self,
+        *,
+        tuning_measurements: dict,
+        tuning_pass_fail: dict,
+        design_vars: dict,
+        prev_design_vars: dict,
+        prev_tuning_measurements: dict,
+        max_candidates: int,
+    ) -> str:
+        """Return a Markdown summary of the f-Vctrl curve and ranked
+        candidate edits for the next-iter prompt, or "" when there is
+        no usable curve state or the safety gate rejects the rendered
+        text.
+
+        R2 codex fix #2: requires `_last_sweep_curve_state` to have
+        been populated by the *current* iteration's `_run_sweep_phase`
+        call. The cache is cleared at every `_run_sweep_phase` entry
+        and at every `run()` start so a stale curve from a prior
+        successful sweep cannot bleed into a later prompt.
+
+        R2 codex fix #3 (defense-in-depth): even though
+        `curve_searcher.build_summary` already passes through
+        `assert_no_foundry_leak`, re-assert against the rendered text
+        here so any future code path that adds caller-supplied content
+        is also gated before reaching the LLM.
+        """
+        state = self._last_sweep_curve_state
+        if state is None:
+            return ""
+        try:
+            summary = curve_searcher.build_summary(
+                vctrl_values=state["vctrls"],
+                base_measurements_per_point=state["base_per_point"],
+                tuning_measurements=tuning_measurements,
+                tuning_pass_fail=tuning_pass_fail,
+                design_vars=design_vars,
+                prev_design_vars=prev_design_vars,
+                prev_tuning_measurements=prev_tuning_measurements,
+                max_candidates=max_candidates,
+            )
+            md = summary.to_markdown()
+            curve_searcher.assert_no_foundry_leak(md)
+            return md
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "curve_searcher build/sanitize failed (%s); skipping "
+                "summary this iter.",
+                exc,
+            )
+            return ""
 
     # ------------------------------------------------------------------ #
     #  Writeback (final Maestro state)

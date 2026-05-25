@@ -224,6 +224,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--enable-curve-searcher",
+        action="store_true",
+        help=(
+            "Path-3 prep (2026-05-24): turn on the LC_VCO curve-level "
+            "searcher. After each sweep phase that fails the spec's "
+            "`tuning_metrics:`, the agent appends a structured summary "
+            "(f-Vctrl curve, Kvco segments, worst violations, ranked "
+            "candidate variable deltas focused on C/L/nfin_cc, plus "
+            "observed last-change sensitivity) to the next-iter LLM "
+            "prompt. Pure-Python; no extra Spectre/OCEAN/SKILL round-"
+            "trips. Default OFF — existing path-2 behaviour is "
+            "unchanged unless this flag is set."
+        ),
+    )
+    parser.add_argument(
+        "--curve-searcher-max-candidates",
+        type=int,
+        default=6,
+        help=(
+            "Path-3 prep (2026-05-24): cap on the ranked candidate list "
+            "emitted by --enable-curve-searcher. <= 0 disables candidate "
+            "generation (curve/sensitivity summary still shown). "
+            "Default 6."
+        ),
+    )
+    parser.add_argument(
         "--auto-bias-ic",
         action="store_true",
         help=(
@@ -879,6 +905,8 @@ def main() -> int:
         plan_auto=plan_auto,
         sweep_results_root=args.sweep_results_root,
         maestro_test=args.maestro_test,
+        curve_searcher_enabled=args.enable_curve_searcher,
+        curve_searcher_max_candidates=args.curve_searcher_max_candidates,
     )
 
     print("\n" + "=" * 60)
