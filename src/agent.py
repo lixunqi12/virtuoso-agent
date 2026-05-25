@@ -24,7 +24,9 @@ from . import spec_evaluator
 from .failure_codes import DumpStatus
 from .llm_client import LLMClient
 from .maestro_metric_sync import sync_spec_metrics_to_maestro
+from .maestro_metric_sync import _waveform_expr as _maestro_waveform_expr
 from .maestro_setup import (
+    MAESTRO_SETUP_KEYS,
     apply_maestro_setup,
     validate_maestro_setup_block as _validate_maestro_setup_block,
 )
@@ -55,6 +57,13 @@ SAFEGUARD_CONSECUTIVE_LIMIT = 3
 # mid-run does not trip the relabel.
 TOPOLOGY_SANITY_VIOLATION_LIMIT = 3
 _SANITY_VIOLATION_PREFIX = "UNMEASURABLE (suspect:"
+
+# Path-2 (2026-05-19): after single-point convergence, the loop spends
+# up to TUNING_RETRY_BUDGET further iterations trying to satisfy the
+# spec's `tuning_metrics` (sweep-driven Kvco / monotonicity / range).
+# Sized so a typical 20-iter cap still leaves headroom for the
+# single-point pass that precedes the tuning gate.
+TUNING_RETRY_BUDGET = 7
 
 
 def _has_sanity_violation(pass_fail: dict | None) -> bool:
@@ -225,6 +234,12 @@ class IterationRecord:
     llm_reasoning: str = ""
     timestamp: float = field(default_factory=time.time)
     diagnostic: IterationDiagnostic = field(default_factory=IterationDiagnostic)
+    # Path-2 (2026-05-19): populated only on iterations that ran a
+    # sweep phase (single-point PASS + spec declared `sweep:` + CLI
+    # `--sweep-results-root` supplied). Empty dict otherwise — easier
+    # to read in the transcript than `None`.
+    tuning_measurements: dict = field(default_factory=dict)
+    tuning_pass_fail: dict = field(default_factory=dict)
 
 
 class CircuitAgent:
@@ -272,6 +287,22 @@ class CircuitAgent:
         # legacy LLM-judged flow (sim_result["measurements"] from
         # safeOceanMeasure, LLM's own pass_fail).
         self.eval_block: dict | None = None
+        # R2 (2026-05-19, claude P3): per-run cache for the tuning
+        # manifest. Keyed by sweep_results_root so test pivots that
+        # change the root invalidate themselves; within one root the
+        # file is static (created out-of-band before the agent runs),
+        # so re-reading it on every tuning retry is wasted SSH/SKILL
+        # round-trips. None on cache miss, dict on hit.
+        self._sweep_manifest_cache: dict[str, dict[int, float]] = {}
+        # Path-2.5 R2 P3 NIT 3 (2026-05-19): tracks whether the
+        # spec-derived Maestro Outputs Setup write has successfully
+        # landed on the remote testbench. The derived payload is
+        # idempotent — re-issuing it after a SafeBridge / SKILL hiccup
+        # is safe — so the dispatch slot re-attempts on each
+        # subsequent iter until the flag flips. False on a fresh
+        # agent; only the Spectre / Maestro path flips it (HSpice
+        # ignores the flag entirely).
+        self._maestro_setup_applied: bool = False
         if isinstance(spec, str):
             try:
                 self.eval_block = spec_evaluator.extract_eval_block(spec)
@@ -304,6 +335,8 @@ class CircuitAgent:
         scs_path: str | None = None,
         transcript_path: str | Path | None = None,
         plan_auto: PlanAuto | None = None,
+        sweep_results_root: str | None = None,
+        maestro_test: str | None = None,
     ) -> dict:
         """Run the closed-loop optimization against a Maestro testbench cell.
 
@@ -464,6 +497,23 @@ class CircuitAgent:
             )
         else:
             contract_note = ""
+        # Path-2.5 (2026-05-19): only tell the LLM to drop the four
+        # structural Maestro blocks when the spec-derived path is
+        # active (eval_block present). Dict-spec / legacy JSON projects
+        # still rely on the LLM emit path — issuing this instruction
+        # unconditionally would regress those flows.
+        if self.eval_block is not None:
+            derived_setup_note = (
+                "- **Maestro setup is derived from the spec automatically.** "
+                "Do NOT emit `tests`, `analyses`, `outputs`, or `corners` "
+                "blocks — the agent translates spec §2 "
+                "(`signals`/`windows`/`metrics`) into Maestro Outputs "
+                "Setup rows + the analyses-enable list deterministically. "
+                "Emit ONLY `measurements`, `pass_fail`, `reasoning`, "
+                "`design_vars`.\n"
+            )
+        else:
+            derived_setup_note = ""
         messages = [{
             "role": "user",
             "content": (
@@ -482,7 +532,8 @@ class CircuitAgent:
                 "(e.g. `500u`, `1.5f`, `10n`, `3k`). "
                 "Do NOT use physical units like mA, pF, nH, V, GHz.\n"
                 "- Do NOT invent variable names — use only the names in "
-                "the whitelist above.\n\n"
+                "the whitelist above.\n"
+                f"{derived_setup_note}\n"
                 "## Region enum (per-device op-point table)\n"
                 "Each next-turn prompt carries a ``tranOp`` DC operating-"
                 "point table. The ``region`` integer maps as:\n"
@@ -627,10 +678,19 @@ class CircuitAgent:
         # mode here is fail-soft (try/except wraps the whole call).
         # Skipped when no eval_block is present (legacy LLM-judged
         # flow) — there are no PC-computed metrics to mirror.
+        maestro_setup_test: str | None = None
         if self.eval_block is not None:
+            maestro_setup_test = self._resolve_maestro_setup_test(
+                tb_cell=tb_cell,
+                maestro_test=maestro_test,
+            )
+
+        if self.eval_block is not None and maestro_setup_test is not None:
             try:
                 sync_summary = sync_spec_metrics_to_maestro(
-                    self.bridge, self.eval_block, logger=logger,
+                    self.bridge, self.eval_block,
+                    logger=logger,
+                    test=maestro_setup_test,
                 )
                 logger.info(
                     "Maestro Outputs sync: %d added, %d skipped.",
@@ -652,11 +712,41 @@ class CircuitAgent:
         safeguard_streak = 0
         stuck_streak = 0
         topology_streak = 0
+        # Path-2: sweep-phase state. `tuning_*` track the most recent
+        # sweep verdicts so they can flow into the next-iteration prompt
+        # AND into the run() return payload.
+        tuning_retries = 0
+        last_tuning_measurements: dict = {}
+        last_tuning_pass_fail: dict = {}
+        sweep_enabled = bool(
+            sweep_results_root
+            and self.eval_block
+            and self.eval_block.get("sweep")
+            and self.eval_block.get("tuning_metrics")
+        )
+        if sweep_results_root and not sweep_enabled:
+            logger.info(
+                "--sweep-results-root supplied but spec has no `sweep:` + "
+                "`tuning_metrics:` block; ignoring."
+            )
 
         for i in range(max_iter):
             logger.info("=== Iteration %d/%d ===", i + 1, max_iter)
 
             parsed = self._parse_llm_response(response)
+            # Path-2.5 (2026-05-19, R2 P1 codex blocker): when the
+            # spec-derived Maestro setup path is active, the LLM's
+            # ``tests`` / ``analyses`` / ``outputs`` / ``corners``
+            # blocks are ignored downstream — feeding them to the
+            # contract validator would only generate a fake violation
+            # (e.g. haiku-4-5 emitting ``outputs: dict`` instead of
+            # list) that burns all 3 repair retries before aborting.
+            # Strip-and-warn at the top of the iter so the static
+            # checker sees a clean payload, then again after every
+            # repair-loop re-parse (the repair prompt does NOT
+            # re-instruct the LLM about these blocks, so a corrected
+            # response may still carry them).
+            self._strip_llm_setup_blocks_if_derived(parsed, iter_idx=i)
             # Repair loop: if the response violates the §4 contract,
             # send a corrective message and re-request. Track C v2
             # raised the cap from 1 to ``_CONTRACT_REPAIR_MAX`` (3) so
@@ -689,6 +779,7 @@ class CircuitAgent:
                 response = self.llm.chat(messages)
                 messages.append({"role": "assistant", "content": response})
                 parsed = self._parse_llm_response(response)
+                self._strip_llm_setup_blocks_if_derived(parsed, iter_idx=i)
                 repair_reason = self._check_contract_violation(parsed)
             if repair_reason:
                 logger.warning(
@@ -716,9 +807,32 @@ class CircuitAgent:
             # v2 keys with a clear repair-prompt in the HSpice branch,
             # or (b) share the v2 apply path with HSpice once the
             # HSpice backend grows an equivalent Outputs Setup. Codex P3.
-            setup_payload = self._slice_maestro_setup_payload(
-                parsed, iter_idx=i, log=logger,
-            )
+            #
+            # Path-2.5 (2026-05-19): when a §2 eval block is present,
+            # derive the Maestro analyses + outputs payload from spec
+            # rather than trusting the LLM's emit. Small models (haiku-
+            # 4-5) regularly mis-shape these blocks
+            # (``outputs: dict`` instead of ``list``, ``analysis:
+            # 'transient'`` instead of ``'tran'``) which used to burn
+            # every contract-repair retry before aborting the iter —
+            # the strip-and-warn helper above now drops them before the
+            # contract check, so iters always reach this dispatch slot.
+            #
+            # The derived payload is normally applied once on iter 0;
+            # ``self._maestro_setup_applied`` tracks success so a SKILL
+            # failure on iter 0 retries automatically on iter 1 instead
+            # of leaving the testbench Outputs Setup empty for the rest
+            # of the run (R2 P3 NIT 3).
+            setup_payload: dict | None = None
+            if self.eval_block is not None:
+                if not self._maestro_setup_applied and maestro_setup_test is not None:
+                    setup_payload = self._derive_maestro_setup_from_spec(
+                        maestro_setup_test,
+                    )
+            else:
+                setup_payload = self._slice_maestro_setup_payload(
+                    parsed, iter_idx=i, log=logger,
+                )
             if setup_payload:
                 try:
                     setup_summary = apply_maestro_setup(
@@ -729,6 +843,8 @@ class CircuitAgent:
                         i + 1,
                         {k: len(v) for k, v in setup_summary["applied"].items()},
                     )
+                    if self.eval_block is not None:
+                        self._maestro_setup_applied = True
                 except Exception as exc:  # noqa: BLE001 — fail-soft
                     logger.warning(
                         "apply_maestro_setup raised at iter %d "
@@ -878,7 +994,7 @@ class CircuitAgent:
             # (e.g. VT(/Vout_p)-VT(/Vout_n) unavailable because circuit
             # didn't oscillate) — without that feedback the LLM mistakenly
             # assumes the next iter starts from a fresh equilibrium.
-            if plan_auto is not None:
+            if plan_auto is not None and plan_auto.active:
                 patch_status = plan_auto.patch_after_run(self.bridge, i + 1)
                 diagnostic.ic_patch_applied = bool(patch_status.get("patched"))
                 if not diagnostic.ic_patch_applied:
@@ -1083,10 +1199,55 @@ class CircuitAgent:
                 topology_streak = 0
 
             if met:
-                logger.info("Specifications met at iteration %d", i + 1)
-                converged = True
-                self._log_final_converged_values(accumulated_vars)
-                break
+                # Path-2: gate single-point PASS on the tuning-curve
+                # phase when the spec declares a sweep and the CLI
+                # supplied a results root. Otherwise single-point PASS
+                # is enough for convergence (legacy behaviour).
+                if sweep_enabled:
+                    tuning_meas, tuning_pf = self._run_sweep_phase(
+                        sweep_results_root=sweep_results_root,
+                        tb_cell=tb_cell,
+                        result_test=maestro_setup_test,
+                        lib=lib,
+                        cell=cell,
+                        design_vars=accumulated_vars,
+                        analyses=analyses_for_run,
+                    )
+                    record.tuning_measurements = tuning_meas
+                    record.tuning_pass_fail = tuning_pf
+                    last_tuning_measurements = tuning_meas
+                    last_tuning_pass_fail = tuning_pf
+                    if self._all_pass(tuning_pf):
+                        logger.info(
+                            "Specifications met (single-point + tuning) "
+                            "at iteration %d", i + 1,
+                        )
+                        converged = True
+                        self._log_final_converged_values(accumulated_vars)
+                        break
+                    tuning_retries += 1
+                    logger.info(
+                        "Iter %d: single-point PASS but tuning FAIL "
+                        "(retry %d/%d). Verdicts: %s",
+                        i + 1, tuning_retries, TUNING_RETRY_BUDGET,
+                        tuning_pf,
+                    )
+                    if tuning_retries >= TUNING_RETRY_BUDGET:
+                        abort_reason = "tuning_budget"
+                        logger.warning(
+                            "tuning_retry_budget (%d) exhausted; single-"
+                            "point PASS but tuning still FAIL.",
+                            TUNING_RETRY_BUDGET,
+                        )
+                        break
+                    # Fall through so the next-iter prompt picks up
+                    # tuning verdicts and the LLM gets a chance to
+                    # re-balance the LC/varactor sizing.
+                else:
+                    logger.info("Specifications met at iteration %d", i + 1)
+                    converged = True
+                    self._log_final_converged_values(accumulated_vars)
+                    break
 
             # SAFEGUARD: three consecutive iterations with amp_hold_ratio<0.3
             # means the tank isn't oscillating; further tweaks won't help.
@@ -1130,10 +1291,14 @@ class CircuitAgent:
                 eval_summary = _format_eval_summary(
                     measurements, pass_fail, dumps, diagnostic=diagnostic,
                 )
+                tuning_section = _format_tuning_summary(
+                    last_tuning_measurements, last_tuning_pass_fail,
+                ) if last_tuning_pass_fail else ""
                 next_prompt = (
                     f"{topology_block}"
                     f"## Iteration {i + 1} measurements (platform-computed)\n"
                     f"{eval_summary}\n\n"
+                    f"{tuning_section}"
                     f"## Per-device DC op-point (tranOp @ t=0)\n"
                     f"{op_point_summary}\n\n"
                     f"## OCEAN run meta\n{sim_summary}\n\n"
@@ -1185,6 +1350,23 @@ class CircuitAgent:
                 logger.warning(
                     "Did not converge within %d iterations.", max_iter,
                 )
+                # R2 (2026-05-19, claude P3): when the sweep gate was
+                # active and the loop exited on max_iter rather than on
+                # tuning_budget, surface how many tuning retries were
+                # still available — actionable for the operator (bump
+                # max_iter vs. abandon the topology).
+                if sweep_enabled:
+                    retries_remaining = max(
+                        0, TUNING_RETRY_BUDGET - tuning_retries,
+                    )
+                    logger.warning(
+                        "tuning_retries_remaining_when_max_iter=%d "
+                        "(budget=%d, used=%d); bump max_iter to give "
+                        "the sweep gate more chances if the single-"
+                        "point bands keep passing.",
+                        retries_remaining, TUNING_RETRY_BUDGET,
+                        tuning_retries,
+                    )
 
         writeback_status = self._run_writeback(accumulated_vars)
 
@@ -1195,6 +1377,11 @@ class CircuitAgent:
             "converged": converged,
             "abort_reason": abort_reason,
             "writeback_status": writeback_status,
+            # Path-2: present iff `sweep:` + `tuning_metrics:` were
+            # declared and a sweep root was supplied. Empty dicts on
+            # legacy runs so downstream code can treat them uniformly.
+            "tuning_measurements": last_tuning_measurements,
+            "tuning_pass_fail": last_tuning_pass_fail,
         }
 
     # ------------------------------------------------------------------ #
@@ -1301,6 +1488,157 @@ class CircuitAgent:
             problems.append(setup_problem)
 
         return "; ".join(problems) if problems else None
+
+    def _strip_llm_setup_blocks_if_derived(
+        self, parsed: dict, *, iter_idx: int,
+    ) -> None:
+        """Remove LLM-emitted Maestro setup keys when the derived path is
+        active (mutates ``parsed`` in place).
+
+        Path-2.5 R2 P1 (2026-05-19): when ``self.eval_block`` is set,
+        the agent derives ``analyses`` / ``outputs`` deterministically
+        from spec §2 and ignores whatever shape the LLM emits for
+        ``tests``/``analyses``/``outputs``/``corners``. Letting those
+        keys reach ``_check_contract_violation`` would falsely trip
+        the contract repair loop on small-model typos (e.g.
+        ``outputs: {…}`` instead of ``outputs: [{…}]``) and burn the
+        full repair budget before aborting — defeating the whole
+        purpose of the derived path. Strip them at the call site
+        instead, with one WARN per iter so the divergence is visible.
+
+        No-op when there's no eval_block (legacy LLM-emit path remains
+        authoritative) or when ``parsed`` carries none of the four keys.
+        """
+        if self.eval_block is None:
+            return
+        present = [k for k in MAESTRO_SETUP_KEYS if k in parsed]
+        if not present:
+            return
+        logger.warning(
+            "iter %d: LLM emitted Maestro setup keys %s; ignoring "
+            "(spec-derived path is authoritative). Stripped before "
+            "contract check.",
+            iter_idx + 1, sorted(present),
+        )
+        for k in present:
+            parsed.pop(k, None)
+
+    def _derive_maestro_setup_from_spec(
+        self, maestro_test: str,
+    ) -> dict:
+        """Derive the Maestro setup payload (analyses + outputs) from §2.
+
+        Path-2.5 (2026-05-19): spec.md §2 already declares ``signals``,
+        ``windows``, and ``metrics`` machine-readably. The agent can
+        deterministically translate them into Maestro Outputs Setup rows
+        + the analyses-enable list — no LLM round-trip needed. This
+        helper replaces the prior LLM-emit path that was getting
+        corrupted by small-model typos (e.g. haiku-4-5 emitting
+        ``outputs: dict`` instead of ``list``, or ``analysis:
+        'transient'`` instead of ``'tran'``), which burned all three
+        contract-repair retries before aborting the iter.
+
+        Returns a dict matching the ``apply_maestro_setup`` contract:
+
+            {"analyses": [{"test": ..., "analysis": "tran",
+                            "enable": True}],
+             "outputs":  [{"name": ..., "output_type": "expr",
+                            "expr": ..., "test": ...}, ...]}
+
+        Empty (``{}``) when the agent has no ``self.eval_block`` —
+        callers should fall through to the legacy LLM-emit path in
+        that case (``isinstance(self.spec, dict)`` JSON specs).
+
+        ``tests`` / ``corners`` are intentionally NOT emitted: the ADE
+        test row already exists in Maestro before the agent loop starts,
+        and corners are PDK-specific (the spec doesn't carry them).
+        """
+        eval_block = self.eval_block
+        if not eval_block:
+            return {}
+
+        signals_list = eval_block.get("signals") or []
+        metrics_list = eval_block.get("metrics") or []
+
+        signal_by_name: dict[str, dict] = {}
+        for entry in signals_list:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                signal_by_name[entry["name"]] = entry
+
+        outputs: list[dict] = []
+        seen_names: set[str] = set()
+        for metric in metrics_list:
+            if not isinstance(metric, dict):
+                continue
+            name = metric.get("name")
+            if not isinstance(name, str) or not name or name in seen_names:
+                continue
+            signal_name = self._metric_source_signal(metric)
+            if signal_name is None:
+                continue
+            signal_entry = signal_by_name.get(signal_name)
+            if signal_entry is None:
+                continue
+            expr = self._maestro_expr_for_signal(signal_entry)
+            if expr is None:
+                continue
+            outputs.append({
+                "name": name,
+                "test": maestro_test,
+                "output_type": "expr",
+                "expr": expr,
+            })
+            seen_names.add(name)
+
+        analyses: list[dict] = [{
+            "test": maestro_test,
+            "analysis": "tran",
+            "enable": True,
+        }]
+
+        return {"analyses": analyses, "outputs": outputs}
+
+    @staticmethod
+    def _metric_source_signal(metric: dict) -> str | None:
+        """Return the signal name a metric depends on, or None.
+
+        Simple metrics carry ``signal`` directly. Compound ``ratio``
+        metrics resolve to the numerator signal (numerator and
+        denominator typically share the same signal in practice;
+        emitting one output suffices to surface the underlying
+        waveform in Maestro). Compound ``t_cross_frac`` metrics
+        carry their own ``signal``. Anything else returns None and
+        the caller skips the metric.
+        """
+        sig = metric.get("signal")
+        if isinstance(sig, str) and sig:
+            return sig
+        if metric.get("compound") == "ratio":
+            num = metric.get("numerator")
+            if isinstance(num, dict):
+                sig = num.get("signal")
+                if isinstance(sig, str) and sig:
+                    return sig
+        return None
+
+    @staticmethod
+    def _maestro_expr_for_signal(signal_entry: dict) -> str | None:
+        """Translate a §2 signal entry into a Maestro waveform expression.
+
+        Delegates to ``maestro_metric_sync._waveform_expr`` so the
+        Option-I sync path and the derived-setup path emit BYTE-
+        IDENTICAL expression strings for the same signal (R2 P3 NIT 2
+        2026-05-19). Canonical kinds:
+
+            V          → ``VT("/path")``
+            I          → ``IT("/path")``
+            Vdiff      → ``(VT("/p1") - VT("/p2"))``
+            Vsum_half  → ``((VT("/p1") + VT("/p2")) / 2.0)``
+
+        Returns None for unknown kinds / malformed paths / paths that
+        fail the SafeBridge probe-path regex.
+        """
+        return _maestro_waveform_expr(signal_entry)
 
     @staticmethod
     def _slice_maestro_setup_payload(
@@ -1422,6 +1760,330 @@ class CircuitAgent:
             scope_lib=self.bridge._scope_lib if hasattr(self.bridge, "_scope_lib") else None,
             scope_tb_cell=self.bridge._scope_tb_cell if hasattr(self.bridge, "_scope_tb_cell") else None,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Path-2 (2026-05-19) — sweep-phase evaluator
+    # ------------------------------------------------------------------ #
+
+    def _tuning_all_unmeasurable(self, reason: str) -> tuple[dict, dict]:
+        """Synthesize UNMEASURABLE verdicts for every declared tuning
+        metric — used when the sweep phase fails before any per-point
+        data is available."""
+        if not self.eval_block:
+            return {}, {}
+        names = [
+            t.get("name") for t in (self.eval_block.get("tuning_metrics") or [])
+            if t.get("name")
+        ]
+        return (
+            {n: None for n in names},
+            {n: f"UNMEASURABLE ({reason})" for n in names},
+        )
+
+    def _derive_sweep_entries(self) -> list[dict]:
+        """Derive the per-point manifest from spec.md §6.1 ``sweep:``.
+
+        Returns ``[{"point": <int 1..N>, "vctrl": <float>}, ...]`` with
+        N = ``sweep.points`` and vctrl evenly distributed between
+        ``range[0]`` and ``range[1]`` inclusive. Raises ``ValueError``
+        if the spec carries no usable ``sweep`` block (caller has
+        already vetted ``self.eval_block`` is present).
+        """
+        sweep = (self.eval_block or {}).get("sweep")
+        if not isinstance(sweep, dict):
+            raise ValueError("spec has no `sweep:` block")
+        lo = float(sweep["range"][0])
+        hi = float(sweep["range"][1])
+        n = int(sweep["points"])
+        if n < 2:
+            raise ValueError("sweep.points must be >= 2")
+        step = (hi - lo) / (n - 1)
+        return [
+            {"point": i + 1, "vctrl": lo + i * step}
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _manifest_matches_spec(
+        existing: dict[int, float], derived: list[dict],
+    ) -> bool:
+        """Return True iff the existing manifest aligns with the
+        spec-derived entries.
+
+        Maestro may run sweep points in a shuffled order, so the manifest's
+        point->Vctrl mapping is authoritative for point identity. For
+        compatibility with hand-authored shuffled manifests, accept any
+        mapping whose point set is exactly the spec-derived point set and whose
+        Vctrl multiset matches the spec grid within 1e-9 rel / 1e-12 abs.
+        """
+        if len(existing) != len(derived):
+            return False
+        derived_points = {entry["point"] for entry in derived}
+        if set(existing) != derived_points:
+            return False
+        existing_vctrls = sorted(float(v) for v in existing.values())
+        derived_vctrls = sorted(float(entry["vctrl"]) for entry in derived)
+        for got, want in zip(existing_vctrls, derived_vctrls):
+            if not math.isclose(
+                got, want,
+                rel_tol=1e-9, abs_tol=1e-12,
+            ):
+                return False
+        return True
+
+    def _resolve_maestro_setup_test(
+        self,
+        *,
+        tb_cell: str,
+        maestro_test: str | None,
+    ) -> str | None:
+        """Return the ADE test row to use for Maestro setup sync.
+
+        ``tb_cell`` remains the testbench cell for OCEAN and final writeback.
+        Maestro setup writers need an ADE test-row name, which may differ from
+        the testbench cell (for example ``pll_LC_VCO_tb_1``).
+        """
+        if maestro_test is not None:
+            return self.bridge._resolve_maestro_test(maestro_test)
+        try:
+            tests = self.bridge._list_remote_maestro_tests()
+        except Exception as exc:  # noqa: BLE001 - setup sync is optional
+            logger.warning(
+                "Maestro setup sync skipped: could not list ADE tests "
+                "(%s: %s). Pass --maestro-test to select one explicitly.",
+                type(exc).__name__, exc,
+            )
+            return None
+        if not isinstance(tests, (set, list, tuple)):
+            logger.warning(
+                "Maestro setup sync skipped: ADE test probe returned %s; "
+                "pass --maestro-test to select one explicitly.",
+                type(tests).__name__,
+            )
+            return None
+        test_set = {t for t in tests if isinstance(t, str)}
+        if tb_cell in test_set:
+            logger.info("Maestro setup sync using ADE test row: %s", tb_cell)
+            return tb_cell
+        if len(test_set) == 1:
+            resolved = next(iter(test_set))
+            logger.info(
+                "Maestro setup sync using sole ADE test row %s "
+                "(tb_cell is %s).",
+                resolved, tb_cell,
+            )
+            return resolved
+        logger.warning(
+            "Maestro setup sync skipped: tb_cell %s is not an ADE test row "
+            "and ADE tests are %s. Pass --maestro-test to select one.",
+            tb_cell, sorted(test_set),
+        )
+        return None
+
+    def _ensure_sweep_manifest(self, sweep_root: str) -> str | None:
+        """Path-2 (2026-05-19): make sure ``.tuning_manifest.json``
+        exists at ``sweep_root`` and matches spec.md §6.1.
+
+        - No ``sweep:`` block in spec → no-op (legacy single-point
+          flow, manifest authoring not applicable).
+        - Manifest already on disk → validate it against the derived
+          entries. Mismatch returns a string reason (caller aborts via
+          UNMEASURABLE); match returns None (caller proceeds to read).
+        - Manifest missing → derive + write it. Failure to write
+          returns a string reason.
+
+        Returning ``None`` means "manifest is ready, go read it."
+        """
+        if not self.eval_block or "sweep" not in self.eval_block:
+            return None
+        try:
+            entries = self._derive_sweep_entries()
+        except (KeyError, ValueError, TypeError) as exc:
+            logger.warning("Sweep manifest derive failed: %s", exc)
+            return "manifest_derive_failed"
+
+        try:
+            existing = self.bridge.read_sweep_manifest(sweep_root)
+        except (RuntimeError, ValueError) as exc:
+            # File missing is the common case — fall through to write.
+            # Other failures (skill error, malformed JSON on disk) also
+            # land here; we still try to author a clean copy.
+            logger.info(
+                "Sweep manifest not readable (%s); authoring from spec.",
+                exc,
+            )
+            existing = None
+
+        if existing is not None:
+            if self._manifest_matches_spec(existing, entries):
+                logger.info(
+                    "Sweep manifest already present at %s (matches spec).",
+                    sweep_root,
+                )
+                return None
+            logger.warning(
+                "Sweep manifest at %s does not match spec sweep block; "
+                "refusing to overwrite hand-written manifest.",
+                sweep_root,
+            )
+            return "manifest_mismatch"
+
+        try:
+            count = self.bridge.write_sweep_manifest(sweep_root, entries)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("Sweep manifest write failed: %s", exc)
+            return "manifest_write_failed"
+        logger.info(
+            "Wrote sweep manifest at %s (%d points).",
+            sweep_root, count,
+        )
+        # Drop any stale cache so the subsequent read sees the new file.
+        self._sweep_manifest_cache.pop(sweep_root, None)
+        return None
+
+    def _run_sweep_phase(
+        self,
+        *,
+        sweep_results_root: str,
+        tb_cell: str,
+        result_test: str | None = None,
+        lib: str | None = None,
+        cell: str | None = None,
+        design_vars: dict[str, Any] | None = None,
+        analyses: list[Any] | None = None,
+    ) -> tuple[dict, dict]:
+        """Compute the spec's ``tuning_metrics`` over the sweep points.
+
+        Preferred pipeline: read manifest → sort by Vctrl → re-run OCEAN
+        for each point using the current design vars → dump_all →
+        per-point ``evaluate(...)`` for the §2 metrics → ``evaluate_swept``.
+
+        Legacy pipeline, used when current-run context is not supplied:
+        read manifest → sort by Vctrl → read existing per-point PSFs →
+        per-point ``evaluate(...)`` for the §2 metrics → ``evaluate_swept``
+        for the tuning metrics. Any per-point dump failure leaves an
+        empty measurements dict for that point — ``evaluate_swept``
+        handles missing values via UNMEASURABLE on the affected ops.
+        Infrastructure failures (manifest unreadable, swept-dump SKILL
+        error) collapse to all-UNMEASURABLE so the agent can decide to
+        retry rather than crash.
+        """
+        if not self.eval_block:
+            return {}, {}
+        ensure_reason = self._ensure_sweep_manifest(sweep_results_root)
+        if ensure_reason is not None:
+            return self._tuning_all_unmeasurable(ensure_reason)
+        manifest = self._sweep_manifest_cache.get(sweep_results_root)
+        if manifest is None:
+            try:
+                manifest = self.bridge.read_sweep_manifest(sweep_results_root)
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("Sweep manifest read failed: %s", exc)
+                return self._tuning_all_unmeasurable("manifest_read_failed")
+            if not manifest:
+                logger.warning("Sweep manifest is empty.")
+                return self._tuning_all_unmeasurable("manifest_empty")
+            self._sweep_manifest_cache[sweep_results_root] = manifest
+
+        # Sort by Vctrl ascending so evaluate_swept's segment-slope op
+        # walks monotonically along the x-axis even when the underlying
+        # Maestro point ordering is shuffled (it usually is, per
+        # _ocean_tuning_extract.ocn).
+        points_sorted = sorted(manifest.items(), key=lambda kv: kv[1])
+        points = [p for p, _ in points_sorted]
+        vctrls = [v for _, v in points_sorted]
+
+        signals, windows = spec_evaluator.build_dump_spec(self.eval_block)
+        base_measurements_per_point: list[dict] = []
+        if lib and cell and design_vars is not None:
+            sweep_cfg = self.eval_block.get("sweep") or {}
+            sweep_var = str(sweep_cfg.get("variable") or "Vctrl")
+            osc_signals = spec_evaluator.extract_osc_signals(self.eval_block)
+            for point, vctrl in points_sorted:
+                point_vars = dict(design_vars)
+                point_vars[sweep_var] = vctrl
+                try:
+                    self.bridge.run_ocean_sim(
+                        lib=lib,
+                        cell=cell,
+                        tb_cell=tb_cell,
+                        design_vars=point_vars,
+                        analyses=analyses,
+                    )
+                    psf_dir = self.bridge.last_results_dir
+                    if not psf_dir:
+                        logger.warning(
+                            "Fresh sweep point %d has no resultsDir.",
+                            point,
+                        )
+                        base_measurements_per_point.append({})
+                        continue
+                    dump_result = self.ocean_worker.dump_all(
+                        psf_dir=psf_dir,
+                        signals=signals,
+                        windows=windows,
+                        osc_signals=osc_signals,
+                    )
+                    if dump_result.get("degenerate"):
+                        logger.warning(
+                            "Fresh sweep point %d skipped by osc_gate: %s",
+                            point, dump_result.get("reason"),
+                        )
+                        base_measurements_per_point.append({})
+                        continue
+                    dumps = dump_result.get("dumps") or {}
+                    meas, _ = spec_evaluator.evaluate(
+                        self.eval_block, dumps, bridge=self.bridge,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Fresh sweep point %d at %s=%s failed: %s",
+                        point, sweep_var, vctrl, exc,
+                    )
+                    meas = {}
+                base_measurements_per_point.append(meas)
+        else:
+            try:
+                per_point_dumps = self.bridge.run_ocean_dump_all_swept(
+                    signals, windows,
+                    sweep_root=sweep_results_root,
+                    points=points,
+                    tb_cell=tb_cell,
+                    result_test=result_test,
+                )
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("Sweep dump_all failed: %s", exc)
+                return self._tuning_all_unmeasurable("dump_failed")
+
+            for point in points:
+                dump = per_point_dumps.get(point)
+                if not isinstance(dump, dict) or not dump.get("ok"):
+                    base_measurements_per_point.append({})
+                    continue
+                dump_payload = dump.get("dumps") if isinstance(
+                    dump.get("dumps"), dict
+                ) else dump
+                try:
+                    meas, _ = spec_evaluator.evaluate(
+                        self.eval_block, dump_payload, bridge=self.bridge,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Sweep point %d evaluate() raised: %s", point, exc,
+                    )
+                    meas = {}
+                base_measurements_per_point.append(meas)
+
+        try:
+            return spec_evaluator.evaluate_swept(
+                self.eval_block,
+                base_measurements_per_point,
+                vctrls,
+                bridge=self.bridge,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("evaluate_swept raised: %s", exc)
+            return self._tuning_all_unmeasurable("evaluate_swept_failed")
 
     # ------------------------------------------------------------------ #
     #  Writeback (final Maestro state)
@@ -1595,6 +2257,28 @@ def _coerce_float(value: Any) -> float | None:
         return float(str(value).strip())
     except ValueError:
         return None
+
+
+def _format_tuning_summary(
+    tuning_measurements: dict, tuning_pass_fail: dict,
+) -> str:
+    """Path-2: render the most recent sweep-phase verdicts so the LLM
+    sees WHY the loop kept going after single-point PASS. Skipped
+    entirely (returns "") when no tuning data is available — single-
+    point runs stay free of dead sections."""
+    if not tuning_pass_fail:
+        return ""
+    rows: list[str] = ["## Tuning-curve verdicts (sweep)"]
+    for name, verdict in tuning_pass_fail.items():
+        value = tuning_measurements.get(name)
+        rows.append(f"  - {name} = {value!s}  → {verdict}")
+    rows.append(
+        "Note: §2 metrics all PASS at the converged design vars; the "
+        "spec's `tuning_metrics:` band failed. Re-tune varactor/LC "
+        "sizing so the f–Vctrl curve flattens (Kvco band) AND covers "
+        "the required range, without losing the single-point PASS."
+    )
+    return "\n".join(rows) + "\n\n"
 
 
 def _format_eval_summary(

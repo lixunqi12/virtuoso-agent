@@ -629,6 +629,44 @@ procedure(safeOcean_validKind(k)
     )
 )
 
+;;; ----------------------------------------------------------------
+;;; Path-2 (2026-05-19): sweep-aware path validators. The sweep root
+;;; is a Maestro Interactive.<N> directory produced by an earlier
+;;; Vctrl sweep; per-point PSFs live at <root>/<point>/<tbCell>_<n>/psf.
+;;; PC bridge assembles each psfDir from a validated root + per-point
+;;; integer + scope tbCell, then sends it here for defense-in-depth.
+;;; ----------------------------------------------------------------
+procedure(safeOcean_validSweepRoot(p)
+    ;; R2 (2026-05-19, codex P1-1+P2): traversal-aware. Reject `..`,
+    ;; `.`, `//`, and relative roots BEFORE charset/tail match — every
+    ;; one of those characters is individually in the charset, so the
+    ;; charset regex alone allowed `/Interactive.0/../../secret/
+    ;; Interactive.1` to slip through.
+    when(stringp(p)
+        if(strlen(p) > 256
+            nil
+            and(equal(substring(p 1 1) "/")
+                not(pcreMatchp("//" p))
+                not(pcreMatchp("(^|/)\\.\\.?(/|\\z)" p))
+                pcreMatchp("^[A-Za-z0-9_./\\-]{1,256}\\z" p)
+                pcreMatchp("/Interactive\\.[0-9]+/?\\z" p))
+        )
+    )
+)
+
+procedure(safeOcean_validPsfDir(p)
+    ;; R2 (2026-05-19, codex P1-1+P2): same traversal-aware contract.
+    when(stringp(p)
+        if(strlen(p) > 320
+            nil
+            and(equal(substring(p 1 1) "/")
+                not(pcreMatchp("//" p))
+                not(pcreMatchp("(^|/)\\.\\.?(/|\\z)" p))
+                pcreMatchp("^[A-Za-z0-9_./\\-]+/psf\\z" p))
+        )
+    )
+)
+
 procedure(safeOcean_buildWaveform(kind paths)
     ;; Build an OCEAN waveform from a (kind, pathList) pair.
     ;;   V          : one path          → VT(path)
@@ -1026,12 +1064,18 @@ procedure(safeOceanProbePtp(signalP signalN tStart tEnd)
 )
 
 
-procedure(safeOceanDumpAll(signalList windowList)
+procedure(safeOceanDumpAll(signalList windowList @optional (psfDir nil))
     ;; Generic dump primitive. No knowledge of oscillator semantics.
     ;;
     ;;   signalList : list of (sigName sigKind pathList)
     ;;                  sigKind ∈ safeOcean_allowedSignalKinds
     ;;   windowList : list of (winName tStart tEnd)
+    ;;   psfDir     : (path-2, optional) when supplied, dump opens the
+    ;;                given <...>/psf directory and selects 'tran before
+    ;;                building waveforms — enabling per-sweep-point
+    ;;                read-back without re-running OCEAN. Skipped in the
+    ;;                normal post-safeOceanRun flow (selectResult is
+    ;;                already active).
     ;;
     ;; Returns:
     ;;   {"ok":true,"dumps":{"<sig>":{"<win>":{stats}, ...}, ...}}
@@ -1107,6 +1151,39 @@ procedure(safeOceanDumpAll(signalList windowList)
             ))
         )
 
+        ;; Path-2 (2026-05-19): when caller supplies a psfDir, open
+        ;; that result set before building waveforms. Skipped on the
+        ;; normal flow where safeOceanRun has already openResults'd
+        ;; the just-finished sim. errset() wraps both calls so a
+        ;; missing/corrupt PSF surfaces as null stats rather than an
+        ;; aborted SKILL session.
+        ;;
+        ;; R2 (2026-05-19, codex P1-2): inspect the errset return on
+        ;; both calls. errset() yields a (result) list on success and
+        ;; nil on error. R1 silently fell through to selectResult('tran)
+        ;; after a failed openResults, which then re-selected whatever
+        ;; result set was previously selected — every per-point dump
+        ;; for the rest of the sweep aliased a stale point's waveform
+        ;; and a tuning-curve evaluation could erroneously PASS. Now a
+        ;; failure exits early with {"ok":false,"error":...}; the
+        ;; per-point loop on the PC side stores that as the partial
+        ;; result and evaluate_swept marks affected metrics
+        ;; UNMEASURABLE.
+        when(psfDir
+            unless(safeOcean_validPsfDir(psfDir)
+                safeOcean_unselectIfHeld()
+                return("{\"ok\":false,\"error\":\"Bad psfDir\"}")
+            )
+            unless(errset(openResults(psfDir))
+                safeOcean_unselectIfHeld()
+                return("{\"ok\":false,\"error\":\"openResults failed\"}")
+            )
+            unless(errset(selectResult('tran))
+                safeOcean_unselectIfHeld()
+                return("{\"ok\":false,\"error\":\"selectResult tran failed\"}")
+            )
+        )
+
         ;; Build (sig, win) dump.
         sigParts = nil
         foreach(sigEntry signalList
@@ -1140,6 +1217,102 @@ procedure(safeOceanDumpAll(signalList windowList)
         allJson = strcat("{" buildString(sigParts ",") "}")
         safeOcean_unselectIfHeld()
         return(strcat("{\"ok\":true,\"dumps\":" allJson "}"))
+    )
+)
+
+;;; ----------------------------------------------------------------
+;;; safeReadSweepManifest(sweepRoot) — Path-2 (2026-05-19)
+;;;
+;;; Slurp <sweepRoot>/.tuning_manifest.json, return verbatim text via
+;;; the 'raw' field. PC-side json.loads the wrapper, then json.loads
+;;; the inner 'raw' string — SKILL stays oblivious to manifest
+;;; schema (just point→Vctrl pairs, but we don't bake that here).
+;;;
+;;; The manifest is created out-of-band by the user (or a setup
+;;; script) before the agent runs; SafeBridge does not write it.
+;;; ----------------------------------------------------------------
+procedure(safeReadSweepManifest(sweepRoot)
+    prog((manifestPath port line buf)
+        unless(stringp(sweepRoot) && safeOcean_validSweepRoot(sweepRoot)
+            return("{\"ok\":false,\"error\":\"Bad sweep root\"}")
+        )
+        manifestPath = strcat(sweepRoot "/.tuning_manifest.json")
+        port = nil
+        errset(port = infile(manifestPath))
+        unless(port
+            return("{\"ok\":false,\"error\":\"No .tuning_manifest.json at sweep root\"}")
+        )
+        buf = ""
+        line = ""
+        while(gets(line port)
+            buf = strcat(buf line)
+        )
+        close(port)
+        return(strcat(
+            "{\"ok\":true,\"raw\":\""
+            safeHelpers_jsonEscape(buf)
+            "\"}"
+        ))
+    )
+)
+
+;;; ----------------------------------------------------------------
+;;; safeWriteSweepManifest(sweepRoot entries) — Path-2 (2026-05-19)
+;;;
+;;; Author <sweepRoot>/.tuning_manifest.json from a typed list of
+;;; (point vctrl) pairs supplied by the PC bridge. Entries is a SKILL
+;;; list whose elements are themselves 2-element lists: integer point
+;;; followed by numeric vctrl. SKILL emits its own JSON text — no
+;;; embedded-quote escaping in the call site, no schema knowledge on
+;;; PC beyond the typed values. PC re-validates point range / vctrl
+;;; finiteness before invoking; SKILL re-validates defense-in-depth.
+;;;
+;;; Returns:
+;;;   {"ok":true,"count":N}
+;;;   {"ok":false,"error":"..."}
+;;; ----------------------------------------------------------------
+procedure(safeWriteSweepManifest(sweepRoot entries)
+    prog((manifestPath port body entry point vctrl first n)
+        unless(stringp(sweepRoot) && safeOcean_validSweepRoot(sweepRoot)
+            return("{\"ok\":false,\"error\":\"Bad sweep root\"}")
+        )
+        unless(listp(entries) && entries
+            return("{\"ok\":false,\"error\":\"entries must be a non-empty list\"}")
+        )
+        body = "["
+        first = t
+        n = 0
+        foreach(entry entries
+            unless(listp(entry) && length(entry) == 2
+                return("{\"ok\":false,\"error\":\"entry must be (point vctrl)\"}")
+            )
+            point = car(entry)
+            vctrl = cadr(entry)
+            unless(fixp(point) && point >= 1 && point <= 1024
+                return("{\"ok\":false,\"error\":\"point out of range\"}")
+            )
+            unless(numberp(vctrl)
+                return("{\"ok\":false,\"error\":\"vctrl must be numeric\"}")
+            )
+            unless(first
+                body = strcat(body ",")
+            )
+            first = nil
+            body = strcat(body
+                "{\"point\":" sprintf(nil "%d" point)
+                ",\"vctrl\":" safeHelpers_numToJson(vctrl) "}")
+            n = n + 1
+        )
+        body = strcat(body "]")
+        manifestPath = strcat(sweepRoot "/.tuning_manifest.json")
+        port = nil
+        errset(port = outfile(manifestPath "w"))
+        unless(port
+            return("{\"ok\":false,\"error\":\"Cannot open manifest for write\"}")
+        )
+        fprintf(port "%s\n" body)
+        close(port)
+        return(sprintf(nil "{\"ok\":true,\"count\":%d}" n))
     )
 )
 

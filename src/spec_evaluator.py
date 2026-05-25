@@ -109,6 +109,26 @@ _COMPOUND_KINDS: frozenset[str] = frozenset({"ratio", "t_cross_frac"})
 
 _ALLOWED_DIRECTIONS: frozenset[str] = frozenset({"rising", "falling", "either"})
 
+# Path-2 (2026-05-19): sweep / tuning_metrics schema. A sweep block declares
+# a 1-D parameter sweep (e.g. Vctrl ∈ [0, 0.8] V, 9 points). Tuning metrics
+# operate on the per-point list of an existing §2 metric OR another tuning
+# metric (allowing Kvco_linearity ← Kvco_MHz_per_V chains). The list of ops
+# is closed — adding a new op needs a handler in `evaluate_swept`. See
+# `_resolve_tuning_order` for the dep-graph + cycle detection.
+_SWEPT_OPS: frozenset[str] = frozenset({
+    "swept_max_minus_min",
+    "swept_segment_slope",
+    "swept_ratio_max_over_min",
+    "swept_same_sign",
+})
+_TUNING_REQUIRED_KEYS: frozenset[str] = frozenset({"name", "op", "of"})
+
+# Sweep variable name regex: same shape as design_var names. Mirrors the
+# SafeBridge `_is_allowed_param_name` allow-list spirit (case-insensitive
+# alpha-num + underscore) — the actual write-side gate stays in SafeBridge;
+# this regex is only the spec-schema check.
+_SWEEP_VAR_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+
 # A YAML eval block is any fenced yaml block whose parsed form is a dict
 # carrying all three top-level keys. Pick the first one that matches —
 # the spec author may keep other yaml code fences (e.g. examples) but
@@ -130,9 +150,20 @@ def extract_eval_block(spec_text: str) -> dict | None:
 
     Returns ``None`` if no such block exists — callers then fall back to
     the legacy LLM-judged flow.
+
+    Path-2 (2026-05-19): optional `sweep:` and `tuning_metrics:` keys
+    may live in the primary fence OR in subsequent fences (so spec
+    authors can keep tuning-curve config in §6 without flattening §2).
+    A standalone fence is recognized by having `sweep` and/or
+    `tuning_metrics` as its top-level keys with no overlap with the
+    primary `_REQUIRED_KEYS`. Splicing is a no-op when the primary
+    fence already carries those keys.
     """
     if not isinstance(spec_text, str):
         return None
+    primary: dict | None = None
+    sweep_addon: Any = None
+    tuning_addon: Any = None
     for match in _YAML_FENCE_RE.finditer(spec_text):
         try:
             data = yaml.safe_load(match.group(1))
@@ -141,11 +172,26 @@ def extract_eval_block(spec_text: str) -> dict | None:
             continue
         if not isinstance(data, dict):
             continue
-        if not _REQUIRED_KEYS.issubset(data.keys()):
+        if primary is None and _REQUIRED_KEYS.issubset(data.keys()):
+            primary = data
             continue
-        validate_eval_block(data)
-        return data
-    return None
+        # Path-2 addon fences: collect sweep / tuning_metrics from
+        # auxiliary fences once the primary fence is known. Reject
+        # mixed shapes (an addon fence carrying signals/windows/metrics
+        # too would be a second primary; ignored to avoid surprises).
+        if primary is not None and not (_REQUIRED_KEYS & data.keys()):
+            if "sweep" in data and sweep_addon is None:
+                sweep_addon = data["sweep"]
+            if "tuning_metrics" in data and tuning_addon is None:
+                tuning_addon = data["tuning_metrics"]
+    if primary is None:
+        return None
+    if sweep_addon is not None and "sweep" not in primary:
+        primary["sweep"] = sweep_addon
+    if tuning_addon is not None and "tuning_metrics" not in primary:
+        primary["tuning_metrics"] = tuning_addon
+    validate_eval_block(primary)
+    return primary
 
 
 def validate_eval_block(block: dict) -> None:
@@ -201,6 +247,24 @@ def validate_eval_block(block: dict) -> None:
             raise ValueError(f"spec eval: duplicate metric name {name!r}")
         metric_names.add(name)
         _validate_metric(m, signal_names, window_names)
+
+    # Path-2 optional blocks. `sweep` and `tuning_metrics` are paired —
+    # the dep-graph resolver in `_resolve_tuning_order` runs only when
+    # both are present; spec authors that declare neither keep the old
+    # single-point flow unchanged. Either-without-the-other is an error
+    # (a sweep with no tuning metrics is useless; tuning metrics with
+    # no sweep have nothing to iterate over).
+    sweep = block.get("sweep")
+    tuning_metrics = block.get("tuning_metrics")
+    if sweep is None and tuning_metrics is None:
+        return
+    if sweep is None or tuning_metrics is None:
+        raise ValueError(
+            "spec eval: `sweep` and `tuning_metrics` must be declared "
+            "together (or both omitted)"
+        )
+    _validate_sweep_block(sweep)
+    _validate_tuning_metrics(tuning_metrics, metric_names)
 
 
 _BOUND_KEYS: frozenset[str] = frozenset({
@@ -387,6 +451,212 @@ def _validate_sanity_range(m: dict) -> None:
             )
     if lo is not None and hi is not None and lo > hi:
         raise ValueError(f"metric {m['name']!r}: sanity lo > hi")
+
+
+def _validate_sweep_block(sweep: Any) -> None:
+    """Optional `sweep:` block declaring a 1-D parameter sweep.
+
+    Schema (all fields required when sweep is declared):
+        variable: str (allow-list regex)
+        range:    [lo, hi] finite floats, lo < hi
+        points:   int in [2, 64]
+        unit:     str (advisory; rendered into log/prompt only)
+
+    SafeBridge re-validates `sweep_root` (CLI flag, not spec field)
+    independently — this validator only covers the spec schema.
+    """
+    if not isinstance(sweep, dict):
+        raise ValueError("spec eval: `sweep` must be a mapping")
+    var = sweep.get("variable")
+    if not isinstance(var, str) or not _SWEEP_VAR_NAME_RE.fullmatch(var):
+        raise ValueError(
+            "spec eval: sweep.variable must match "
+            f"{_SWEEP_VAR_NAME_RE.pattern!r}"
+        )
+    rng = sweep.get("range")
+    if not isinstance(rng, (list, tuple)) or len(rng) != 2:
+        raise ValueError("spec eval: sweep.range must be [lo, hi]")
+    lo, hi = rng
+    for v, label in ((lo, "lo"), (hi, "hi")):
+        # R2 (2026-05-19, codex P2 BLOCKER): bool is a subclass of int, so
+        # ``isinstance(False, (int, float))`` is True. YAML ``range: [false,
+        # true]`` would silently round-trip to ``[0.0, 1.0]`` and produce a
+        # 9-entry manifest spanning the wrong control voltage. Reject bool
+        # explicitly BEFORE the numeric/finite check.
+        if isinstance(v, bool):
+            raise ValueError(
+                f"spec eval: sweep.range {label} must be numeric, not boolean"
+            )
+        if not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+            raise ValueError(
+                f"spec eval: sweep.range {label} must be a finite number"
+            )
+    if float(lo) >= float(hi):
+        raise ValueError("spec eval: sweep.range lo must be < hi")
+    points = sweep.get("points")
+    if not isinstance(points, int) or isinstance(points, bool):
+        raise ValueError("spec eval: sweep.points must be an int")
+    if not (2 <= points <= 64):
+        raise ValueError("spec eval: sweep.points must be in [2, 64]")
+    unit = sweep.get("unit")
+    if unit is not None and not isinstance(unit, str):
+        raise ValueError("spec eval: sweep.unit must be a string when set")
+
+
+def _validate_tuning_metrics(
+    tuning_metrics: Any, base_metric_names: set[str]
+) -> None:
+    """Validate `tuning_metrics` list + dep-graph (cycles, unknown refs).
+
+    Each entry must reference (`of:`) either a §2 metric name or another
+    tuning metric — chains like `Kvco_linearity ← Kvco_MHz_per_V` are
+    intentionally supported. `_resolve_tuning_order` performs the actual
+    topological sort.
+    """
+    if not isinstance(tuning_metrics, list) or not tuning_metrics:
+        raise ValueError("spec eval: `tuning_metrics` must be a non-empty list")
+    seen: set[str] = set()
+    for entry in tuning_metrics:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "spec eval: each tuning_metrics entry must be a mapping"
+            )
+        missing = _TUNING_REQUIRED_KEYS - entry.keys()
+        if missing:
+            raise ValueError(
+                f"spec eval: tuning metric missing required keys "
+                f"{sorted(missing)}"
+            )
+        name = entry["name"]
+        if not isinstance(name, str) or not name:
+            raise ValueError("spec eval: tuning metric needs a non-empty name")
+        if name in base_metric_names:
+            raise ValueError(
+                f"spec eval: tuning metric name {name!r} collides with §2 "
+                "metric — pick a distinct name"
+            )
+        if name in seen:
+            raise ValueError(f"spec eval: duplicate tuning metric {name!r}")
+        seen.add(name)
+        op = entry["op"]
+        if op not in _SWEPT_OPS:
+            raise ValueError(
+                f"spec eval: tuning metric {name!r}: op {op!r} not in "
+                f"{sorted(_SWEPT_OPS)}"
+            )
+        of = entry["of"]
+        if not isinstance(of, str) or not of:
+            raise ValueError(
+                f"spec eval: tuning metric {name!r}: `of` must be a non-empty "
+                "string referencing a §2 metric or earlier tuning metric"
+            )
+        # `of` may refer to a tuning_metric defined later in the list —
+        # cycles are caught by `_resolve_tuning_order`, undefined refs
+        # too. Don't reject forward references here.
+        scale = entry.get("scale")
+        if scale is not None:
+            # PyYAML 1.1 parses `1.0e3` as a string (no sign after `e`),
+            # so accept str-coercible values too; the existing simple-
+            # metric scale path (`_compute_metric`) also coerces lazily
+            # via float().
+            if isinstance(scale, bool):
+                raise ValueError(
+                    f"spec eval: tuning metric {name!r}: scale must be a "
+                    "finite number when set"
+                )
+            try:
+                fscale = float(scale)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"spec eval: tuning metric {name!r}: scale must be a "
+                    "finite number when set"
+                )
+            if not math.isfinite(fscale):
+                raise ValueError(
+                    f"spec eval: tuning metric {name!r}: scale must be a "
+                    "finite number when set"
+                )
+        if op == "swept_same_sign":
+            _validate_bool_pass(entry)
+        else:
+            _validate_pass_range(entry)
+        _validate_sanity_range(entry)
+
+    # Dep-graph + cycle check. _resolve_tuning_order raises on cycles
+    # or undefined `of:` references.
+    _resolve_tuning_order(
+        {"metrics": [{"name": n} for n in base_metric_names],
+         "tuning_metrics": tuning_metrics}
+    )
+
+
+def _validate_bool_pass(entry: dict) -> None:
+    """`swept_same_sign` returns a bool; its pass range is `[true, true]`
+    or `[false, false]` to gate on a specific value. Other forms are
+    nonsense (a bool can't fall "between" two values)."""
+    pr = entry.get("pass")
+    if pr is None:
+        return
+    if not isinstance(pr, (list, tuple)) or len(pr) != 2:
+        raise ValueError(
+            f"tuning metric {entry.get('name')!r}: pass must be [bool, bool] "
+            "for bool-valued op"
+        )
+    lo, hi = pr
+    if not isinstance(lo, bool) or not isinstance(hi, bool):
+        raise ValueError(
+            f"tuning metric {entry.get('name')!r}: bool-valued op requires "
+            "pass entries to be bool literals (true/false)"
+        )
+    if lo != hi:
+        raise ValueError(
+            f"tuning metric {entry.get('name')!r}: pass [lo, hi] must be the "
+            "same bool — a bool value cannot fall 'between' true and false"
+        )
+
+
+def _resolve_tuning_order(block: dict) -> list[dict]:
+    """Topological order over `tuning_metrics` so dependent ops eval
+    after their `of:` reference is computed.
+
+    A tuning metric's `of:` may reference either a §2 metric (always
+    available — supplied as per-point list by caller) or another tuning
+    metric defined in the same block. Cycles and dangling refs raise
+    ValueError. Returns the list of tuning_metric dicts in the order
+    `evaluate_swept` should compute them.
+    """
+    tuning = block.get("tuning_metrics") or []
+    if not tuning:
+        return []
+    base_names = {m.get("name") for m in (block.get("metrics") or [])}
+    by_name = {t["name"]: t for t in tuning}
+
+    visited: dict[str, str] = {}  # "visiting" | "done"
+    ordered: list[dict] = []
+
+    def visit(name: str, stack: tuple[str, ...]) -> None:
+        state = visited.get(name)
+        if state == "done":
+            return
+        if state == "visiting":
+            cycle = " -> ".join(stack + (name,))
+            raise ValueError(f"spec eval: tuning_metrics cycle: {cycle}")
+        visited[name] = "visiting"
+        entry = by_name[name]
+        of = entry["of"]
+        if of in by_name:
+            visit(of, stack + (name,))
+        elif of not in base_names:
+            raise ValueError(
+                f"spec eval: tuning metric {name!r}: `of` {of!r} is neither "
+                "a §2 metric nor a tuning metric in this block"
+            )
+        visited[name] = "done"
+        ordered.append(entry)
+
+    for t in tuning:
+        visit(t["name"], ())
+    return ordered
 
 
 # --------------------------------------------------------------------- #
@@ -606,7 +876,10 @@ def _verdict(
     sanity_range: Any = None,
     reason: str | None = None,
 ) -> str:
-    """Rev 5: three-state verdict.
+    """Rev 5: three-state verdict. Path-2 (2026-05-19): bool values flow
+    through the bool branch — same UNMEASURABLE/FAIL/PASS three-state but
+    the comparison reduces to equality against `pass_range[0]` (which
+    `_validate_bool_pass` already enforces equal to `pass_range[1]`).
 
     UNMEASURABLE conditions (in precedence order):
         1. value is None and we captured a reason
@@ -617,6 +890,23 @@ def _verdict(
     """
     if value is None:
         return f"UNMEASURABLE ({reason or 'no value'})"
+
+    # Bool path runs before the numeric sanity comparison: comparing a
+    # bool against numeric bounds with `<` would silently coerce True/False
+    # to 1/0, masking misuse. `_validate_bool_pass` keeps bool ops
+    # bool-only, so we only need a bool branch here, not a guard against
+    # mixed types.
+    if isinstance(value, bool):
+        if pass_range is None:
+            return "PASS"
+        lo, hi = pass_range
+        if isinstance(lo, bool) and isinstance(hi, bool):
+            if value == lo:
+                return "PASS"
+            return f"FAIL (expected {lo}, got {value})"
+        # Numeric pass range against a bool metric — shouldn't happen
+        # because validator rejects it, but be explicit.
+        return f"UNMEASURABLE (numeric pass range on bool value)"
 
     if sanity_range is not None:
         s_lo, s_hi = sanity_range
@@ -639,3 +929,214 @@ def _verdict(
     if hi is not None and value > hi:
         return f"FAIL (above {hi})"
     return "PASS"
+
+
+# --------------------------------------------------------------------- #
+#  Path-2: swept (tuning-curve) evaluation
+# --------------------------------------------------------------------- #
+
+def evaluate_swept(
+    block: dict,
+    base_measurements_per_point: list[dict[str, Any]],
+    vctrl_values: list[float],
+    *,
+    bridge: Any = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Compute the tuning-curve metrics in ``block['tuning_metrics']``.
+
+    ``base_measurements_per_point[i]`` is the dict of §2 metric values
+    measured at sweep point ``i``; ``vctrl_values[i]`` is the sweep
+    variable value at that index. Both lists are assumed already sorted
+    by Vctrl ascending (the agent / `analyze_tuning_curve.py` orders
+    them after reading the Maestro sweep manifest — the Maestro point
+    index is NOT sequential, see `scripts/_ocean_tuning_extract.ocn`).
+
+    Each tuning metric's ``of:`` references either a §2 metric (then the
+    per-point value list is the column from ``base_measurements_per_point``)
+    or another tuning metric (then it's whatever that op produced —
+    e.g. the N-1-element list from ``swept_segment_slope``). Returns
+    ``(tuning_measurements, tuning_pass_fail)``; values may be float,
+    list[float], or bool depending on the op.
+
+    ``bridge`` is unused today (no SKILL calls); the kwarg is reserved
+    so the signature matches ``evaluate(...)`` and future ops can opt in.
+    """
+    del bridge  # reserved for future use
+    if not block.get("tuning_metrics"):
+        return {}, {}
+    if len(base_measurements_per_point) != len(vctrl_values):
+        raise ValueError(
+            "evaluate_swept: base_measurements_per_point and vctrl_values "
+            "must have the same length "
+            f"({len(base_measurements_per_point)} vs {len(vctrl_values)})"
+        )
+
+    tuning_measurements: dict[str, Any] = {}
+    tuning_pass_fail: dict[str, str] = {}
+
+    base_metric_names = {
+        m.get("name") for m in (block.get("metrics") or [])
+    }
+
+    for entry in _resolve_tuning_order(block):
+        name = entry["name"]
+        op = entry["op"]
+        of = entry["of"]
+        # `entry.get("scale") or 1.0` would coerce 0 / "" / None to 1.0;
+        # be explicit so a typo-zero scale isn't silently re-floored.
+        raw_scale = entry.get("scale")
+        scale = 1.0 if raw_scale is None else float(raw_scale)
+        try:
+            value, reason = _compute_swept(
+                op, of, entry, base_metric_names,
+                base_measurements_per_point, vctrl_values,
+                tuning_measurements,
+            )
+        except Exception as exc:  # noqa: BLE001 — evaluator never crashes
+            logger.warning(
+                "spec eval: tuning metric %s computation failed: %s",
+                name, exc,
+            )
+            value, reason = None, f"exception: {type(exc).__name__}"
+
+        # Scale is applied only to numeric (scalar or list) outputs;
+        # bools (swept_same_sign) ignore it. Apply BEFORE the verdict
+        # so the pass band can be expressed in the user-facing unit
+        # (e.g. MHz/V, not GHz/V).
+        if value is not None and scale != 1.0:
+            if isinstance(value, list):
+                value = [v * scale for v in value]
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                value = float(value) * scale
+
+        tuning_measurements[name] = value
+        # For ops that produce a list (segment_slope), the verdict is
+        # computed against the worst-case element so a single bad
+        # segment cannot hide behind an in-range max. The
+        # tuning_measurements value stays the full list so the LLM
+        # prompt can show every segment.
+        verdict_value = _worst_case_for_pass(value, entry.get("pass"))
+        tuning_pass_fail[name] = _verdict(
+            verdict_value, entry.get("pass"), entry.get("sanity"), reason,
+        )
+
+    return tuning_measurements, tuning_pass_fail
+
+
+def _compute_swept(
+    op: str,
+    of: str,
+    entry: dict,
+    base_metric_names: set[str],
+    base_per_point: list[dict[str, Any]],
+    vctrl_values: list[float],
+    tuning_results: dict[str, Any],
+) -> tuple[Any, str | None]:
+    """Per-op handler. Returns (value, reason); reason is non-None when
+    value is None / UNMEASURABLE."""
+    # Resolve `of:` to a value series. Two source shapes:
+    #   - base metric: paired (vctrl, value) list with None drops
+    #   - tuning metric producing a list (segment_slope): scalar-ish
+    #     list, no x-axis pairing (ratio / same_sign / max_minus_min)
+    if of in base_metric_names:
+        pairs = [
+            (v, p.get(of)) for v, p in zip(vctrl_values, base_per_point)
+        ]
+        valid = [(v, y) for v, y in pairs if y is not None]
+        dropped = len(pairs) - len(valid)
+    elif of in tuning_results:
+        source = tuning_results[of]
+        if isinstance(source, list):
+            # No paired x-axis; ops that need one (segment_slope) must
+            # reference a base metric. We catch that branch per-op.
+            valid = [(None, y) for y in source if y is not None]
+            dropped = len(source) - len(valid)
+        else:
+            return None, (
+                f"of {of!r} is a scalar tuning result; only list-valued "
+                "sources (e.g. swept_segment_slope) can feed another op"
+            )
+    else:
+        # Should be caught by _resolve_tuning_order, but defensive.
+        return None, f"of {of!r} not declared in this block"
+
+    # R2 (2026-05-19, claude P3 #3): source-type gate runs BEFORE the
+    # count gate. A swept_segment_slope misconfigured with a tuning-op
+    # source AND fewer than 2 points used to surface as "only N valid
+    # points" — actionable but pointing at the wrong dial. The
+    # source-type error is the real cause; once it's fixed the count
+    # gate may pass.
+    if op == "swept_segment_slope" and of not in base_metric_names:
+        return None, (
+            "swept_segment_slope needs a base §2 metric source for "
+            "the x-axis (Vctrl); cannot chain off another tuning op"
+        )
+
+    min_required = 2 if op == "swept_segment_slope" else 1
+    if len(valid) < min_required:
+        return None, (
+            f"only {len(valid)} valid points after dropping {dropped} None "
+            f"(need ≥ {min_required} for op {op})"
+        )
+
+    if op == "swept_max_minus_min":
+        ys = [y for _, y in valid]
+        return float(max(ys) - min(ys)), None
+
+    if op == "swept_segment_slope":
+        slopes: list[float] = []
+        for (v0, y0), (v1, y1) in zip(valid, valid[1:]):
+            dv = float(v1) - float(v0)
+            if dv == 0.0:
+                return None, (
+                    f"duplicate Vctrl {v0}; segment slope undefined"
+                )
+            slopes.append((float(y1) - float(y0)) / dv)
+        return slopes, None
+
+    if op == "swept_ratio_max_over_min":
+        abs_ys = [abs(float(y)) for _, y in valid]
+        mx, mn = max(abs_ys), min(abs_ys)
+        if mn == 0.0:
+            return None, "min |value| is 0; ratio undefined"
+        return mx / mn, None
+
+    if op == "swept_same_sign":
+        ys = [float(y) for _, y in valid]
+        all_pos = all(y > 0 for y in ys)
+        all_neg = all(y < 0 for y in ys)
+        return bool(all_pos or all_neg), None
+
+    # Unreachable — validator gates this.
+    return None, f"unknown swept op {op!r}"
+
+
+def _worst_case_for_pass(value: Any, pass_range: Any) -> Any:
+    """For list-valued ops, return the element worst-positioned against
+    the pass range so `_verdict` flags a single bad segment as FAIL
+    rather than letting it hide inside the list. Scalars / bools pass
+    through unchanged. ``None`` short-circuits to None so the
+    UNMEASURABLE path stays clean.
+    """
+    if value is None or not isinstance(value, list):
+        return value
+    if not value:
+        return None
+    if pass_range is None:
+        return value[0]
+    lo, hi = pass_range
+    # Worst-case: the element farthest outside [lo, hi]. If none are
+    # outside, return any in-range element (the first) so the verdict
+    # falls through to PASS.
+    worst = value[0]
+    worst_margin = 0.0
+    for v in value:
+        margin = 0.0
+        if lo is not None and v < lo:
+            margin = max(margin, lo - v)
+        if hi is not None and v > hi:
+            margin = max(margin, v - hi)
+        if margin > worst_margin:
+            worst_margin = margin
+            worst = v
+    return worst

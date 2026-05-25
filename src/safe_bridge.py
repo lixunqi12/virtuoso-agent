@@ -40,7 +40,13 @@ _PARAM_ATOM_RE = re.compile(
 )
 # Scrub patterns for display_transient_waveform arguments.
 _SAFE_PSF_DIR_RE = re.compile(r"^[A-Za-z0-9_./~:\-]+$")
+_SAFE_RESULT_DIR_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
 _SAFE_NET_NAME_RE = re.compile(r"^/[A-Za-z0-9_]+$")
+# Path-2 (2026-05-19): Maestro Interactive.<N> sweep root. Same alphabet
+# as _SAFE_PSF_DIR_RE; require a `/Interactive.<digits>` tail so the
+# manifest reader cannot be repurposed as a generic file slurp.
+_SAFE_SWEEP_ROOT_RE = re.compile(r"^[A-Za-z0-9_./\-]{1,256}$")
+_SAFE_INTERACTIVE_TAIL_RE = re.compile(r"/Interactive\.[0-9]+/?$")
 _SAFE_OP_POINT_KEYS = {
     # Bias
     "vgs", "vds", "vbs",
@@ -150,6 +156,14 @@ _ALLOWED_SKILL_ENTRYPOINTS = frozenset({
     # Called before safeOceanDumpAll to skip the 30 s dump hang on
     # non-oscillating waveforms (run_20260420_033152 iters 2/4/6/9/10).
     "safeOceanProbePtp",
+    # Path-2 (2026-05-19): read .tuning_manifest.json from a Maestro
+    # Interactive.<N> sweep root to recover per-point Vctrl mapping.
+    "safeReadSweepManifest",
+    # Path-2 (2026-05-19): author .tuning_manifest.json from a
+    # PC-derived (point, vctrl) list. The agent derives entries from
+    # spec.md §6.1 `sweep:` and writes them out before the read side
+    # runs — Maestro itself never creates the file.
+    "safeWriteSweepManifest",
     # Stage 1 rev 6 (2026-04-18): generic design-variable auto-discovery.
     # Parses Maestro's input.scs to learn testbench desVars â€“ enables
     # the agent to pick up Maestro defaults instead of hardcoding names.
@@ -2295,6 +2309,342 @@ class SafeBridge:
         )
         result_json = self._execute_skill_json(expr)
         return _scrub(result_json)
+
+    # ------------------------------------------------------------------ #
+    #  Path-2 (2026-05-19) — sweep-aware read primitives for the
+    #  tuning-curve evaluation pipeline. These never run a new sim;
+    #  they read PSFs from an existing Maestro Interactive.<N> tree
+    #  and surface them through the same DumpAll stat schema the
+    #  single-point pipeline already uses.
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _validate_sweep_root(sweep_root: str) -> None:
+        if not isinstance(sweep_root, str):
+            raise ValueError("sweep_root must be a string")
+        if not sweep_root:
+            raise ValueError("sweep_root must be non-empty")
+        if len(sweep_root) > 256:
+            raise ValueError(f"sweep_root too long (len={len(sweep_root)})")
+        # Path-2 R2 (2026-05-19, codex P1-1): boundary checks BEFORE the
+        # charset regex. The charset gate alone allowed ``..``, ``//``,
+        # ``.`` segments, and relative roots because every character is
+        # individually inside [A-Za-z0-9_./-]. A caller could escape the
+        # intended Interactive.N tree via /Interactive.0/../../secret/
+        # Interactive.1 — fullmatch still passes, Interactive tail still
+        # matches.
+        if not sweep_root.startswith("/"):
+            raise ValueError("sweep_root must be an absolute path")
+        if "//" in sweep_root:
+            raise ValueError("sweep_root must not contain '//' segments")
+        # split("/") yields a leading "" (from the absolute "/") and an
+        # optional trailing "" (when sweep_root ends with "/"). Anything
+        # else empty is impossible because "//" was rejected above. Real
+        # segments are everything except those bookend empties.
+        for seg in sweep_root.strip("/").split("/"):
+            if seg in (".", ".."):
+                raise ValueError(
+                    f"sweep_root must not contain '{seg}' segments"
+                )
+        if not _SAFE_SWEEP_ROOT_RE.fullmatch(sweep_root):
+            raise ValueError(
+                "sweep_root contains illegal characters; only "
+                "[A-Za-z0-9_./-] allowed"
+            )
+        if not _SAFE_INTERACTIVE_TAIL_RE.search(sweep_root):
+            raise ValueError(
+                "sweep_root must end with /Interactive.<N> (optionally /)"
+            )
+
+    def read_sweep_manifest(self, sweep_root: str) -> dict[int, float]:
+        """Path-2: load ``<sweep_root>/.tuning_manifest.json``.
+
+        The manifest is a JSON list ``[{"point": <int>, "vctrl":
+        <float>}, ...]`` produced out-of-band before the agent runs.
+        SafeBridge only reads it (no remote-side writes from path-2).
+        Returns a ``{point_idx: vctrl_value}`` map ordered by point.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "read_sweep_manifest requires the remote-side SKILL helpers."
+            )
+        self._validate_sweep_root(sweep_root)
+        expr = f'safeReadSweepManifest("{sweep_root}")'
+        result_json = self._execute_skill_json(expr)
+        if not result_json.get("ok", False):
+            raise RuntimeError(
+                "safeReadSweepManifest failed: "
+                f"{_scrub(str(result_json.get('error', 'unknown')))}"
+            )
+        raw = result_json.get("raw")
+        if not isinstance(raw, str):
+            raise RuntimeError("manifest payload missing 'raw' string")
+        try:
+            entries = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"manifest is not valid JSON: {exc}") from None
+        if not isinstance(entries, list) or not entries:
+            raise RuntimeError("manifest must be a non-empty JSON list")
+        mapping: dict[int, float] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"manifest entry must be object, got {type(entry).__name__}"
+                )
+            # R2 (2026-05-19, codex P3): bool is a subclass of int, so
+            # `int(True) == 1` would silently accept ``{"point": true,
+            # "vctrl": false}``. Reject booleans explicitly — they
+            # almost certainly indicate a serializer bug in whatever
+            # produced the manifest.
+            try:
+                raw_point = entry["point"]
+                raw_vctrl = entry["vctrl"]
+            except KeyError:
+                raise RuntimeError(
+                    "manifest entry malformed: missing point/vctrl"
+                ) from None
+            if isinstance(raw_point, bool) or isinstance(raw_vctrl, bool):
+                raise RuntimeError(
+                    "manifest entry malformed: point/vctrl must be "
+                    "numeric, not boolean"
+                )
+            # R2 (2026-05-19, codex P3): strict isinstance, parity with the
+            # write side. JSON does not natively produce strings here, but a
+            # hand-edited manifest could carry ``"point": "2"`` or ``"point":
+            # 1.9``; both would silently survive ``int()`` and corrupt the
+            # point→vctrl mapping (rounding / lex-order traps).
+            if not isinstance(raw_point, int):
+                raise RuntimeError(
+                    "manifest entry malformed: point must be int, got "
+                    f"{type(raw_point).__name__}"
+                )
+            if not isinstance(raw_vctrl, (int, float)):
+                raise RuntimeError(
+                    "manifest entry malformed: vctrl must be int|float, got "
+                    f"{type(raw_vctrl).__name__}"
+                )
+            point = raw_point
+            vctrl = float(raw_vctrl)
+            if not math.isfinite(vctrl):
+                raise RuntimeError(f"manifest point {point}: non-finite vctrl")
+            if point < 1 or point > 1024:
+                raise RuntimeError(
+                    f"manifest point {point} outside [1, 1024]"
+                )
+            if point in mapping:
+                raise RuntimeError(f"duplicate point {point} in manifest")
+            mapping[point] = vctrl
+        return dict(sorted(mapping.items()))
+
+    def write_sweep_manifest(
+        self, sweep_root: str, entries: list[dict],
+    ) -> int:
+        """Path-2: author ``<sweep_root>/.tuning_manifest.json``.
+
+        ``entries`` is a list of ``{"point": <int 1..1024>,
+        "vctrl": <finite float>}`` records. The PC composes a typed
+        SKILL list (no embedded JSON string) so the call site stays
+        within the existing ``_check_skill_entrypoint`` allow-list
+        (``list`` nesting is already permitted). SKILL formats the
+        on-disk JSON itself. Returns the count of entries written.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "write_sweep_manifest requires the remote-side SKILL helpers."
+            )
+        self._validate_sweep_root(sweep_root)
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("entries must be a non-empty list")
+        seen: set[int] = set()
+        skill_pairs: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"manifest entry must be dict, got {type(entry).__name__}"
+                )
+            try:
+                raw_point = entry["point"]
+                raw_vctrl = entry["vctrl"]
+            except KeyError:
+                raise ValueError(
+                    "manifest entry missing point/vctrl"
+                ) from None
+            # R2 (2026-05-19, codex P3): strict isinstance, no silent
+            # coercion. ``point=1.9`` would have rounded to 1; ``"2"`` would
+            # have parsed via int(); ``vctrl="0.3"`` would have parsed via
+            # float(). All three corrupt the manifest's schema contract.
+            # Reject up front — the caller's job to pass the right type.
+            # ``isinstance(True, int)`` is True, so the bool gate must fire
+            # before the int/float type check.
+            if isinstance(raw_point, bool) or isinstance(raw_vctrl, bool):
+                raise ValueError(
+                    "manifest entry malformed: point/vctrl must be "
+                    "numeric, not boolean"
+                )
+            if not isinstance(raw_point, int):
+                raise ValueError(
+                    "manifest entry malformed: point must be int, got "
+                    f"{type(raw_point).__name__}"
+                )
+            if not isinstance(raw_vctrl, (int, float)):
+                raise ValueError(
+                    "manifest entry malformed: vctrl must be int|float, got "
+                    f"{type(raw_vctrl).__name__}"
+                )
+            point = raw_point
+            vctrl = float(raw_vctrl)
+            if point < 1 or point > 1024:
+                raise ValueError(f"point {point} outside [1, 1024]")
+            if not math.isfinite(vctrl):
+                raise ValueError(f"point {point}: non-finite vctrl")
+            if point in seen:
+                raise ValueError(f"duplicate point {point} in entries")
+            seen.add(point)
+            # ``repr(float)`` round-trips in Python 3 and emits no SKILL
+            # metacharacters for finite floats (no quotes, parens, semicolons).
+            skill_pairs.append(f"list({point} {vctrl!r})")
+        entries_skill = "list(" + " ".join(skill_pairs) + ")"
+        expr = f'safeWriteSweepManifest("{sweep_root}" {entries_skill})'
+        result_json = self._execute_skill_json(expr)
+        if not result_json.get("ok", False):
+            raise RuntimeError(
+                "safeWriteSweepManifest failed: "
+                f"{_scrub(str(result_json.get('error', 'unknown')))}"
+            )
+        count = result_json.get("count")
+        if not isinstance(count, int) or count != len(entries):
+            raise RuntimeError(
+                f"safeWriteSweepManifest count mismatch: "
+                f"got {count!r}, expected {len(entries)}"
+            )
+        return count
+
+    def run_ocean_dump_all_swept(
+        self,
+        signals: list[tuple[str, str, list[str]]],
+        windows: list[tuple[str, float, float]],
+        *,
+        sweep_root: str,
+        points: list[int],
+        tb_cell: str | None = None,
+        result_test: str | None = None,
+    ) -> dict[int, dict[str, Any]]:
+        """Path-2: per-sweep-point variant of ``run_ocean_dump_all``.
+
+        Iterates the supplied ``points`` against
+        ``<sweep_root>/<P>/<result_dir>/psf`` and returns
+        ``{point_idx: dump_json}``. A per-point SKILL failure is
+        captured as ``{"ok": False, "error": ...}`` so the upstream
+        ``evaluate_swept`` pipeline can still produce a partial result
+        and the agent can decide whether to retry. ``tb_cell`` is the
+        testbench cell used by OCEAN/final writeback; ``result_test`` is the
+        exact ADE/result test directory name when it differs from the cell.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "run_ocean_dump_all_swept requires the remote-side SKILL helpers."
+            )
+        if not isinstance(signals, (list, tuple)) or not signals:
+            raise ValueError("signals must be a non-empty list")
+        if not isinstance(windows, (list, tuple)) or not windows:
+            raise ValueError("windows must be a non-empty list")
+        self._validate_sweep_root(sweep_root)
+        if not isinstance(points, (list, tuple)) or not points:
+            raise ValueError("points must be a non-empty list")
+        norm_points: list[int] = []
+        seen_points: set[int] = set()
+        for p in points:
+            try:
+                pi = int(p)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"point {p!r} must be integer-coercible"
+                ) from None
+            if pi < 1 or pi > 1024:
+                raise ValueError(f"point {pi} outside [1, 1024]")
+            if pi in seen_points:
+                raise ValueError(f"duplicate point {pi}")
+            seen_points.add(pi)
+            norm_points.append(pi)
+
+        tb = tb_cell if tb_cell is not None else self._scope_tb_cell
+        if not isinstance(tb, str) or not tb:
+            raise RuntimeError(
+                "tb_cell must be supplied (or set_scope(..., tb_cell=...) "
+                "called) before run_ocean_dump_all_swept"
+            )
+        _validate_name(tb, "tb_cell")
+        result_dir = (
+            self._resolve_maestro_test(result_test)
+            if result_test is not None
+            else f"{tb}_1"
+        )
+        if not _SAFE_RESULT_DIR_RE.fullmatch(result_dir):
+            raise ValueError(
+                "result_test must be a safe PSF result directory leaf "
+                "(letters, digits, underscore, dot, dash; no colon or slash)."
+            )
+
+        norm_signals: list[tuple[str, str, list[str]]] = []
+        seen_names: set[str] = set()
+        for entry in signals:
+            name, kind, paths = self._validate_signal_entry(entry)
+            if name in seen_names:
+                raise ValueError(f"duplicate signal name {name!r}")
+            seen_names.add(name)
+            norm_signals.append((name, kind, paths))
+
+        norm_windows: list[tuple[str, float, float]] = []
+        seen_windows: set[str] = set()
+        for entry in windows:
+            name, ts, te = self._validate_window_entry(entry)
+            if name in seen_windows:
+                raise ValueError(f"duplicate window name {name!r}")
+            seen_windows.add(name)
+            norm_windows.append((name, ts, te))
+
+        sig_parts = " ".join(
+            'list("{n}" "{k}" list({paths}))'.format(
+                n=n, k=k, paths=" ".join(f'"{p}"' for p in ps)
+            )
+            for n, k, ps in norm_signals
+        )
+        win_parts = " ".join(
+            f'list("{n}" {self._format_time(ts)} {self._format_time(te)})'
+            for n, ts, te in norm_windows
+        )
+
+        root = sweep_root.rstrip("/")
+        out: dict[int, dict[str, Any]] = {}
+        for point in norm_points:
+            psf_dir = f"{root}/{point}/{result_dir}/psf"
+            if not _SAFE_PSF_DIR_RE.fullmatch(psf_dir):
+                raise RuntimeError(
+                    f"assembled psfDir for point {point} fails safety regex"
+                )
+            expr = (
+                f"safeOceanDumpAll(list({sig_parts}) "
+                f'list({win_parts}) "{psf_dir}")'
+            )
+            try:
+                result_json = self._execute_skill_json(expr)
+            except Exception as exc:
+                logger.warning(
+                    "swept dump skill failure at point %d: %s",
+                    point, _scrub(str(exc)),
+                )
+                out[point] = {"ok": False, "error": "skill_exception"}
+                continue
+            if not result_json.get("ok", False):
+                logger.warning(
+                    "swept dump returned not-ok at point %d: %s",
+                    point,
+                    _scrub(str(result_json.get("error", "unknown"))),
+                )
+                out[point] = _scrub(result_json)
+                continue
+            out[point] = _scrub(result_json)
+        return out
 
     def run_ocean_t_cross(
         self,

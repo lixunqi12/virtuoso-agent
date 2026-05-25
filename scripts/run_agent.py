@@ -131,6 +131,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--maestro-test",
+        default=None,
+        help=(
+            "Optional ADE/Maestro test row name for setup/output sync. "
+            "This may differ from --tb-cell, which remains the testbench "
+            "cell used by OCEAN simulation and final writeback. If omitted, "
+            "the agent probes Maestro tests and uses --tb-cell when it is a "
+            "real test row, the sole discovered row when unique, or skips "
+            "setup sync when ambiguous."
+        ),
+    )
+    parser.add_argument(
         "--spec",
         required=True,
         help=(
@@ -194,6 +206,22 @@ def parse_args() -> argparse.Namespace:
         "--env-file",
         default=None,
         help="Path to .env file (default: config/.env)",
+    )
+    parser.add_argument(
+        "--sweep-results-root",
+        default=None,
+        help=(
+            "Path-2 (2026-05-19): POSIX path on the remote host to a "
+            "Maestro Interactive.<N> directory whose per-point PSFs the "
+            "agent reads to evaluate the spec's `tuning_metrics` after "
+            "single-point convergence. The directory must end with "
+            "`/Interactive.<digits>` and contain a `.tuning_manifest.json` "
+            "listing `[{point, vctrl}, ...]` (point→Vctrl is not "
+            "sequential — Maestro shuffles the iteration order). When "
+            "the spec has no `sweep:` / `tuning_metrics:` block, this "
+            "flag is silently ignored. Path lives on the CLI, not in "
+            "spec.md, so the same spec can target multiple sweep runs."
+        ),
     )
     parser.add_argument(
         "--auto-bias-ic",
@@ -321,7 +349,10 @@ def parse_args() -> argparse.Namespace:
     # `MSYS_NO_PATHCONV=1` every invocation. Only activates on the known
     # mangled prefix; legit Windows paths are untouched.
     _MSYS_PREFIX = "C:/msys64"
-    for _attr in ("scs_path", "remote_skill_dir", "netlist", "remote_spec_root"):
+    for _attr in (
+        "scs_path", "remote_skill_dir", "netlist", "remote_spec_root",
+        "sweep_results_root",
+    ):
         _val = getattr(args, _attr, None)
         if isinstance(_val, str) and _val.startswith(_MSYS_PREFIX + "/"):
             setattr(args, _attr, _val[len(_MSYS_PREFIX):])
@@ -712,6 +743,7 @@ def main() -> int:
         print(f"  sim backend      : {args.sim_backend}")
         if args.sim_backend == "spectre":
             print(f"  lib/cell/tb_cell : {args.lib}/{args.cell}/{args.tb_cell}")
+            print(f"  maestro_test     : {args.maestro_test or '<auto>'}")
             print(f"  analysis         : {args.analysis}")
             print(f"  remote_skill_dir : {args.remote_skill_dir or '<unset>'}")
         else:
@@ -830,10 +862,11 @@ def main() -> int:
     )
 
     logger.info(
-        "Starting optimization: %s/%s (tb_cell: %s, max_iter: %d)",
+        "Starting optimization: %s/%s (tb_cell: %s, maestro_test: %s, max_iter: %d)",
         args.lib,
         args.cell,
         args.tb_cell,
+        args.maestro_test or "<auto>",
         args.max_iter,
     )
     result = agent.run(
@@ -844,6 +877,8 @@ def main() -> int:
         scs_path=args.scs_path,
         transcript_path=transcript_path,
         plan_auto=plan_auto,
+        sweep_results_root=args.sweep_results_root,
+        maestro_test=args.maestro_test,
     )
 
     print("\n" + "=" * 60)
@@ -852,6 +887,13 @@ def main() -> int:
     measurements = result.get("measurements", {})
     for key, value in measurements.items():
         print(f"  {key}: {value}")
+    tuning_meas = result.get("tuning_measurements") or {}
+    tuning_pf = result.get("tuning_pass_fail") or {}
+    if tuning_pf:
+        print("\n  --- Tuning curve (sweep) ---")
+        for k, verdict in tuning_pf.items():
+            v = tuning_meas.get(k)
+            print(f"  {k}: {v}  → {verdict}")
     print(f"\n  converged        : {result.get('converged')}")
     print(f"  abort_reason     : {result.get('abort_reason') or '-'}")
     print(f"  writeback_status : {result.get('writeback_status') or '-'}")

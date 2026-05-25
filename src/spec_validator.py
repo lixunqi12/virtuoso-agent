@@ -243,6 +243,23 @@ def _check_sanity_contains_pass(m: dict) -> list[str]:
 #  Public API
 # --------------------------------------------------------------------- #
 
+def _check_swept_metric(m: dict, block: dict) -> list[str]:
+    """Path-2 (2026-05-19): static feasibility for tuning_metrics.
+
+    The hard schema gates (cycles, dangling `of:`, bool-vs-numeric pass,
+    op vocabulary) live in ``spec_evaluator.validate_eval_block`` —
+    this function only reports the post-schema infeasibility cases the
+    feasibility module owns. Today that's: empty list — every swept op
+    is bounded by `of:`-source ranges that depend on circuit behavior,
+    so a static "always FAIL" verdict like the simple-metric bound math
+    isn't reachable without simulating. Kept as a hook for future ops
+    that DO have static bounds (e.g. monotonicity checks against a
+    declared `of:` source ptp_max).
+    """
+    del m, block  # nothing actionable today; see docstring
+    return []
+
+
 def validate_spec_feasibility(block: dict) -> list[str]:
     """Run all static feasibility checks on an already-parsed block.
 
@@ -260,6 +277,13 @@ def validate_spec_feasibility(block: dict) -> list[str]:
             issues.extend(_check_ratio_metric(m, block))
         elif compound == "t_cross_frac":
             issues.extend(_check_t_cross_frac_metric(m, block))
+    # Path-2: tuning_metrics get the sanity-vs-pass check + per-op hook.
+    # The dep graph (cycles, dangling refs) is hard-validated in
+    # `spec_evaluator.validate_eval_block`; surfacing it again here as
+    # a feasibility "issue" would be redundant noise.
+    for m in block.get("tuning_metrics") or []:
+        issues.extend(_check_sanity_contains_pass(m))
+        issues.extend(_check_swept_metric(m, block))
     return issues
 
 

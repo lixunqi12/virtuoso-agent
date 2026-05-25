@@ -1485,3 +1485,729 @@ class TestTopologyClassifierHspice:
         assert result["abort_reason"] is None
         assert result["converged"] is True
 
+
+# ---------------------------------------------------------------- #
+#  Path-2.5 (2026-05-19): spec-derived Maestro setup
+# ---------------------------------------------------------------- #
+
+
+class TestDeriveMaestroSetupFromSpec:
+    """The agent must translate spec §2 (signals/windows/metrics) into a
+    Maestro setup payload deterministically, replacing the LLM-emit path
+    that small models (haiku-4-5) regularly mis-shape.
+
+    The contract: ``_derive_maestro_setup_from_spec(tb_cell)`` returns
+    a dict matching ``apply_maestro_setup``'s schema —
+    ``{"analyses": [...], "outputs": [...]}`` — with one Maestro output
+    per spec metric (V→VT, I→IT, Vdiff→VT-VT, Vsum_half→(VT+VT)/2) and
+    a single ``tran`` analyses entry on the scoped testbench.
+    """
+
+    @staticmethod
+    def _agent(spec_text: str) -> "CircuitAgent":
+        return CircuitAgent(
+            bridge=MagicMock(),
+            llm=MagicMock(),
+            spec=spec_text,
+            ocean_worker=MagicMock(),
+        )
+
+    @staticmethod
+    def _lc_vco_spec() -> str:
+        """Minimal §2 fixture matching projects/lc_vco_base/.../spec.md."""
+        return (
+            "# LC_VCO\n\n"
+            "## 2. Eval block\n\n"
+            "```yaml\n"
+            "signals:\n"
+            "  - name: Vdiff\n"
+            "    kind: Vdiff\n"
+            "    paths: [\"/Vout_p\", \"/Vout_n\"]\n"
+            "  - name: Vcm\n"
+            "    kind: Vsum_half\n"
+            "    paths: [\"/Vout_p\", \"/Vout_n\"]\n"
+            "  - name: Vout_p\n"
+            "    kind: V\n"
+            "    path: \"/Vout_p\"\n"
+            "  - name: I_tail\n"
+            "    kind: I\n"
+            "    path: \"/I0/M2/D\"\n"
+            "\n"
+            "windows:\n"
+            "  full:  [1.0e-7, 2.0e-7]\n"
+            "  late:  [1.5e-7, 2.0e-7]\n"
+            "  early: [7.5e-8, 1.25e-7]\n"
+            "\n"
+            "metrics:\n"
+            "  - {name: f_osc_GHz, signal: Vdiff, window: full, "
+            "stat: freq_Hz, scale: 1.0e-9, pass: [19.5, 20.5]}\n"
+            "  - {name: V_diff_pp_V, signal: Vdiff, window: late, "
+            "stat: ptp, pass: [0.40, null]}\n"
+            "  - {name: V_cm_V, signal: Vcm, window: late, "
+            "stat: mean, pass: [0.70, 0.81]}\n"
+            "  - {name: I_core_uA, signal: I_tail, window: late, "
+            "stat: mean_abs, scale: 1.0e6, pass: [null, 800]}\n"
+            "  - name: amp_hold_ratio\n"
+            "    compound: ratio\n"
+            "    numerator:   {signal: Vdiff, window: late,  stat: rms}\n"
+            "    denominator: {signal: Vdiff, window: early, stat: rms}\n"
+            "    pass: [0.95, null]\n"
+            "```\n"
+        )
+
+    def test_returns_empty_when_no_eval_block(self):
+        """A dict-spec agent has no eval_block → empty dict signals the
+        caller to fall through to the legacy LLM-emit path."""
+        agent = CircuitAgent(
+            bridge=MagicMock(), llm=MagicMock(),
+            spec={"f_osc": "19.5"}, ocean_worker=MagicMock(),
+        )
+        assert agent._derive_maestro_setup_from_spec("LC_VCO_tb") == {}
+
+    def test_analyses_is_single_tran_on_scoped_tb_cell(self):
+        agent = self._agent(self._lc_vco_spec())
+        out = agent._derive_maestro_setup_from_spec("LC_VCO_tb")
+        assert out["analyses"] == [{
+            "test": "LC_VCO_tb",
+            "analysis": "tran",
+            "enable": True,
+        }]
+
+    def test_outputs_one_entry_per_metric(self):
+        """Snapshot: 5 metrics → 5 outputs; expression matches signal kind."""
+        agent = self._agent(self._lc_vco_spec())
+        out = agent._derive_maestro_setup_from_spec("LC_VCO_tb")
+        by_name = {o["name"]: o for o in out["outputs"]}
+        # 4 simple + 1 compound-ratio (numerator signal = Vdiff)
+        assert sorted(by_name) == sorted([
+            "f_osc_GHz", "V_diff_pp_V", "V_cm_V",
+            "I_core_uA", "amp_hold_ratio",
+        ])
+        # Canonical paren'd form (R2 P3 NIT 2): the derive helper now
+        # delegates to ``maestro_metric_sync._waveform_expr`` so derived
+        # and Option-I sync paths emit byte-identical strings.
+        # Vdiff signal → (VT(p) - VT(n))
+        assert by_name["f_osc_GHz"]["expr"] == (
+            '(VT("/Vout_p") - VT("/Vout_n"))'
+        )
+        assert by_name["V_diff_pp_V"]["expr"] == (
+            '(VT("/Vout_p") - VT("/Vout_n"))'
+        )
+        # Vsum_half → ((VT(p) + VT(n)) / 2.0)
+        assert by_name["V_cm_V"]["expr"] == (
+            '((VT("/Vout_p") + VT("/Vout_n")) / 2.0)'
+        )
+        # I signal → IT(path)
+        assert by_name["I_core_uA"]["expr"] == 'IT("/I0/M2/D")'
+        # Compound ratio falls back to numerator signal (Vdiff)
+        assert by_name["amp_hold_ratio"]["expr"] == (
+            '(VT("/Vout_p") - VT("/Vout_n"))'
+        )
+        # Every output is keyed to the scoped tb_cell as the test.
+        for entry in out["outputs"]:
+            assert entry["test"] == "LC_VCO_tb"
+            assert entry["output_type"] == "expr"
+
+    def test_v_kind_uses_single_path(self):
+        """A signal of kind V (single ``path``) emits ``VT("/path")``."""
+        spec = (
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: VA, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: VA_rms, signal: VA, window: full, stat: rms, "
+            "pass: [null, 1.0]}\n"
+            "```\n"
+        )
+        agent = self._agent(spec)
+        out = agent._derive_maestro_setup_from_spec("tb")
+        assert out["outputs"][0]["expr"] == 'VT("/A")'
+
+    def test_unknown_signal_kind_skipped_not_crash(self):
+        """An unknown ``kind`` produces no output for that metric rather
+        than a malformed expression. spec_evaluator already validates
+        kinds upstream, but the helper must be robust if a kind sneaks
+        through (e.g. future schema extension)."""
+        agent = self._agent(self._lc_vco_spec())
+        # Mutate eval_block in-place after construction to inject a kind
+        # the helper doesn't understand.
+        agent.eval_block["signals"].append({
+            "name": "Mystery", "kind": "Q_dot",
+            "paths": ["/whatever"],
+        })
+        agent.eval_block["metrics"].append({
+            "name": "mystery_metric", "signal": "Mystery",
+            "window": "full", "stat": "mean", "pass": [0, 1],
+        })
+        out = agent._derive_maestro_setup_from_spec("LC_VCO_tb")
+        assert "mystery_metric" not in {o["name"] for o in out["outputs"]}
+        # Known metrics still get emitted.
+        assert "f_osc_GHz" in {o["name"] for o in out["outputs"]}
+
+    def test_derived_payload_passes_setup_block_validator(self):
+        """Round-trip: every derived entry must pass
+        ``validate_maestro_setup_block`` so ``apply_maestro_setup`` can
+        consume it without any contract-repair detour."""
+        from src.maestro_setup import validate_maestro_setup_block
+        agent = self._agent(self._lc_vco_spec())
+        payload = agent._derive_maestro_setup_from_spec("LC_VCO_tb")
+        assert validate_maestro_setup_block(payload) is None
+
+
+class TestStripLLMSetupBlocksWhenDerived:
+    """R2 P1 codex BLOCKER: ``_strip_llm_setup_blocks_if_derived`` MUST
+    remove the four Maestro setup keys from the parsed LLM response
+    BEFORE the contract check sees them whenever the spec-derived path
+    is active. Otherwise the per-entry shape validator inside
+    ``validate_maestro_setup_block`` flags small-model typos
+    (``outputs: dict``, ``analysis: 'transient'``) as contract
+    violations, burning every repair retry on a payload the agent
+    intends to ignore anyway.
+    """
+
+    @staticmethod
+    def _agent_with_eval_block() -> "CircuitAgent":
+        spec = (
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: V, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: V_rms, signal: V, window: full, stat: rms, "
+            "pass: [null, 1.0]}\n"
+            "```\n"
+        )
+        agent = CircuitAgent(
+            bridge=MagicMock(), llm=MagicMock(),
+            spec=spec, ocean_worker=MagicMock(),
+        )
+        assert agent.eval_block is not None  # sanity for the test
+        return agent
+
+    def test_contract_check_skips_maestro_setup_keys_when_eval_block_present(
+        self,
+    ):
+        """The PoC from codex's review: haiku's malformed ``outputs:
+        dict`` + ``analysis: 'transient'`` payload must NOT trip
+        contract violation when the agent has a spec-derived path
+        because the stripper drops those keys first."""
+        agent = self._agent_with_eval_block()
+        parsed = {
+            "outputs": {"name": "m", "expr": 'VT("/V")'},  # bad shape
+            "analyses": [{"test": "tb", "analysis": "transient",
+                          "enable": True}],  # bad analysis name
+            "measurements": {},
+            "pass_fail": {},
+            "reasoning": "x",
+            "design_vars": {},
+        }
+        agent._strip_llm_setup_blocks_if_derived(parsed, iter_idx=0)
+        # The four setup keys are gone; the rest of the payload is intact.
+        assert "outputs" not in parsed
+        assert "analyses" not in parsed
+        assert "tests" not in parsed
+        assert "corners" not in parsed
+        for k in ("measurements", "pass_fail", "reasoning", "design_vars"):
+            assert k in parsed
+        # Post-strip, the static contract checker should green-light it.
+        assert CircuitAgent._check_contract_violation(parsed) is None
+
+    def test_strip_is_noop_when_eval_block_is_none(self):
+        """Dict-spec agents (legacy LLM-emit path) must keep getting
+        the maestro_setup blocks fed to the contract validator —
+        otherwise the legacy flow loses its per-entry shape gate."""
+        agent = CircuitAgent(
+            bridge=MagicMock(), llm=MagicMock(),
+            spec={"f_osc": "19.5"}, ocean_worker=MagicMock(),
+        )
+        parsed = {
+            "outputs": [{"name": "m", "expr": 'VT("/V")'}],
+            "measurements": {}, "pass_fail": {},
+            "reasoning": "x", "design_vars": {},
+        }
+        before = dict(parsed)
+        agent._strip_llm_setup_blocks_if_derived(parsed, iter_idx=0)
+        assert parsed == before  # untouched
+
+    def test_strip_is_noop_when_no_setup_keys_present(self):
+        """When the LLM correctly omits all four blocks (the new
+        steady-state behavior under the path-2.5 prompt), the helper
+        must not log a misleading 'ignoring' warning."""
+        agent = self._agent_with_eval_block()
+        parsed = {
+            "measurements": {}, "pass_fail": {},
+            "reasoning": "x", "design_vars": {},
+        }
+        before = dict(parsed)
+        agent._strip_llm_setup_blocks_if_derived(parsed, iter_idx=0)
+        assert parsed == before
+
+
+class TestDerivedSetupPromptConditional:
+    """R2 P2: the 'Do NOT emit tests/analyses/outputs/corners'
+    instruction must only appear when the spec-derived path is active.
+    Issuing it unconditionally would regress legacy dict-spec projects
+    that still depend on the LLM-emit path
+    (``_slice_maestro_setup_payload``)."""
+
+    @staticmethod
+    def _str_spec() -> str:
+        return (
+            "# Spec\n\n"
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: V, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: V_rms, signal: V, window: full, stat: rms, "
+            "pass: [null, 1.0]}\n"
+            "```\n"
+        )
+
+    def test_derive_note_present_when_eval_block_active(self, agent):
+        agent.spec = self._str_spec()
+        from src import spec_evaluator
+        agent.eval_block = spec_evaluator.extract_eval_block(agent.spec)
+        assert agent.eval_block is not None
+        agent.llm.chat.return_value = ""  # no_changes abort
+        agent.run(lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=1)
+        prompt = agent.llm.chat.call_args[0][0][0]["content"]
+        assert "Maestro setup is derived from the spec automatically" in prompt
+        assert "Do NOT emit `tests`, `analyses`, `outputs`, or `corners`" in prompt
+
+    def test_derive_note_absent_when_no_eval_block(self, agent):
+        """Legacy dict-spec path: no eval_block → no instruction."""
+        # The `agent` fixture is dict-spec by default → eval_block=None.
+        assert agent.eval_block is None
+        agent.llm.chat.return_value = ""  # no_changes abort
+        agent.run(lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=1)
+        prompt = agent.llm.chat.call_args[0][0][0]["content"]
+        assert "Maestro setup is derived from the spec automatically" not in prompt
+
+
+class TestDerivedSetupAppliedFlag:
+    """R2 P3 NIT 3: ``_maestro_setup_applied`` must flip to True after
+    a successful apply, and stay False after a failure so the next
+    iter re-attempts the derived payload (rather than silently leaving
+    Maestro's Outputs Setup empty for the rest of the run)."""
+
+    @staticmethod
+    def _spec() -> str:
+        return (
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: V, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: V_rms, signal: V, window: full, stat: rms, "
+            "pass: [null, 1.0]}\n"
+            "```\n"
+        )
+
+    def test_flag_starts_false(self):
+        agent = CircuitAgent(
+            bridge=MagicMock(), llm=MagicMock(),
+            spec=self._spec(), ocean_worker=MagicMock(),
+        )
+        assert agent._maestro_setup_applied is False
+
+
+class TestResolveMaestroSetupTest:
+    @staticmethod
+    def _agent_with_bridge(bridge: MagicMock) -> "CircuitAgent":
+        return CircuitAgent(
+            bridge=bridge, llm=MagicMock(),
+            spec=TestDerivedSetupAppliedFlag._spec(),
+            ocean_worker=MagicMock(),
+        )
+
+    def test_explicit_maestro_test_wins(self):
+        bridge = MagicMock()
+        bridge._resolve_maestro_test.side_effect = lambda test: test
+        agent = self._agent_with_bridge(bridge)
+        assert agent._resolve_maestro_setup_test(
+            tb_cell="LC_VCO_tb",
+            maestro_test="pll_LC_VCO_tb_1",
+        ) == "pll_LC_VCO_tb_1"
+        bridge._list_remote_maestro_tests.assert_not_called()
+
+    def test_auto_uses_tb_cell_when_it_is_test_row(self):
+        bridge = MagicMock()
+        bridge._list_remote_maestro_tests.return_value = {
+            "LC_VCO_tb", "other_test",
+        }
+        agent = self._agent_with_bridge(bridge)
+        assert agent._resolve_maestro_setup_test(
+            tb_cell="LC_VCO_tb",
+            maestro_test=None,
+        ) == "LC_VCO_tb"
+
+    def test_auto_uses_sole_test_row_when_tb_cell_differs(self):
+        bridge = MagicMock()
+        bridge._list_remote_maestro_tests.return_value = {"pll_LC_VCO_tb_1"}
+        agent = self._agent_with_bridge(bridge)
+        assert agent._resolve_maestro_setup_test(
+            tb_cell="LC_VCO_tb",
+            maestro_test=None,
+        ) == "pll_LC_VCO_tb_1"
+
+    def test_auto_skips_when_ambiguous(self, caplog):
+        bridge = MagicMock()
+        bridge._list_remote_maestro_tests.return_value = {"a", "b"}
+        agent = self._agent_with_bridge(bridge)
+        with caplog.at_level("WARNING"):
+            resolved = agent._resolve_maestro_setup_test(
+                tb_cell="LC_VCO_tb",
+                maestro_test=None,
+            )
+        assert resolved is None
+        assert any("Maestro setup sync skipped" in r.message for r in caplog.records)
+
+
+# ====================================================================== #
+#  Path-2 (2026-05-19) — _ensure_sweep_manifest + _derive_sweep_entries
+#  Authoring side: the agent writes .tuning_manifest.json from spec.md
+#  §6.1 so Maestro doesn't need to know anything about sweep ordering.
+# ====================================================================== #
+
+
+class TestDeriveSweepEntries:
+    """``_derive_sweep_entries`` translates spec.md §6.1 ``sweep:`` into
+    a list of {point, vctrl} records — same shape that ``read_sweep_manifest``
+    parses on the way back in."""
+
+    @staticmethod
+    def _spec_with_sweep(points: int, lo: float, hi: float) -> str:
+        return (
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: V, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: V_rms, signal: V, window: full, stat: rms, "
+            "pass: [null, 1.0]}\n"
+            "```\n"
+            "```yaml\n"
+            f"sweep: {{variable: Vctrl, range: [{lo}, {hi}], "
+            f"points: {points}, unit: V}}\n"
+            "tuning_metrics:\n"
+            "  - {name: tuning_range, op: swept_max_minus_min, of: V_rms, "
+            "pass: [0.0, null]}\n"
+            "```\n"
+        )
+
+    def test_9_points_0_to_0_8_matches_baseline_curve(self):
+        agent = CircuitAgent(
+            bridge=MagicMock(), llm=MagicMock(),
+            spec=self._spec_with_sweep(9, 0.0, 0.8),
+            ocean_worker=MagicMock(),
+        )
+        entries = agent._derive_sweep_entries()
+        assert len(entries) == 9
+        points = [e["point"] for e in entries]
+        assert points == list(range(1, 10))
+        vctrls = [e["vctrl"] for e in entries]
+        # Endpoints exact, mid-points equispaced 0.1 V (matches the
+        # baseline f–V curve in projects/lc_vco_base/constraints/spec.md).
+        assert vctrls[0] == pytest.approx(0.0)
+        assert vctrls[-1] == pytest.approx(0.8)
+        for i in range(1, 9):
+            assert vctrls[i] - vctrls[i - 1] == pytest.approx(0.1)
+
+    def test_raises_when_no_sweep_block(self):
+        spec_no_sweep = (
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: V, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: V_rms, signal: V, window: full, stat: rms, "
+            "pass: [null, 1.0]}\n"
+            "```\n"
+        )
+        agent = CircuitAgent(
+            bridge=MagicMock(), llm=MagicMock(),
+            spec=spec_no_sweep, ocean_worker=MagicMock(),
+        )
+        with pytest.raises(ValueError, match=r"(?i)sweep"):
+            agent._derive_sweep_entries()
+
+
+class TestEnsureSweepManifest:
+    """``_ensure_sweep_manifest(sweep_root)`` returns None when the file
+    is ready to read (existed-and-matched OR freshly written), and a
+    string reason when the caller must abort (mismatch on disk, write
+    failed, derive failed, etc.). The bridge calls are mocked."""
+
+    _ROOT = "/home/u/sim/cell_tb/maestro/results/maestro/Interactive.0"
+
+    @staticmethod
+    def _agent_with_sweep(bridge: MagicMock) -> CircuitAgent:
+        spec = (
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: V, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: V_rms, signal: V, window: full, stat: rms, "
+            "pass: [null, 1.0]}\n"
+            "```\n"
+            "```yaml\n"
+            "sweep: {variable: Vctrl, range: [0.0, 0.8], points: 9, unit: V}\n"
+            "tuning_metrics:\n"
+            "  - {name: tuning_range, op: swept_max_minus_min, of: V_rms, "
+            "pass: [0.0, null]}\n"
+            "```\n"
+        )
+        return CircuitAgent(
+            bridge=bridge, llm=MagicMock(),
+            spec=spec, ocean_worker=MagicMock(),
+        )
+
+    def test_no_op_when_spec_has_no_sweep(self):
+        """Dict-spec (legacy) or single-point spec.md: ensure-helper must
+        be a true no-op so existing projects don't trip the new path."""
+        bridge = MagicMock()
+        bridge.read_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not be called")
+        )
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not be called")
+        )
+        agent = CircuitAgent(
+            bridge=bridge, llm=MagicMock(),
+            spec={"f_osc": "20"}, ocean_worker=MagicMock(),
+        )
+        assert agent._ensure_sweep_manifest(self._ROOT) is None
+
+    def test_writes_when_file_missing(self):
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.side_effect = RuntimeError(
+            "No .tuning_manifest.json at sweep root"
+        )
+        bridge.write_sweep_manifest.return_value = 9
+        agent = self._agent_with_sweep(bridge)
+        reason = agent._ensure_sweep_manifest(self._ROOT)
+        assert reason is None
+        bridge.write_sweep_manifest.assert_called_once()
+        args, _ = bridge.write_sweep_manifest.call_args
+        assert args[0] == self._ROOT
+        entries = args[1]
+        assert len(entries) == 9
+        assert entries[0] == {"point": 1, "vctrl": pytest.approx(0.0)}
+        assert entries[-1] == {"point": 9, "vctrl": pytest.approx(0.8)}
+
+    def test_skips_write_when_existing_matches_spec(self):
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.return_value = {
+            i + 1: round(i * 0.1, 1) for i in range(9)
+        }
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not overwrite a matching file")
+        )
+        agent = self._agent_with_sweep(bridge)
+        reason = agent._ensure_sweep_manifest(self._ROOT)
+        assert reason is None
+        bridge.write_sweep_manifest.assert_not_called()
+
+    def test_skips_write_when_existing_has_shuffled_mapping(self):
+        """Maestro's point execution order can be shuffled. The manifest's
+        point->Vctrl mapping should be accepted when it has the same point set
+        and the same Vctrl grid, even if point 1 is not the low endpoint."""
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.return_value = {
+            1: 0.3, 2: 0.0, 3: 0.8, 4: 0.4, 5: 0.1,
+            6: 0.7, 7: 0.2, 8: 0.6, 9: 0.5,
+        }
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not overwrite a matching file")
+        )
+        agent = self._agent_with_sweep(bridge)
+        reason = agent._ensure_sweep_manifest(self._ROOT)
+        assert reason is None
+        bridge.write_sweep_manifest.assert_not_called()
+
+    def test_aborts_with_mismatch_when_existing_disagrees(self, caplog):
+        """Hand-written manifest takes precedence over the spec — the
+        agent refuses to silently overwrite it. Caller must see the
+        ``manifest_mismatch`` reason and surface UNMEASURABLE."""
+        bridge = MagicMock()
+        # 3-point file on disk vs 9-point spec → mismatch
+        bridge.read_sweep_manifest.return_value = {1: 0.0, 2: 0.4, 3: 0.8}
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not overwrite a mismatching file")
+        )
+        agent = self._agent_with_sweep(bridge)
+        with caplog.at_level("WARNING"):
+            reason = agent._ensure_sweep_manifest(self._ROOT)
+        assert reason == "manifest_mismatch"
+        bridge.write_sweep_manifest.assert_not_called()
+        assert any(
+            "does not match spec" in rec.message for rec in caplog.records
+        )
+
+    def test_aborts_with_mismatch_when_same_length_point_set_differs(self):
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.return_value = {
+            1: 0.0, 2: 0.1, 3: 0.2, 4: 0.3, 5: 0.4,
+            6: 0.5, 7: 0.6, 8: 0.7, 99: 0.8,
+        }
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not overwrite a mismatching file")
+        )
+        agent = self._agent_with_sweep(bridge)
+        assert agent._ensure_sweep_manifest(self._ROOT) == "manifest_mismatch"
+        bridge.write_sweep_manifest.assert_not_called()
+
+    def test_aborts_with_mismatch_when_vctrl_grid_differs(self):
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.return_value = {
+            1: 0.0, 2: 0.1, 3: 0.2, 4: 0.3, 5: 0.45,
+            6: 0.5, 7: 0.6, 8: 0.7, 9: 0.8,
+        }
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not overwrite a mismatching file")
+        )
+        agent = self._agent_with_sweep(bridge)
+        assert agent._ensure_sweep_manifest(self._ROOT) == "manifest_mismatch"
+        bridge.write_sweep_manifest.assert_not_called()
+
+    def test_aborts_when_write_fails(self):
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.side_effect = RuntimeError(
+            "manifest missing"
+        )
+        bridge.write_sweep_manifest.side_effect = RuntimeError(
+            "disk full"
+        )
+        agent = self._agent_with_sweep(bridge)
+        reason = agent._ensure_sweep_manifest(self._ROOT)
+        assert reason == "manifest_write_failed"
+
+    def test_drops_cached_manifest_after_write(self):
+        """A stale entry in ``_sweep_manifest_cache`` from a previous
+        iter would shadow the newly-written file. The ensure helper
+        must invalidate it so the next read picks up fresh values."""
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.side_effect = RuntimeError(
+            "manifest missing"
+        )
+        bridge.write_sweep_manifest.return_value = 9
+        agent = self._agent_with_sweep(bridge)
+        agent._sweep_manifest_cache[self._ROOT] = {1: 9.99}  # stale
+        agent._ensure_sweep_manifest(self._ROOT)
+        assert self._ROOT not in agent._sweep_manifest_cache
+
+
+class TestRunSweepPhase:
+    _ROOT = "/home/u/sim/cell_tb/maestro/results/maestro/Interactive.0"
+
+    @staticmethod
+    def _agent_with_sweep(bridge: MagicMock) -> CircuitAgent:
+        spec = (
+            "```yaml\n"
+            "signals:\n"
+            "  - {name: V, kind: V, path: \"/A\"}\n"
+            "windows:\n"
+            "  full: [0, 1.0e-7]\n"
+            "metrics:\n"
+            "  - {name: V_rms, signal: V, window: full, stat: rms, "
+            "pass: [null, 10.0]}\n"
+            "```\n"
+            "```yaml\n"
+            "sweep: {variable: Vctrl, range: [0.0, 0.2], points: 3, unit: V}\n"
+            "tuning_metrics:\n"
+            "  - {name: tuning_range, op: swept_max_minus_min, of: V_rms, "
+            "pass: [1.5, null], sanity: [0.0, 10.0]}\n"
+            "```\n"
+        )
+        return CircuitAgent(
+            bridge=bridge, llm=MagicMock(),
+            spec=spec, ocean_worker=MagicMock(),
+        )
+
+    def test_unwraps_dump_all_wrapper_before_swept_eval(self):
+        """Real SafeBridge swept dumps return {"ok": true, "dumps": ...}.
+        The sweep evaluator must hand the inner dumps payload to
+        spec_evaluator.evaluate(); otherwise every base metric reads as
+        None and tuning metrics become UNMEASURABLE."""
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.return_value = {1: 0.0, 2: 0.1, 3: 0.2}
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("manifest already matches")
+        )
+        bridge.run_ocean_dump_all_swept.return_value = {
+            1: {"ok": True, "dumps": {"V": {"full": {"rms": 1.0}}}},
+            2: {"ok": True, "dumps": {"V": {"full": {"rms": 2.0}}}},
+            3: {"ok": True, "dumps": {"V": {"full": {"rms": 3.0}}}},
+        }
+        agent = self._agent_with_sweep(bridge)
+
+        measurements, pass_fail = agent._run_sweep_phase(
+            sweep_results_root=self._ROOT,
+            tb_cell="LC_VCO_tb",
+            result_test="pll_LC_VCO_tb_1",
+        )
+
+        assert measurements["tuning_range"] == pytest.approx(2.0)
+        assert pass_fail["tuning_range"] == "PASS"
+
+    def test_fresh_sweep_reruns_current_design_vars_per_vctrl(self):
+        """Closed-loop tuning must not reuse stale Interactive.0 PSFs.
+
+        The manifest still supplies the point-to-Vctrl mapping, but each
+        point is simulated with the current design variables so tuning
+        verdicts track the LLM's latest C/L/varactor proposal.
+        """
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.return_value = {1: 0.2, 2: 0.0, 3: 0.1}
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("manifest already matches")
+        )
+        bridge.run_ocean_dump_all_swept = MagicMock(
+            side_effect=AssertionError("must not read stale sweep PSFs")
+        )
+
+        def fake_run_ocean_sim(**kwargs):
+            vctrl = kwargs["design_vars"]["Vctrl"]
+            bridge.last_results_dir = f"/tmp/psf_vctrl_{vctrl}"
+            return {"ok": True}
+
+        bridge.run_ocean_sim.side_effect = fake_run_ocean_sim
+        agent = self._agent_with_sweep(bridge)
+        agent.ocean_worker.dump_all.side_effect = [
+            {"ok": True, "dumps": {"V": {"full": {"rms": 1.0}}}},
+            {"ok": True, "dumps": {"V": {"full": {"rms": 2.0}}}},
+            {"ok": True, "dumps": {"V": {"full": {"rms": 3.0}}}},
+        ]
+
+        measurements, pass_fail = agent._run_sweep_phase(
+            sweep_results_root=self._ROOT,
+            tb_cell="LC_VCO_tb",
+            result_test="pll_LC_VCO_tb_1",
+            lib="pll",
+            cell="LC_VCO",
+            design_vars={"C": "69f", "L": "574p", "Vctrl": "0.4"},
+            analyses=["tran"],
+        )
+
+        called_vctrls = [
+            call.kwargs["design_vars"]["Vctrl"]
+            for call in bridge.run_ocean_sim.call_args_list
+        ]
+        assert called_vctrls == [0.0, 0.1, 0.2]
+        assert all(
+            call.kwargs["design_vars"]["C"] == "69f"
+            for call in bridge.run_ocean_sim.call_args_list
+        )
+        bridge.run_ocean_dump_all_swept.assert_not_called()
+        assert measurements["tuning_range"] == pytest.approx(2.0)
+        assert pass_fail["tuning_range"] == "PASS"
