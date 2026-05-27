@@ -1,0 +1,42 @@
+%% v4/sec/conclusion.tex — §10 Conclusion + Future Work (TODAES long-form)
+%%
+%% Provenance: verbatim mechanical carry of paper/sec/conclusion.tex
+%% (2026-05-16) under Phase-1 task 91240545. v3 source is frozen.
+%%
+%% PHASE-2 expansion targets (from outline_v4.md §10 plan, ~0.5pp):
+%%   - Future work — add hash-only thinking channel / fully on-prem
+%%     inference bullet (cross-ref §4 Tier-3 first-emission row,
+%%     §sec:platform-status)
+%%   - Future work — add "Safe-Bridge as reusable LLM4EDA
+%%     deployment pattern" bullet referencing
+%%     \S\ref{sec:reproducibility} artifact pack
+%%   - Conclusion paragraph — replace "v3 ..." framing with TODAES
+%%     submission framing once C1-C6 are stable
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented an \textbf{eleven-LLM $\times$ seven-metric
+spec-contract benchmark for industrial-node analog sizing} on
+\textbf{Safe-Bridge}, a verifiable substrate that lets any cloud
+LLM drive a real foundry-bound schematic without PDK content
+crossing the trust boundary. The eleven checkpoints span seven
+vendor families across two countries (6~US + 5~China). The
+cost--quality Pareto
+(\S\ref{sec:results}) with its reasoning-token premium and the
+failure-bucket matrix (\S\ref{sec:failures}) constitute the
+reusable contribution for future industrial-EDA LLM evaluations.
+
+\paragraph{Future work.}
+\begin{itemize}
+  \item \textbf{Multi-circuit expansion.} OpAmp testbench (the
+    \S\ref{sec:intro}/\S\ref{sec:methodology} in-revision hook);
+    further targets: comparator, bandgap reference.
+  \item \textbf{Multi-PDK / multi-node expansion.} Cross-foundry
+    and cross-node generalisation (BSIM-CMG generations, cell
+    libraries, process stacks).
+  \item Extend \filename{\_normalize\_usage} to capture
+    Anthropic / Gemini reasoning-token accounting
+    (\S\ref{sec:results-premium}).
+\end{itemize}
+%% PHASE-2: add hash-only thinking channel / fully on-prem inference bullet (cross-ref §4 Tier-3 first-emission row); add Safe-Bridge-as-reusable-pattern bullet (cross-ref §sec:reproducibility).

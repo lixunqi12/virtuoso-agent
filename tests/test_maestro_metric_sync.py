@@ -219,6 +219,13 @@ class TestScaleAndPassBounds:
         assert expr.startswith("(frequency(clip(")
         assert "* 1e-09" in expr or "* 1.0e-09" in expr
 
+    def test_scale_numeric_string_applied(self, bridge, writer_mocks):
+        block = _eval_block_simple(stat="mean_abs", scale="1.0e6")
+        sync_spec_metrics_to_maestro(bridge, block)
+        expr = writer_mocks["add_output"].call_args.kwargs["expr"]
+        assert expr.startswith("(average(abs(clip(")
+        assert "* 1000000.0" in expr
+
     def test_scale_one_is_noop(self, bridge, writer_mocks):
         block = _eval_block_simple(stat="freq_Hz", scale=1.0)
         sync_spec_metrics_to_maestro(bridge, block)

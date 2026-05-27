@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 1040" font-family="Helvetica, Arial, sans-serif" font-size="12" stroke-linejoin="round">
+  <title>Safe-Bridge Architecture (Figure 1)</title>
+  <desc>Eight-node architecture diagram for Safe-Bridge. The LLM provider and the foundry PDK sit outside a dashed-green trust boundary. The boundary contains: Agent, Python whitelist layer, Return-path scrubber, RAMIC TCP bridge, SKILL whitelist layer, and Cadence DB + Maestro. Six numbered crossings mark the trust-boundary edges referenced by the §4 prose.</desc>
+
+  <!-- arrowhead defs -->
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="strokeWidth" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="strokeWidth" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a7f37"/>
+    </marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="strokeWidth" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c33"/>
+    </marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="380" y="22" text-anchor="middle" font-size="14" font-weight="bold">Fig. 1 — Safe-Bridge Architecture</text>
+  <text x="380" y="38" text-anchor="middle" font-size="10" fill="#555">Untrusted nodes outside the dashed-green trust boundary; six numbered crossings labelled on edges</text>
+
+  <!-- ====================== LLM (untrusted, top) ====================== -->
+  <g>
+    <rect x="240" y="60" width="280" height="74" rx="8" ry="8" fill="#fff0f0" stroke="#c33" stroke-width="2"/>
+    <text x="380" y="82" text-anchor="middle" font-weight="bold">LLM provider</text>
+    <text x="380" y="98" text-anchor="middle" font-size="11">Anthropic / OpenAI / Kimi / MiniMax</text>
+    <text x="380" y="112" text-anchor="middle" font-size="10" fill="#555" font-style="italic">curious-but-passive; sees every prompt + tool result</text>
+    <text x="380" y="126" text-anchor="middle" font-size="10" fill="#555" font-style="italic">UNTRUSTED</text>
+  </g>
+
+  <!-- ====================== Trust boundary subgraph ====================== -->
+  <!-- dashed-green rounded rectangle -->
+  <rect x="40" y="180" width="680" height="660" rx="14" ry="14"
+        fill="none" stroke="#1a7f37" stroke-width="3" stroke-dasharray="10 5"/>
+  <text x="56" y="200" font-size="11" font-weight="bold" fill="#1a7f37">Trust boundary (Safe-Bridge)</text>
+
+  <!-- Agent node -->
+  <g>
+    <rect x="240" y="220" width="280" height="64" rx="8" ry="8" fill="#f0fff4" stroke="#1a7f37" stroke-width="2"/>
+    <text x="380" y="242" text-anchor="middle" font-weight="bold">Agent</text>
+    <text x="380" y="258" text-anchor="middle" font-size="11">src/agent.py — optimisation loop</text>
+    <text x="380" y="274" text-anchor="middle" font-size="10" fill="#555">JSON contract; repair-prompt retries; empty-diff guard</text>
+  </g>
+
+  <!-- Python whitelist layer -->
+  <g>
+    <rect x="60" y="320" width="300" height="120" rx="8" ry="8" fill="#f0fff4" stroke="#1a7f37" stroke-width="2"/>
+    <text x="210" y="342" text-anchor="middle" font-weight="bold">Python whitelist layer</text>
+    <text x="210" y="358" text-anchor="middle" font-size="11">safe_bridge.py</text>
+    <text x="70" y="378" font-size="10">• allowed_params + regex (L2300–2346)</text>
+    <text x="70" y="394" font-size="10">• _NAME_RE (L34) on every lib/cell/instance</text>
+    <text x="70" y="410" font-size="10">• 17-name SKILL entrypoint allow-list (L125–176)</text>
+    <text x="70" y="426" font-size="10">• Inline-upload contained to skill/ (L2021–2024)</text>
+  </g>
+
+  <!-- Scrubber -->
+  <g>
+    <rect x="400" y="320" width="300" height="120" rx="8" ry="8" fill="#fff7d6" stroke="#9a6700" stroke-width="2"/>
+    <text x="550" y="342" text-anchor="middle" font-weight="bold">Return-path scrubber</text>
+    <text x="550" y="358" text-anchor="middle" font-size="11">_scrub (L255–277) · scrub() (L280–290)</text>
+    <text x="410" y="378" font-size="10">• _FOUNDRY_LEAK_RE → &lt;redacted&gt; (L80–83)</text>
+    <text x="410" y="394" font-size="10">• abs / UNC paths → &lt;path&gt; (L84–95)</text>
+    <text x="410" y="410" font-size="10">• _strip_model_info (L2282–2291)</text>
+    <text x="410" y="426" font-size="10">• op-point key whitelist (L41–56)</text>
+  </g>
+
+  <!-- RAMIC bridge -->
+  <g>
+    <rect x="240" y="480" width="280" height="64" rx="8" ry="8" fill="#f0fff4" stroke="#1a7f37" stroke-width="2"/>
+    <text x="380" y="502" text-anchor="middle" font-weight="bold">RAMIC TCP bridge</text>
+    <text x="380" y="518" text-anchor="middle" font-size="11">localhost:65061 (virtuoso-bridge-lite)</text>
+    <text x="380" y="534" text-anchor="middle" font-size="10" fill="#555">JSON-over-TCP; in-process to Cadence host</text>
+  </g>
+
+  <!-- SKILL whitelist layer -->
+  <g>
+    <rect x="60" y="580" width="640" height="110" rx="8" ry="8" fill="#f0fff4" stroke="#1a7f37" stroke-width="2"/>
+    <text x="380" y="602" text-anchor="middle" font-weight="bold">SKILL whitelist layer</text>
+    <text x="380" y="618" text-anchor="middle" font-size="11">skill/safe*.il wrappers (re-validated on the Cadence side)</text>
+    <text x="380" y="638" text-anchor="middle" font-size="10">safeReadSchematic[Deep] · safeReadOpPoint[AfterTran] · safeOceanRun · safeOceanDumpAll · safeOceanTCross</text>
+    <text x="380" y="654" text-anchor="middle" font-size="10">safeMaeWriteAndSave · safeGenerateSpecScaffold · safeSetParam · safePatchNetlistIC</text>
+    <text x="380" y="674" text-anchor="middle" font-size="10" fill="#555" font-style="italic">strips model + foundry-cell names before serialising results</text>
+  </g>
+
+  <!-- Cadence DB + Maestro -->
+  <g>
+    <rect x="240" y="730" width="280" height="74" rx="8" ry="8" fill="#e7f0ff" stroke="#1f4eaa" stroke-width="2"/>
+    <text x="380" y="752" text-anchor="middle" font-weight="bold">Cadence DB + Maestro</text>
+    <text x="380" y="768" text-anchor="middle" font-size="11">Virtuoso IC23.1 session</text>
+    <text x="380" y="784" text-anchor="middle" font-size="10" fill="#555">in-memory schematic + simulator state</text>
+    <text x="380" y="798" text-anchor="middle" font-size="10" fill="#555" font-style="italic">PDK bytes loaded here, never serialised out</text>
+  </g>
+
+  <!-- ====================== PDK (untrusted, bottom-right outside boundary) ====================== -->
+  <g>
+    <rect x="540" y="880" width="200" height="120" rx="8" ry="8" fill="#fff0f0" stroke="#c33" stroke-width="2"/>
+    <text x="640" y="902" text-anchor="middle" font-weight="bold">Foundry PDK</text>
+    <text x="640" y="920" text-anchor="middle" font-size="11">BSIM4 / BSIM-CMG model cards</text>
+    <text x="640" y="936" text-anchor="middle" font-size="11">process stack</text>
+    <text x="640" y="952" text-anchor="middle" font-size="11">proprietary cell library</text>
+    <text x="640" y="976" text-anchor="middle" font-size="10" fill="#555" font-style="italic">NDA-bound</text>
+    <text x="640" y="992" text-anchor="middle" font-size="10" fill="#555" font-style="italic">never crosses the boundary</text>
+  </g>
+
+  <!-- ====================== Edges with numbered crossings ====================== -->
+
+  <!-- (1) LLM → Agent : tool call (JSON) -->
+  <line x1="380" y1="134" x2="380" y2="216" stroke="#c33" stroke-width="2" marker-end="url(#ahr)"/>
+  <circle cx="400" cy="175" r="11" fill="#fff" stroke="#c33" stroke-width="2"/>
+  <text x="400" y="179" text-anchor="middle" font-size="10" font-weight="bold" fill="#c33">1</text>
+  <text x="412" y="170" font-size="10" fill="#555">tool call (JSON)</text>
+
+  <!-- (6) Agent → LLM : redacted JSON result (return path) -->
+  <line x1="350" y1="216" x2="350" y2="134" stroke="#1a7f37" stroke-width="2" marker-end="url(#ahg)"/>
+  <circle cx="330" cy="175" r="11" fill="#fff" stroke="#1a7f37" stroke-width="2"/>
+  <text x="330" y="179" text-anchor="middle" font-size="10" font-weight="bold" fill="#1a7f37">6</text>
+  <text x="246" y="170" font-size="10" fill="#555">redacted JSON</text>
+
+  <!-- Agent → Python WL -->
+  <line x1="320" y1="284" x2="240" y2="316" stroke="#333" stroke-width="1.5" marker-end="url(#ah)"/>
+  <text x="240" y="304" font-size="10" fill="#555">validated call</text>
+
+  <!-- Python WL → Scrubber (internal: scrubbing applied to return values) -->
+  <line x1="360" y1="380" x2="400" y2="380" stroke="#333" stroke-width="1.5" marker-end="url(#ah)"/>
+
+  <!-- Scrubber → Agent (return) -->
+  <line x1="500" y1="316" x2="440" y2="284" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ahg)"/>
+  <text x="460" y="306" font-size="10" fill="#555">scrubbed result</text>
+
+  <!-- (2) Python WL → RAMIC : allow-listed SKILL expr -->
+  <line x1="210" y1="440" x2="320" y2="478" stroke="#333" stroke-width="1.5" marker-end="url(#ah)"/>
+  <circle cx="240" cy="468" r="11" fill="#fff" stroke="#333" stroke-width="2"/>
+  <text x="240" y="472" text-anchor="middle" font-size="10" font-weight="bold">2</text>
+  <text x="60" y="468" font-size="10" fill="#555">allow-listed SKILL expr</text>
+
+  <!-- Scrubber ← RAMIC (return path through scrubber on the way up) -->
+  <line x1="440" y1="478" x2="540" y2="440" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ahg)"/>
+  <text x="540" y="468" font-size="10" fill="#555">JSON response</text>
+
+  <!-- (3) RAMIC → SKILL WL : TCP payload -->
+  <line x1="380" y1="544" x2="380" y2="576" stroke="#333" stroke-width="1.5" marker-end="url(#ah)"/>
+  <circle cx="404" cy="560" r="11" fill="#fff" stroke="#333" stroke-width="2"/>
+  <text x="404" y="564" text-anchor="middle" font-size="10" font-weight="bold">3</text>
+  <text x="418" y="556" font-size="10" fill="#555">TCP payload (localhost)</text>
+
+  <!-- SKILL WL → RAMIC (return) -->
+  <line x1="345" y1="576" x2="345" y2="546" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ahg)"/>
+  <text x="260" y="566" font-size="10" fill="#555">filtered JSON</text>
+
+  <!-- (4) SKILL WL → Cadence DB : scoped query -->
+  <line x1="380" y1="690" x2="380" y2="726" stroke="#333" stroke-width="1.5" marker-end="url(#ah)"/>
+  <circle cx="404" cy="710" r="11" fill="#fff" stroke="#333" stroke-width="2"/>
+  <text x="404" y="714" text-anchor="middle" font-size="10" font-weight="bold">4</text>
+  <text x="418" y="706" font-size="10" fill="#555">scoped read / scoped write</text>
+
+  <!-- Cadence ← SKILL WL (return) -->
+  <line x1="345" y1="726" x2="345" y2="692" stroke="#1a7f37" stroke-width="1.5" marker-end="url(#ahg)"/>
+  <text x="262" y="716" font-size="10" fill="#555">raw result</text>
+
+  <!-- (5) Cadence DB ↔ PDK : referenced but not serialised -->
+  <path d="M 520 770 Q 580 830 580 880" fill="none" stroke="#c33" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ahr)"/>
+  <path d="M 600 880 Q 560 830 520 790" fill="none" stroke="#c33" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#ahr)"/>
+  <circle cx="612" cy="828" r="11" fill="#fff" stroke="#c33" stroke-width="2"/>
+  <text x="612" y="832" text-anchor="middle" font-size="10" font-weight="bold" fill="#c33">5</text>
+  <text x="540" y="858" font-size="10" fill="#555" font-style="italic">PDK referenced in-process</text>
+  <text x="540" y="872" font-size="10" fill="#555" font-style="italic">(content stays inside Cadence)</text>
+
+  <!-- ====================== Legend ====================== -->
+  <g transform="translate(40,870)">
+    <rect x="0" y="0" width="220" height="150" rx="6" ry="6" fill="#ffffff" stroke="#999" stroke-width="1"/>
+    <text x="110" y="18" text-anchor="middle" font-weight="bold" font-size="11">Legend</text>
+
+    <rect x="10" y="28" width="18" height="12" fill="#fff0f0" stroke="#c33" stroke-width="1.5"/>
+    <text x="34" y="38" font-size="10">untrusted (LLM, PDK)</text>
+
+    <rect x="10" y="48" width="18" height="12" fill="#f0fff4" stroke="#1a7f37" stroke-width="1.5"/>
+    <text x="34" y="58" font-size="10">trusted (Safe-Bridge components)</text>
+
+    <rect x="10" y="68" width="18" height="12" fill="#fff7d6" stroke="#9a6700" stroke-width="1.5"/>
+    <text x="34" y="78" font-size="10">scrubber (filter node)</text>
+
+    <rect x="10" y="88" width="18" height="12" fill="#e7f0ff" stroke="#1f4eaa" stroke-width="1.5"/>
+    <text x="34" y="98" font-size="10">Cadence session</text>
+
+    <line x1="10" y1="116" x2="34" y2="116" stroke="#1a7f37" stroke-width="3" stroke-dasharray="6 3"/>
+    <text x="40" y="120" font-size="10">trust boundary</text>
+
+    <circle cx="20" cy="136" r="8" fill="#fff" stroke="#333" stroke-width="1.5"/>
+    <text x="20" y="140" text-anchor="middle" font-size="9" font-weight="bold">n</text>
+    <text x="34" y="140" font-size="10">numbered crossing (1–6)</text>
+  </g>
+</svg>

@@ -1,0 +1,44 @@
+# Pricing snapshot for MLCAD 2026 paper USD/run column.
+# Snapshot date: 2026-05-01
+# Rates are USD per 1M tokens (input / output). Reasoning tokens are
+# billed at the output rate per each vendor's documented policy.
+# Sources: vendor public pricing pages as of paper submission.
+#
+# DRAFT — paper_writer assembled from public rates current at the
+# 2026-05-01 snapshot date. Cross-check vendor pages before final
+# camera-ready.
+
+vendors:
+  claude-opus-4-7:
+    input_per_m: 15.00
+    output_per_m: 75.00
+  claude-sonnet-4-6:
+    input_per_m: 3.00
+    output_per_m: 15.00
+  claude-haiku-4-5:
+    input_per_m: 0.80
+    output_per_m: 4.00
+  gpt-5.5:
+    input_per_m: 1.25
+    output_per_m: 10.00
+  gpt-5.4-mini:
+    input_per_m: 0.25
+    output_per_m: 2.00
+  gemini-2.5-pro:
+    input_per_m: 1.25
+    output_per_m: 10.00
+  kimi-k2.5:
+    input_per_m: 0.60
+    output_per_m: 2.50
+  minimax-m2.7:
+    input_per_m: 0.30
+    output_per_m: 1.20
+  mimo-v2.5-pro:
+    input_per_m: 0.50
+    output_per_m: 1.50
+  deepseek-v4-pro:
+    input_per_m: 0.27
+    output_per_m: 1.10
+  deepseek-v4-flash:
+    input_per_m: 0.07
+    output_per_m: 0.28

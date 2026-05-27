@@ -1,0 +1,66 @@
+%% sec/intro.tex — §1 Introduction
+%% Source: paper/sec1_intro_v3.md (md remains source of truth)
+
+\section{Introduction}
+\label{sec:intro}
+
+Large language models are now active participants in analog sizing
+loops, calling SPICE simulators and revising netlists across
+iterations~\cite{analogcoder,adollm,eesizer,anaflow,ledro,autosizer,analogsage}.
+Reported success rates on open-PDK benchmarks such as
+AnalogGym~\cite{analoggym} are encouraging, and
+EEsizer~\cite{eesizer} has begun to look at multi-LLM evaluation on
+six basic circuits. Two practical questions, however, remain
+unanswered as a \emph{conjunction}: \textbf{(i)~which LLM should a
+team pick under a token budget when running against a real
+industrial PDK?}---no prior work pairs multi-LLM evaluation with
+industrial-node deployment, cost--quality Pareto analysis,
+\emph{and} per-LLM failure-mode taxonomy; and \textbf{(ii)~is
+domestic-China LLM inference industrially viable for analog
+sizing?}---to our knowledge zero published work evaluates Moonshot,
+MiniMax, Xiaomi, or DeepSeek on this workload.
+
+Concurrent work AnalogAgent~\cite{analogagent} addresses a related
+NDA constraint \emph{orthogonally} via on-premise tiny open-weight
+models (Qwen3 1.7B--14B); we address the deployment-economics
+constraint via an eleven-checkpoint cost--quality Pareto on a real
+industrial PDK. The two stories bracket the industrial-deployment
+design space.
+
+We present an eleven-LLM benchmark for industrial-node analog
+sizing running on \textbf{Safe-Bridge}, a verifiable NDA-safe
+wrapper around the PC\,$\leftrightarrow$\,remote-host SKILL IPC
+channel that ensures no foundry content reaches any cloud LLM. The
+eleven checkpoints span seven vendor families across two countries
+(6~US: Anthropic Opus~4.7 / Sonnet~4.6 / Haiku~4.5, OpenAI
+GPT-5.5 / GPT-5.4-mini, Google Gemini~2.x; 5~China: Moonshot
+Kimi~K2.5, MiniMax~M2.7, Xiaomi MiMo~v2.5-pro, DeepSeek V4-pro /
+V4-flash). The workload is LC\_VCO\_20GHz; an OpAmp testbench is
+the in-revision hook. The four-vendor China-frontier cohort turns
+domestic-China viability from a single anecdote into a cross-vendor
+pattern.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item \textbf{SP1.}~Safe-Bridge---the verifiable NDA-safe
+    substrate (\S\ref{sec:platform}) that makes SP2 possible on
+    real foundry silicon: four code-anchored scrub layers, five
+    hard invariants, defense-in-depth audit methodology.
+  \item \textbf{SP2 (headline).}~An eleven-LLM industrial-node
+    analog-sizing benchmark (\S\ref{sec:methodology}--\S\ref{sec:results}):
+    6~US + 5~China across seven vendor families, identical
+    Safe-Bridge / spec / prompt; only \texttt{-{}-llm} differs.
+  \item \textbf{SP3.}~Cost--quality Pareto
+    (\S\ref{sec:results}) with a labelled reasoning-token premium
+    sub-section---the sharpest single numerical observation in the
+    paper.
+  \item \textbf{SP4.}~Failure-mode taxonomy and cross-vendor
+    domestic-China LLM viability
+    (\S\ref{sec:failures}--\S\ref{sec:discussion}): a
+    four-China-frontier-vendor cohort rather than a single point
+    estimate.
+\end{itemize}
+
+\S\ref{sec:related}--\S\ref{sec:conclusion} cover related work,
+Safe-Bridge, methodology, Pareto results, failure taxonomy,
+domestic-China discussion, and conclusion respectively.

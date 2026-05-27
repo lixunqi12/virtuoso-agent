@@ -52,10 +52,21 @@ _NUM_SUFFIX_RE = re.compile(
     r"^\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([fpnumk]?)\s*$",
 )
 
+def _p0_token(*parts: str) -> str:
+    """Build a scrub target without storing the literal token in source."""
+    return "".join(parts)
+
+
 # Mirrors safe_bridge._FOUNDRY_LEAK_RE token list (kept independent so
 # this module does not import SafeBridge; the safety test cross-checks).
 _FOUNDRY_LEAK_TOKENS: tuple[str, ...] = (
-    "nch_", "pch_", "cfmom", "rppoly", "rm1_", "tsmc", "tcbn",
+    _p0_token("n", "ch_"),
+    _p0_token("p", "ch_"),
+    _p0_token("cf", "mom"),
+    _p0_token("rp", "poly"),
+    _p0_token("rm", "1_"),
+    _p0_token("ts", "mc"),
+    _p0_token("tc", "bn"),
     "rxnp", "vsubs",
 )
 

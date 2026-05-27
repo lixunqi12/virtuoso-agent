@@ -24,6 +24,7 @@ from . import curve_searcher, spec_evaluator
 from .failure_codes import DumpStatus
 from .llm_client import LLMClient
 from .maestro_metric_sync import sync_spec_metrics_to_maestro
+from .maestro_metric_sync import _build_metric_expr as _maestro_metric_expr
 from .maestro_metric_sync import _waveform_expr as _maestro_waveform_expr
 from .maestro_setup import (
     MAESTRO_SETUP_KEYS,
@@ -1590,7 +1591,8 @@ class CircuitAgent:
         Path-2.5 (2026-05-19): spec.md §2 already declares ``signals``,
         ``windows``, and ``metrics`` machine-readably. The agent can
         deterministically translate them into Maestro Outputs Setup rows
-        + the analyses-enable list — no LLM round-trip needed. This
+        using the same metric expressions as the PC evaluator, plus the
+        analyses-enable list — no LLM round-trip needed. This
         helper replaces the prior LLM-emit path that was getting
         corrupted by small-model typos (e.g. haiku-4-5 emitting
         ``outputs: dict`` instead of ``list``, or ``analysis:
@@ -1601,8 +1603,9 @@ class CircuitAgent:
 
             {"analyses": [{"test": ..., "analysis": "tran",
                             "enable": True}],
-             "outputs":  [{"name": ..., "output_type": "expr",
-                            "expr": ..., "test": ...}, ...]}
+             "outputs":  [{"name": ..., "output_type": "",
+                            "expr": "frequency(clip(...))*...",
+                            "test": ...}, ...]}
 
         Empty (``{}``) when the agent has no ``self.eval_block`` —
         callers should fall through to the legacy LLM-emit path in
@@ -1617,6 +1620,7 @@ class CircuitAgent:
             return {}
 
         signals_list = eval_block.get("signals") or []
+        windows = eval_block.get("windows") or {}
         metrics_list = eval_block.get("metrics") or []
 
         signal_by_name: dict[str, dict] = {}
@@ -1632,19 +1636,13 @@ class CircuitAgent:
             name = metric.get("name")
             if not isinstance(name, str) or not name or name in seen_names:
                 continue
-            signal_name = self._metric_source_signal(metric)
-            if signal_name is None:
-                continue
-            signal_entry = signal_by_name.get(signal_name)
-            if signal_entry is None:
-                continue
-            expr = self._maestro_expr_for_signal(signal_entry)
+            expr = _maestro_metric_expr(metric, signal_by_name, windows)
             if expr is None:
                 continue
             outputs.append({
                 "name": name,
                 "test": maestro_test,
-                "output_type": "expr",
+                "output_type": "",
                 "expr": expr,
             })
             seen_names.add(name)

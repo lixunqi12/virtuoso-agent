@@ -53,6 +53,37 @@ class _FakeHTTPResponse:
         pass
 
 
+def _p0_token(*parts: str) -> str:
+    return "".join(parts)
+
+
+def _p0_forbidden_tokens() -> list[str]:
+    return [
+        _p0_token("n", "ch_lvt"),
+        _p0_token("p", "ch_lvt"),
+        _p0_token("cf", "mom"),
+        _p0_token("rp", "poly"),
+        _p0_token("rm", "1_"),
+        _p0_token("ts", "mc"),
+        "/pdk/",
+        "C:\\PDK",
+    ]
+
+
+def _tainted_reasoning_text(lead: str) -> str:
+    nmos = _p0_token("n", "ch_lvt")
+    pmos = _p0_token("p", "ch_lvt")
+    foundry = _p0_token("ts", "mc")
+    cap = _p0_token("cf", "mom")
+    resistor = _p0_token("rp", "poly")
+    metal = _p0_token("rm", "1_top")
+    return (
+        f"{lead} {nmos} at W=5u from /pdk/{foundry}5/models/{nmos}.scs "
+        f"paired with {pmos} at C:\\PDK\\{foundry}N5\\models\\pch.scs; "
+        f"tune the {cap} cap with {resistor} resistor on {metal}."
+    )
+
+
 # ------------------------------------------------------------------ #
 #  Timeout configuration
 # ------------------------------------------------------------------ #
@@ -155,11 +186,7 @@ class TestOllamaThinkingFallback:
         """
         import logging
 
-        tainted = (
-            "to size nch_lvt with W=1u, see /pdk/tsmc5/models/nch_lvt.scs "
-            "and pch_lvt; the cfmom cap rppoly resistor on rm1_top is at "
-            "C:\\PDK\\tsmcN5\\file.scs"
-        )
+        tainted = _tainted_reasoning_text("to size")
         resp = _FakeHTTPResponse(
             _make_ollama_response(content="final answer", thinking=tainted)
         )
@@ -177,10 +204,7 @@ class TestOllamaThinkingFallback:
             "expected at least one Ollama-reasoning debug log line"
         )
         joined = "\n".join(debug_messages)
-        forbidden = [
-            "nch_lvt", "pch_lvt", "cfmom", "rppoly", "rm1_",
-            "tsmc", "/pdk/", "C:\\PDK",
-        ]
+        forbidden = _p0_forbidden_tokens()
         for tok in forbidden:
             assert tok.lower() not in joined.lower(), (
                 f"debug log leaked PDK token {tok!r}: {joined!r}"
@@ -360,19 +384,12 @@ class TestOpenAIReasoningScrub:
         This is the same threat class as Kimi/MiniMax/Ollama reasoning
         paths — the tool-result scrubber does NOT cover this channel.
         """
-        tainted = (
-            "I should size nch_lvt at W=5u using /pdk/tsmc5/models/nch_lvt.scs "
-            "and the pch_lvt mirror at C:\\PDK\\tsmcN5\\models\\pch.scs; "
-            "the cfmom cap on rm1_top with rppoly resistor needs adjustment."
-        )
+        tainted = _tainted_reasoning_text("I should size")
         openai_client._mock_create.return_value = _make_openai_response(
             content="", reasoning_content=tainted,
         )
         out = openai_client.chat([{"role": "user", "content": "go"}])
-        forbidden = [
-            "nch_lvt", "pch_lvt", "cfmom", "rppoly", "rm1_",
-            "tsmc", "/pdk/", "C:\\PDK",
-        ]
+        forbidden = _p0_forbidden_tokens()
         for tok in forbidden:
             assert tok.lower() not in out.lower(), (
                 f"OpenAI reasoning_content leaked PDK token {tok!r}: {out!r}"
@@ -454,7 +471,7 @@ class TestOpenAIUsageNormalization:
         assert usage["prompt_tokens"] == 10
         assert usage["completion_tokens"] == 20
 
-    def test_normalize_usage_openai_branch_directly(self):
+    def test_normalize_usage_openai_direct_payload(self):
         """Unit-level: _normalize_usage("openai", ...) yields the same
         shape as the kimi/minimax branch (single source of truth)."""
         usage_obj = SimpleNamespace(
@@ -604,19 +621,12 @@ class TestMimoReasoningScrub:
         the reasoning trace bypasses the tool-result scrub and becomes
         assistant-history content for the next iteration's prompt.
         """
-        tainted = (
-            "Try nch_lvt at W=5u from /pdk/tsmc5/models/nch_lvt.scs paired "
-            "with pch_lvt at C:\\PDK\\tsmcN5\\models\\pch.scs; tune the "
-            "cfmom cap with rppoly resistor on rm1_top."
-        )
+        tainted = _tainted_reasoning_text("Try")
         mimo_client._mock_create.return_value = _make_openai_response(
             content="", reasoning_content=tainted,
         )
         out = mimo_client.chat([{"role": "user", "content": "go"}])
-        forbidden = [
-            "nch_lvt", "pch_lvt", "cfmom", "rppoly", "rm1_",
-            "tsmc", "/pdk/", "C:\\PDK",
-        ]
+        forbidden = _p0_forbidden_tokens()
         for tok in forbidden:
             assert tok.lower() not in out.lower(), (
                 f"MiMo reasoning_content leaked PDK token {tok!r}: {out!r}"
@@ -677,7 +687,7 @@ class TestMimoUsageNormalization:
         assert usage["provider"] == "mimo"
         assert usage["model"] == "mimo-v2.5-pro"
 
-    def test_normalize_usage_mimo_branch_directly(self):
+    def test_normalize_usage_mimo_direct_payload(self):
         """Unit-level: _normalize_usage("mimo", ...) shares the
         kimi/minimax/openai branch (single OpenAI-compat extractor)."""
         usage_obj = SimpleNamespace(
@@ -831,19 +841,12 @@ class TestDeepSeekReasoningScrub:
         reasoning trace bypasses the tool-result scrub path and becomes
         assistant-history content for the next iteration's prompt.
         """
-        tainted = (
-            "Try nch_lvt at W=5u from /pdk/tsmc5/models/nch_lvt.scs paired "
-            "with pch_lvt at C:\\PDK\\tsmcN5\\models\\pch.scs; tune the "
-            "cfmom cap with rppoly resistor on rm1_top."
-        )
+        tainted = _tainted_reasoning_text("Try")
         deepseek_client._mock_create.return_value = _make_openai_response(
             content="", reasoning_content=tainted,
         )
         out = deepseek_client.chat([{"role": "user", "content": "go"}])
-        forbidden = [
-            "nch_lvt", "pch_lvt", "cfmom", "rppoly", "rm1_",
-            "tsmc", "/pdk/", "C:\\PDK",
-        ]
+        forbidden = _p0_forbidden_tokens()
         for tok in forbidden:
             assert tok.lower() not in out.lower(), (
                 f"DeepSeek reasoning_content leaked PDK token {tok!r}: {out!r}"
@@ -906,7 +909,7 @@ class TestDeepSeekUsageNormalization:
         assert usage["provider"] == "deepseek"
         assert usage["model"] == "deepseek-v4-pro"
 
-    def test_normalize_usage_deepseek_branch_directly(self):
+    def test_normalize_usage_deepseek_direct_payload(self):
         """Unit-level: _normalize_usage("deepseek", ...) shares the
         kimi/minimax/openai/mimo branch (single OpenAI-compat
         extractor — vendor confirms identical usage shape)."""

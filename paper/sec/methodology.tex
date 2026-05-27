@@ -1,0 +1,209 @@
+%% sec/methodology.tex — §4 Benchmark Methodology
+%% Source: paper/sec4_methodology.md
+
+\section{Benchmark Methodology}
+\label{sec:methodology}
+
+\subsection{Workload}
+\label{sec:method-workload}
+
+We evaluate on \textbf{LC\_VCO\_20GHz}, a 20\,GHz inductively-loaded
+differential VCO laid out on a real industrial-node CMOS PDK
+(specific node withheld under NDA; reported in supplementary
+material with metric scales normalised to preserve compliance).
+An additional OpAmp testbench is reported in revision/appendix if
+available before deadline.
+
+\subsection{Spec contract}
+\label{sec:method-spec}
+
+The spec is a YAML metric contract (signals / windows / metrics)
+identical across all eleven LLMs; the seven concrete metrics for
+LC\_VCO\_20G are the machine-readable contract the evaluator
+consumes (Table~\ref{tab:spec}, taken from
+\filename{spec.md:61--88}). The evaluator supports only the simple
+stats \texttt{\{mean, min, max, ptp, rms, mean\_abs, freq\_Hz,
+duty\_pct\}} plus the compound forms
+\texttt{\{ratio, t\_cross\_frac\}}
+(\filename{src/spec\_evaluator.py:104-106}); phase-noise / K\_VCO
+are out of scope for v3. A run \textbf{passes} iff every metric is
+within its \texttt{pass} range; failures classify by which metric
+fell out of range (\texttt{MEASURED\_OUT\_OF\_RANGE}) versus the
+evaluator declaring the measurement infeasible
+(\texttt{UNMEASURABLE}).
+
+\begin{table}[t]
+  \centering
+  \caption{LC\_VCO\_20G spec contract (\filename{spec.md:61--88}).
+    A run passes iff every metric is inside its \texttt{pass}
+    range; \texttt{[null,\ X]} denotes upper-only,
+    \texttt{[X,\ null]} lower-only. The \texttt{sanity} range is
+    the topology-feasibility window outside which the run is
+    classified as a topology-induced FAIL (\S\ref{sec:failures}).}
+  \label{tab:spec}
+  \footnotesize
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{l l l l}
+    \toprule
+    \textbf{Metric} & \textbf{Window} & \textbf{Pass} & \textbf{Sanity} \\
+    \midrule
+    \texttt{f\_osc\_GHz}      & full         & $[19.5,\ 20.5]$    & $[0.1,\ 100]$ \\
+    \texttt{V\_diff\_pp\_V}   & late         & $[0.40,\ \text{null}]$ & $[0,\ 8]$ \\
+    \texttt{V\_cm\_V}         & late         & $[0.70,\ 0.81]$    & $[0,\ 1.6]$ \\
+    \texttt{duty\_cycle\_pct} & late         & $[48,\ 52]$        & $[0,\ 100]$ \\
+    \texttt{amp\_hold\_ratio} & late/early   & $[0.95,\ \text{null}]$ & $[0,\ 3]$ \\
+    \texttt{t\_startup\_ns}   & startup      & $[\text{null},\ 10]$ & $[0,\ 200]$ \\
+    \texttt{I\_core\_uA}      & late         & $[\text{null},\ 800]$ & $[0,\ 10000]$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Protocol}
+\label{sec:method-protocol}
+
+For each (LLM, run-seed) tuple the agent runs the same Safe-Bridge
+configuration, the same prompt template, and the same JSON tool
+contract; only the \texttt{-{}-llm} flag differs across cells of the
+matrix. Each run iterates until either (i)~the spec evaluator
+reports first-pass, or (ii)~a stuck-streak guard (no design-vector
+change across 3 successive iterations) aborts, or (iii)~an
+iteration budget cap of $N$ (resolved per pilot) is reached. The eleven
+checkpoints span seven vendor families---Anthropic Opus 4.7 /
+Sonnet 4.6 / Haiku 4.5 (US), OpenAI GPT-5.5 / GPT-5.4-mini (US),
+Google Gemini 2.x (US), Moonshot Kimi K2.5 (China),
+MiniMax M2.7 (China), Xiaomi MiMo v2.5-pro (China), DeepSeek
+V4-pro / V4-flash (China)---drawn from a six-US + five-China split
+(\S\ref{sec:platform-threat}).
+
+\subsection{Seed handling and labelling}
+\label{sec:method-seed}
+
+Each run uses a replicate key from $\{1, 2, 3\}$
+(\filename{scripts/run\_benchmark.py:94});
+\filename{build\_subprocess\_cmd}
+(\filename{scripts/run\_benchmark.py:187-217}) does not pass the
+seed to \filename{run\_agent.py} or any API request. The spec
+contract is byte-for-byte identical across LLMs, so seed acts
+purely as a replicate label, not as a prompt or sampling-API
+input.
+
+\subsection{Repetition and variance}
+\label{sec:method-rep}
+
+Each LLM is run for at least \textbf{three independent seeds} per
+cell of the matrix (more for LLMs identified as noisy in pilot).
+Reported quantities are \textbf{median + interquartile range
+(IQR)}, not best-of; single-run reports are flagged as such in
+\S\ref{sec:results}. The $11\times\geq 3$ floor is 33 runs minimum.
+
+\subsection{Three-axis scrub-audit methodology}
+\label{sec:method-audit}
+
+Every scrub-coverage regression test asserts on three independent
+axes simultaneously: (a)~\textbf{records-present} (expected log
+record emitted at expected level); (b)~\textbf{forbidden-tokens-%
+absent} (every PDK-token set member absent from emitted text);
+(c)~\textbf{scrub-marker-present}
+(\texttt{<redacted>} / \texttt{<path>} marker present, confirming
+the scrubber ran rather than the leak path being unreachable in
+the test fixture). A single negative assertion (``token absent'')
+false-positives when the log line is never emitted; the three-axis
+pattern catches that failure mode. Canonical implementation:
+\filename{test\_debug\_log\_scrubs\_thinking\_pdk\_tokens}
+(\filename{tests/test\_llm\_client.py:147--190}); reasoning-trace
+scrub call sites at \filename{llm\_client.py}
+L339, L431, L533, L636, L742, L810, L818
+(Kimi / MiniMax / OpenAI / MiMo / DeepSeek / Ollama-debug /
+Ollama-fallback respectively).
+
+\subsection{Metric definitions}
+\label{sec:method-metrics}
+
+\begin{table}[t]
+  \centering
+  \caption{Headline metric definitions (Table~2).}
+  \label{tab:metrics}
+  \footnotesize
+  \begin{tabularx}{\linewidth}{l X}
+    \toprule
+    \textbf{Metric} & \textbf{Definition} \\
+    \midrule
+    Success rate & Fraction of runs reaching all-metric-pass
+      ($\in[0,1]$); reported as median across seeds. \\
+    Iter-to-converge & Iteration count of first all-metric-pass
+      ($\infty$ if never). \\
+    Input tokens & Sum across all turns; per-vendor counter as
+      documented in each provider's SDK. \\
+    Output tokens & Sum across turns; for OpenAI excludes
+      \texttt{reasoning\_tokens}; for Kimi / MiniMax / MiMo /
+      DeepSeek excludes \texttt{reasoning\_content} (Anthropic /
+      Gemini accounting is input + output + total only in v3, see
+      \S\ref{sec:results-premium} caveat). \\
+    Reasoning tokens & Broken out separately for vendors whose API
+      surfaces them on the current \filename{\_normalize\_usage}
+      schema (\filename{src/llm\_client.py:21-80}); Anthropic /
+      Gemini reasoning-token usage is \textbf{not currently
+      tracked} and is flagged as a v3 limitation in
+      \S\ref{sec:results-premium} / \S\ref{sec:conclusion}. \\
+    USD per run & Tokens $\times$ public pricing as of
+      \textbf{2026-05-01}; pricing table in appendix; reasoning
+      tokens billed at the documented per-vendor rate for vendors
+      with tracked reasoning-token counts. \\
+    Wall-clock / iter & Median over completed iterations; excludes
+      rate-limit / 429 retry waits, separately reported. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Threats to validity}
+\label{sec:method-threats}
+
+We enumerate the four primary validity threats reviewers most
+often raise on benchmark papers, each with our intended response in
+\S\ref{sec:results}--\S\ref{sec:discussion}:
+
+\begin{enumerate}
+  \item \textbf{Single-circuit scope.} Generalisation to other
+    analog topologies is unproven. We state this up-front and use
+    the ``OpAmp in revision/appendix'' hook
+    (\S\ref{sec:method-workload}) to flag the open problem without
+    promising a result we have not yet measured.
+
+  \item \textbf{Pricing drift.} Public per-token pricing changes;
+    we pin all USD figures to a single 2026-05-01 pricing snapshot,
+    with the raw token counts also reported so re-pricing under
+    future tariffs is straightforward.
+
+  \item \textbf{Rate-limit / 429 noise.} Inflates wall-clock for
+    cost-floor LLMs (Haiku 4.5, GPT-5.4-mini, DeepSeek V4-flash,
+    MiMo v2.5-pro) asymmetrically. We separate rate-limit wait time
+    from compute wall-clock and report both.
+
+  \item \textbf{Reasoning-token accounting per-vendor differences.}
+    Kimi, MiniMax, OpenAI, MiMo, and DeepSeek all return an
+    OpenAI-compatible usage shape;
+    \filename{\_normalize\_usage} reads the
+    \texttt{completion\_tokens\_details.reasoning\_tokens}
+    sub-field and surfaces it as the dedicated
+    \texttt{reasoning\_tokens} counter
+    (\filename{src/llm\_client.py:47-59}). The associated
+    \texttt{reasoning\_content} \emph{text} (assistant reasoning
+    trace, distinct from the usage counter) is the
+    scrubbed-fallback path handled separately at the per-vendor
+    reply sites (per-vendor reply sites enumerated in
+    \S\ref{sec:method-audit}). Anthropic's thinking-token accounting
+    (\texttt{cache\_creation\_input\_tokens} /
+    \texttt{cache\_read\_input\_tokens}) and Gemini's
+    \texttt{thinking}-block usage are \textbf{not currently
+    captured} by \filename{\_normalize\_usage}
+    (\filename{src/llm\_client.py:42-63}); the Anthropic and
+    Gemini rows of the \S\ref{sec:results-premium} premium table
+    are therefore marked unavailable, with a schema extension
+    flagged in \S\ref{sec:conclusion}.
+
+\end{enumerate}
+
+\noindent Additional threats (provider-side caching,
+cohort-selection bias, prompt-template optimality,
+sampling-parameter standardisation) are discussed in the
+supplementary appendix.

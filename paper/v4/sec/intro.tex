@@ -1,0 +1,151 @@
+%% v4/sec/intro.tex — §1 Introduction (TODAES long-form, post Round-19 pivot)
+%%
+%% Status (2026-05-16): Round-19 unlock — leader authorised §1 draft
+%% (motivation + positioning sentence + C1-C6 contribution list).
+%% §2 related-work three-way split is on hold pending dual-reviewer
+%% closure (codex may challenge C1 first-analog claim).
+%%
+%% Target length: ~1.0 page in acmsmall single-column (~450-550 words).
+
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{Setting and gap}
+\label{sec:intro-gap}
+
+Large language models (LLMs) are now active participants in
+electronic-design-automation (EDA) loops. In the digital and
+high-level-synthesis (HLS) domains, recent ACM TODAES work has
+established the template: an LLM proposes a design artefact, an EDA
+tool returns ground-truth feedback (compile pass/fail, synthesis
+metric, simulation trace), and the loop iterates until a contract
+is met. AutoChip~\cite{autochip} drives this pattern for Verilog;
+HLSRewriter~\cite{hlsrewriter}, C2HLSC~\cite{c2hlsc}, and
+LHS~\cite{lhs} carry it through high-level-synthesis;
+ConfiBench~\cite{confibench} adds principled confidence
+benchmarking on top.
+
+The \emph{analog} sizing loop is a natural next target: a SPICE
+simulator already supplies the ground-truth oracle, and recent
+work~\cite{analogcoder,adollm,eesizer,anaflow,ledro,autosizer,analogsage}
+has shown that LLMs can iterate on netlists and revise device sizes.
+Yet to our knowledge no prior work in a TODAES-class venue has
+reported an analog-sizing LLM4EDA system evaluated on a real
+foundry-bound process design kit (PDK). The combination of
+\emph{industrial-node PDK confidentiality} and \emph{multi-vendor
+frontier-LLM coverage} is the gap we close.
+
+\subsection{Practical questions left unanswered}
+\label{sec:intro-questions}
+
+Three practical questions remain unanswered---the first two
+constitute the headline conjunction; the third is the orthogonal
+deployment-gate that any answer to (Q1)/(Q2) must clear.
+
+\textbf{(Q1) Cost--quality choice.} Which LLM should a deployment
+team pick under a token budget when running against a real
+industrial PDK? Reported success rates on open benchmarks such as
+AnalogGym~\cite{analoggym} cluster near saturation across many
+checkpoints; the discriminating signal moves to dollars per run.
+EEsizer~\cite{eesizer} took the first multi-LLM step but on
+Ngspice-level open PDKs, with no cost--quality Pareto and no
+per-LLM failure taxonomy.
+
+\textbf{(Q2) Domestic-China viability.} Is domestic-China frontier
+LLM inference (Moonshot, MiniMax, Xiaomi, DeepSeek) industrially
+viable for analog sizing? To our knowledge zero published work
+evaluates any of these four vendors on this workload, let alone all
+four as a cohort.
+
+\textbf{(Q3) PDK confidentiality (orthogonal gate).} Industrial
+deployment is gated by an NDA that forbids foundry content from
+leaving the controlled host. Concurrent work
+AnalogAgent~\cite{analogagent} solves this by restricting inference
+to small on-premise open-weight models (Qwen3 1.7B--14B). We take
+the complementary path: admit any cloud LLM, prevent PDK content
+from ever crossing the trust boundary. The two stories bracket the
+industrial-deployment design space.
+
+\subsection{This work}
+\label{sec:intro-thiswork}
+
+We present an eleven-LLM benchmark for industrial-node analog
+sizing running on \textbf{Safe-Bridge}, a verifiable NDA-safe
+wrapper around the PC\,$\leftrightarrow$\,remote-host SKILL IPC
+channel. The eleven checkpoints span seven vendor families across
+two countries: 6~US (Anthropic Opus~4.7 / Sonnet~4.6 / Haiku~4.5,
+OpenAI GPT-5.5 / GPT-5.4-mini, Google Gemini~2.x) and 5~China
+(Moonshot Kimi~K2.5, MiniMax~M2.7, Xiaomi MiMo~v2.5-pro, DeepSeek
+V4-pro / V4-flash). The headline workload is LC\_VCO\_20\,GHz on a
+foundry-bound PDK; an OpAmp transferability study (\S\ref{sec:methodology})
+corroborates the platform on a second circuit topology. The
+four-vendor China-frontier cohort turns domestic-China viability
+from a single anecdote into a cross-vendor pattern.
+
+\paragraph{Positioning.}
+To our knowledge, this is the first NDA-safe, industrial-PDK,
+eleven-LLM analog sizing benchmark in a TODAES-class venue,
+extending prior LLM4EDA work (AutoChip~\cite{autochip},
+HLSRewriter~\cite{hlsrewriter}, C2HLSC~\cite{c2hlsc},
+LHS~\cite{lhs}, ConfiBench~\cite{confibench}) from the digital and
+HLS domains into the analog / SPICE-loop domain under realistic
+foundry-PDK confidentiality constraints. Concurrent TODAES analog
+work AMSnet-KG~\cite{amsnetkg} targets open-PDK netlist
+auto-design via knowledge-graph RAG; the two efforts occupy
+orthogonal niches---dataset / retrieval methodology on open
+substrate versus deployment substrate and cross-vendor evaluation
+on closed substrate.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item \textbf{C1.}~First NDA-safe, closed-loop, industrial-PDK
+    analog sizing benchmark comparing eleven LLM checkpoints under
+    a scrubbed Safe-Bridge interface in ACM TODAES, extending the
+    AutoChip / HLSRewriter / C2HLSC / LHS / ConfiBench digital-EDA
+    precedents into the analog / SPICE-loop domain. Concurrent
+    TODAES analog work AMSnet-KG~\cite{amsnetkg} targets open-PDK
+    netlist auto-design via knowledge-graph RAG and is orthogonal
+    along the NDA-PDK, scrub-substrate, and cross-vendor-cohort
+    axes.
+  \item \textbf{C2.}~\emph{Safe-Bridge} (\S\ref{sec:platform};
+    overview in \S\ref{sec:overview}): a verifiable NDA-safe
+    substrate for cloud-LLM-driven analog design on a real foundry
+    PDK---code-anchored four-scrub-layer architecture with
+    three-axis audit methodology, packaged in
+    \S\ref{sec:reproducibility} as a reusable pattern for any
+    LLM4EDA effort that must respect foundry NDA.
+  \item \textbf{C3.}~An eleven-checkpoint industrial-node benchmark
+    (\S\ref{sec:methodology}) spanning seven vendor families across
+    two countries: the only cross-vendor cohort to evaluate frontier
+    domestic-China LLM inference (Moonshot, MiniMax, Xiaomi,
+    DeepSeek) on industrial analog sizing.
+  \item \textbf{C4.}~A cost--quality Pareto with a labelled
+    \emph{reasoning-token premium} sub-section
+    (\S\ref{sec:results})---the sharpest single quantitative
+    finding, characterising practitioner under-budgeting by
+    $r/(1{-}r)$ for vendors that bill hidden reasoning tokens.
+  \item \textbf{C5.}~An eight-bucket failure-mode taxonomy with
+    per-LLM cross-vendor data (\S\ref{sec:failures}), moving
+    beyond pass/fail headlines to characterise \emph{how} each
+    vendor's behaviour breaks down at the margin.
+  \item \textbf{C6.}~A reproducibility / artifact contribution
+    (\S\ref{sec:reproducibility}): full software artifact
+    structure, scrub-rule format, and replication recipe enabling
+    future analog LLM4EDA evaluations on closed industrial PDKs.
+\end{itemize}
+
+\paragraph{Roadmap.}
+\S\ref{sec:related} surveys related work across three clusters
+(LLM for digital EDA, classical analog optimization, PDK-safe LLM
+tooling). \S\ref{sec:overview} gives a one-figure system overview
+of the agent loop, Safe-Bridge, and the spec-contract framework.
+\S\ref{sec:platform} treats Safe-Bridge in depth: threat model,
+four scrub layers, hard invariants, three-axis audit methodology.
+\S\ref{sec:methodology} describes the benchmark methodology, the
+eleven-checkpoint matrix, and threats to validity.
+\S\ref{sec:results} reports the cost--quality Pareto and the
+reasoning-token premium. \S\ref{sec:failures} presents the failure
+taxonomy. \S\ref{sec:discussion} discusses cross-vendor
+domestic-China viability. \S\ref{sec:reproducibility} packages the
+artefact and replication recipe. \S\ref{sec:conclusion} concludes
+and lists future work.

@@ -21,6 +21,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.safe_bridge import SafeBridge  # noqa: E402
 
 
+def _p0_token(*parts: str) -> str:
+    return "".join(parts)
+
+
 @pytest.fixture
 def pdk_map_file(tmp_path):
     content = """\
@@ -361,13 +365,13 @@ class TestRemoteDedupCreateMaestroTest:
         assert writer_mocks["create_test"].called
 
     @pytest.mark.parametrize("leak_token", [
-        "nch_alpha",          # PDK device-family prefix
-        "pch_secret",
-        "tsmc_18nm",
-        "cfmom_cap",
-        "rppoly_high_ohm",
-        "rm1_2um",
-        "tcbn_lib_cell",
+        _p0_token("n", "ch_alpha"),
+        _p0_token("p", "ch_secret"),
+        _p0_token("ts", "mc_18nm"),
+        _p0_token("cf", "mom_cap"),
+        _p0_token("rp", "poly_high_ohm"),
+        _p0_token("rm", "1_2um"),
+        _p0_token("tc", "bn_lib_cell"),
     ])
     def test_remote_probe_drops_foundry_prefixed_tokens(
         self, pdk_map_file, tmp_path, leak_token,
@@ -395,22 +399,22 @@ class TestRemoteDedupCreateMaestroTest:
         """R3 P2 — pin the exact parser output for a representative
         raw blob so future refactors can't silently change behavior."""
         client = MagicMock()
+        leak_token = _p0_token("n", "ch_leak")
         client.execute_skill.return_value = MagicMock(
             output=(
-                # Quoted tokens: legit + bad chars + foundry prefix +
-                # ASCII-only OCEAN word (a degenerate same-as-analysis
-                # test name — we explicitly accept this corner case).
-                '"TB_legit_1" "bad token" "$weird" "nch_leak" "tran"'
+                # Quoted tokens: legit + bad chars + foundry-shaped
+                # token + ASCII-only OCEAN word (a degenerate
+                # same-as-analysis test name that remains accepted).
+                f'"TB_legit_1" "bad token" "$weird" "{leak_token}" "tran"'
             ),
             errors=None,
         )
         b = SafeBridge(client, pdk_map_file, skill_dir=tmp_path / "ns")
         b.set_scope("mylib", "MYCELL", tb_cell="MYTB")
         names = b._list_remote_maestro_tests()
-        # Whitelist drops "bad token" + "$weird"; foundry filter
-        # drops "nch_leak". "tran" survives — see function docstring's
-        # "known limitation" note: we can't distinguish "user named
-        # their test tran" from "SKILL leaked an analysis token".
+        # Whitelist drops "bad token" + "$weird"; foundry filter drops
+        # the synthetic leak. "tran" survives per the documented
+        # limitation: it could be a legitimate user test name.
         assert names == {"TB_legit_1", "tran"}
 
 

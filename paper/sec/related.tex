@@ -1,0 +1,86 @@
+%% sec/related.tex — §2 Related Work
+%% Source: paper/sec2_related_v3.md
+
+\section{Related Work}
+\label{sec:related}
+
+Recent LLM-driven analog design work clusters by what the LLM is
+asked to do. \textbf{Designer cluster:} AnalogCoder~\cite{analogcoder}
+and AnalogCoder-Pro~\cite{analogcoderpro} frame analog design as
+code generation from spec---complementary to our work, which
+assumes a foundry-bound schematic already exists. \textbf{Optimizer /
+sizer cluster (closest):} ADO-LLM~\cite{adollm} couples Bayesian
+optimization with LLM-proposed in-context demonstrations.
+EEsizer~\cite{eesizer} runs a ReAct closed loop over Ngspice across
+eight commercial LLMs. AnaFlow~\cite{anaflow} is a four-agent
+explainable workflow on BSIM 45\,nm predictive models.
+LEDRO~\cite{ledro} uses an LLM to shrink TuRBO's search box. Two
+concurrent 2025--2026 papers extend the SOTA:
+AutoSizer~\cite{autosizer} benchmarks reflective multi-agent
+meta-optimization across 24 circuits;
+AnalogSAGE~\cite{analogsage} adds stratified memory and experience
+replay. \textbf{Benchmark cluster:} AnalogGym~\cite{analoggym} is
+the de-facto open benchmark suite; our spec evaluator borrows its
+YAML-metric idiom but binds it to a closed industrial PDK.
+
+\textbf{AnalogAgent}~\cite{analogagent} is the only prior work that
+explicitly targets NDA-constrained deployment. They solve it by
+restricting inference to tiny on-premise Qwen3 1.7B--14B open-weight
+models. Safe-Bridge takes the \emph{complementary} approach: admit
+any cloud LLM, prevent PDK content from ever crossing the trust
+boundary. The two stories bracket the industrial-deployment design
+space.
+
+\paragraph{Differentiation (Table~\ref{tab:relwork}).}
+EEsizer is the prior system that goes furthest on raw checkpoint
+count (eight commercial LLMs), but its eight are all
+Western-frontier and it does not develop a cost--quality Pareto or
+per-LLM failure taxonomy. AnalogAgent evaluates four checkpoints
+but they are all Qwen3-family on-prem tiny models, not cloud
+frontier. No prior system evaluates a single China-frontier cloud
+LLM, let alone four. Our row is the \emph{only} one that is \yes\
+across the conjunction of multi-LLM evaluation, China-frontier
+vendor coverage, cost--quality Pareto, industrial PDK, per-LLM
+failure taxonomy, and verifiable NDA-safe substrate simultaneously.
+
+%% --- Table 1: Differentiation matrix (table* = full column width) ---
+\begin{table*}[t]
+  \centering
+  \caption{Differentiation matrix recast around the SP2 multi-LLM
+    benchmark contribution. ``\yes'' = primary contribution along
+    this axis; ``\partyes'' = mentioned but not primary; ``\no'' =
+    not addressed; ``\na'' = orthogonal (AnalogGym is a benchmark
+    suite, not an agent).}
+  \label{tab:relwork}
+  \small
+  \begin{tabular}{l c c c c c c}
+    \toprule
+    \textbf{System} & \makecell{\textbf{\#}\\\textbf{Ckpts}} & \makecell{\textbf{China-}\\\textbf{frontier}} & \makecell{\textbf{Cost--quality}\\\textbf{Pareto}} & \makecell{\textbf{Industrial}\\\textbf{PDK}} & \makecell{\textbf{Failure}\\\textbf{tax.}} & \makecell{\textbf{NDA-safe}\\\textbf{substrate}} \\
+    \midrule
+    ADO-LLM~\cite{adollm}              & 1     & 0   & \no & \no & \no       & \no \\
+    EEsizer~\cite{eesizer}             & 8$^*$ & 0   & \no & \no & \no       & \no \\
+    AnaFlow~\cite{anaflow}             & 2     & 0   & \no & \no & \partyes  & \no \\
+    LEDRO~\cite{ledro}                 & 1     & 0   & \no & \no & \no       & \no \\
+    AnalogCoder~\cite{analogcoder}     & 3     & 0   & \no & \no & \no       & \no \\
+    AutoSizer~\cite{autosizer}         & 3     & 0   & \no & \no & \no       & \no \\
+    AnalogSAGE~\cite{analogsage}       & 1     & 0   & \no & \no & \no       & \no \\
+    AnalogAgent~\cite{analogagent}     & 4$^{**}$ & 0 & \no & \no & \no      & \yes \\
+    AnalogGym~\cite{analoggym}         & \na   & \na & \na & \partyes & \na  & \no \\
+    \midrule
+    \textbf{Ours (Safe-Bridge benchmark)} & \textbf{11} & \textbf{4} & \yes & \yes & \yes & \yes \\
+    \bottomrule
+  \end{tabular}
+  \\[0.4em]
+  \begin{minipage}{0.95\linewidth}\footnotesize
+  $^*$EEsizer's 8 commercial LLMs are all Western-frontier (no
+  China-frontier vendor); they do not develop a cost--quality
+  Pareto or per-LLM failure taxonomy.
+  $^{**}$AnalogAgent's 4 are Qwen3 1.7B--14B on-prem tiny
+  models---not a frontier-cloud-LLM evaluation; their NDA-safe
+  \yes\ is via on-prem isolation (complementary, not competitive,
+  to our cloud-LLM-with-filter path).
+  \textbf{Ours.} 4 China-frontier vendors $=$ Moonshot Kimi~K2.5,
+  MiniMax~M2.7, Xiaomi MiMo~v2.5-pro, DeepSeek V4-pro/flash;
+  NDA-safe via filter path.
+  \end{minipage}
+\end{table*}

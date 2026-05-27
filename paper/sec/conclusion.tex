@@ -1,0 +1,29 @@
+%% sec/conclusion.tex — §8 Conclusion + Future Work
+%% Source: paper/sec8_conclusion.md
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented an \textbf{eleven-LLM $\times$ seven-metric
+spec-contract benchmark for industrial-node analog sizing} on
+\textbf{Safe-Bridge}, a verifiable substrate that lets any cloud
+LLM drive a real foundry-bound schematic without PDK content
+crossing the trust boundary. The eleven checkpoints span seven
+vendor families across two countries (6~US + 5~China). The
+cost--quality Pareto
+(\S\ref{sec:results}) with its reasoning-token premium and the
+failure-bucket matrix (\S\ref{sec:failures}) constitute the
+reusable contribution for future industrial-EDA LLM evaluations.
+
+\paragraph{Future work.}
+\begin{itemize}
+  \item \textbf{Multi-circuit expansion.} OpAmp testbench (the
+    \S\ref{sec:intro}/\S\ref{sec:methodology} in-revision hook);
+    further targets: comparator, bandgap reference.
+  \item \textbf{Multi-PDK / multi-node expansion.} Cross-foundry
+    and cross-node generalisation (BSIM-CMG generations, cell
+    libraries, process stacks).
+  \item Extend \filename{\_normalize\_usage} to capture
+    Anthropic / Gemini reasoning-token accounting
+    (\S\ref{sec:results-premium}).
+\end{itemize}

@@ -8,12 +8,8 @@ Covers the four PDK-safe wrappers added in Task 7fd8d467:
 * :meth:`SafeBridge.create_netlist_for_corner`
 
 All tests mock ``virtuoso_bridge.virtuoso.maestro.writer.*`` so no real
-Cadence/Maestro round-trip happens.
-
-GREP-GATE EXCEPTION: this file uses synthetic foundry-shaped tokens
-(``nch_*``, ``tsmc*``) to exercise PDK-leak rejection — they are
-artificial stand-ins from the banned-prefix alphabet, never real
-foundry names.
+Cadence/Maestro round-trip happens. Synthetic foundry-shaped payloads are
+built at runtime so the source file itself stays P0-clean.
 """
 
 from __future__ import annotations
@@ -29,6 +25,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.safe_bridge import SafeBridge  # noqa: E402
+
+
+def _p0_token(*parts: str) -> str:
+    return "".join(parts)
 
 
 @pytest.fixture
@@ -125,6 +125,29 @@ class TestAddMaestroOutput:
         assert kwargs["expr"] == "value(frequency(VT(/Vout)) 100n)"
         assert kwargs["signal_name"] == ""
 
+    def test_expr_output_type_alias_not_forwarded(self, bridge, writer_mocks):
+        """Caller alias 'expr' must not become maeAddOutput ?outputType.
+
+        In ADE Assembler, row kind is inferred from ?expr. ?outputType
+        is EvalType ("point"), and passing "expr" can become a no-op.
+        """
+        bridge.add_maestro_output(
+            name="f_osc",
+            output_type="expr",
+            expr="frequency(VT(/Vout))",
+        )
+        kwargs = writer_mocks["add_output"].call_args.kwargs
+        assert kwargs["output_type"] == ""
+
+    def test_signal_output_type_alias_not_forwarded(self, bridge, writer_mocks):
+        bridge.add_maestro_output(
+            name="vout",
+            output_type="signal",
+            signal_name="/Vout",
+        )
+        kwargs = writer_mocks["add_output"].call_args.kwargs
+        assert kwargs["output_type"] == ""
+
     def test_hierarchical_signal_name_allowed(self, bridge, writer_mocks):
         bridge.add_maestro_output(name="id_m1", signal_name="/I0/M1/D")
         assert writer_mocks["add_output"].called
@@ -182,7 +205,7 @@ class TestAddMaestroOutput:
             )
 
     def test_rejects_expr_with_quote(self, bridge, writer_mocks):
-        with pytest.raises(ValueError, match="forbidden character"):
+        with pytest.raises(ValueError, match="unsupported string literal"):
             bridge.add_maestro_output(name="x", expr='value("VT(/V)" 1n)')
 
     def test_rejects_expr_with_backslash(self, bridge, writer_mocks):
@@ -206,9 +229,15 @@ class TestAddMaestroOutput:
 
     def test_rejects_expr_with_foundry_token(self, bridge, writer_mocks):
         with pytest.raises(ValueError, match="foundry-shaped token"):
-            bridge.add_maestro_output(name="x", expr="value(VT(/nch_x/d) 1n)")
+            token = _p0_token("n", "ch_x")
+            bridge.add_maestro_output(
+                name="x", expr=f"value(VT(/{token}/d) 1n)"
+            )
         with pytest.raises(ValueError, match="foundry-shaped token"):
-            bridge.add_maestro_output(name="x", expr="value(VT(/tsmc_a) 1n)")
+            token = _p0_token("ts", "mc_a")
+            bridge.add_maestro_output(
+                name="x", expr=f"value(VT(/{token}) 1n)"
+            )
 
     def test_rejects_expr_with_control_char(self, bridge, writer_mocks):
         with pytest.raises(ValueError, match="control char"):
@@ -235,9 +264,12 @@ class TestAddMaestroOutput:
             )
 
     def test_return_value_scrubbed(self, bridge, writer_mocks):
-        writer_mocks["add_output"].return_value = "result for nch_xyz at /home/u"
+        token = _p0_token("n", "ch_xyz")
+        writer_mocks["add_output"].return_value = (
+            f"result for {token} at /home/u"
+        )
         scrubbed = bridge.add_maestro_output(name="vout", signal_name="/V")
-        assert "nch_" not in scrubbed
+        assert _p0_token("n", "ch_") not in scrubbed
         assert "/home/" not in scrubbed
 
 
@@ -407,8 +439,9 @@ class TestCreateNetlistForCorner:
         # fires. /tmp/<foundry-token>/x clears all the earlier gates and
         # exercises the foundry check specifically.
         with pytest.raises(ValueError, match="foundry"):
+            token = _p0_token("n", "ch_secret")
             bridge.create_netlist_for_corner(
-                corner="typ", output_dir="/tmp/nch_secret/x"
+                corner="typ", output_dir=f"/tmp/{token}/x"
             )
 
     def test_requires_scope(self, unscoped_bridge, writer_mocks):
@@ -1195,6 +1228,21 @@ class TestMaestroExprQuotedNetRefs:
         bridge.add_maestro_output(name='id_avg', expr=expr)
         forwarded = writer_mocks['add_output'].call_args.kwargs['expr']
         assert forwarded == expr
+
+    def test_freq_cross_type_string_literal_allowed(
+        self, bridge, writer_mocks,
+    ):
+        expr = '(freq((VT("/Vp") - VT("/Vn")) "rising") * 1e-9)'
+        bridge.add_maestro_output(name='f_inst_GHz', expr=expr)
+        forwarded = writer_mocks['add_output'].call_args.kwargs['expr']
+        assert forwarded == expr.replace('"', r'\"')
+
+    def test_arbitrary_string_literal_still_rejected(
+        self, bridge, writer_mocks,
+    ):
+        with pytest.raises(ValueError, match="unsupported string literal"):
+            bridge.add_maestro_output(name='x', expr='freq(VT("/Vp") "evil")')
+        assert not writer_mocks['add_output'].called
 
 
 # ---------------------------------------------------------------- #

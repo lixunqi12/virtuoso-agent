@@ -1,0 +1,116 @@
+%% paper/v4/main.tex — TODAES long-form scaffold (v4, post Round-19 pivot)
+%%
+%% Venue: ACM TODAES journal long-form (14-25 pp)
+%% Class: acmart acmsmall,review (per Round-19 leader ruling Q4)
+%% Status (2026-05-16): §1, §3-§8, §10 live after Phase-1 mechanical
+%%   carry (task 91240545). §2 stays not-input until Phase-1 §2.1/2.2/2.3
+%%   restructure; §9 reproducibility section pending Phase-2 authoring.
+%%
+%% Build chain (MiKTeX 26.2 portable):
+%%   pdflatex main.tex
+%%   bibtex   main
+%%   pdflatex main.tex
+%%   pdflatex main.tex
+%%
+%% NB: refs.bib is shared with paper/refs.bib via relative path
+%%   (..\refs) — no duplication. Same for shared figures.
+
+\documentclass[acmsmall,review,anonymous]{acmart}
+
+%% ---------- Packages (mirrored from paper/main.tex) ----------
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{rotating}
+\usepackage{makecell}
+\usepackage{xcolor}
+\usepackage{pifont}
+\usepackage{amsmath}
+\usepackage{mathtools}
+\usepackage{microtype}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage[normalem]{ulem}
+\usepackage{tikz}
+\usetikzlibrary{decorations.pathreplacing}
+\usepackage{graphicx}
+\usepackage[textsize=footnotesize,linecolor=red!50,backgroundcolor=red!10,bordercolor=red!50]{todonotes}
+
+%% Search paths so we can reuse paper/figs and paper/refs.bib without copy.
+\graphicspath{{../figs/}{./figs/}}
+
+%% ---------- Convenience macros (mirrored) ----------
+\newcommand{\yes}{\ding{51}}
+\newcommand{\no}{\ding{55}}
+\newcommand{\partyes}{\textit{partial}}
+\newcommand{\na}{\textit{n/a}}
+\newcommand{\tbdsix}{\textcolor{red}{\textsf{\scriptsize[TBD-D6]}}}
+\newcommand{\tbdeight}{\textcolor{red}{\textsf{\scriptsize[TBD-D8]}}}
+\newcommand{\tbdcell}{\textit{TBD}}
+\newcommand{\filename}[1]{\texttt{#1}}
+
+%% ---------- ACM metadata (anonymous review build) ----------
+\settopmatter{printacmref=false,printccs=false,printfolios=true}
+
+%% ---------- Title / author / abstract ----------
+\title{Six US + Five China Frontier LLMs vs.\ an Industrial Analog Sizing Task:\\
+A Cost--Quality Pareto Study on a Foundry-Bound PDK}
+
+\author{Anonymous Author(s)}
+\affiliation{%
+  \institution{Submission \#TBD}
+  \city{}\country{}}
+\email{anonymous@submission}
+
+\renewcommand{\shortauthors}{Anonymous}
+
+\begin{document}
+
+\begin{abstract}
+We present the first NDA-safe, industrial-PDK, eleven-LLM analog
+sizing benchmark in ACM TODAES, extending prior LLM4EDA work in the
+digital and high-level-synthesis domains (AutoChip~\cite{autochip},
+HLSRewriter~\cite{hlsrewriter}, C2HLSC~\cite{c2hlsc},
+LHS~\cite{lhs}, ConfiBench~\cite{confibench}) into the analog /
+SPICE-loop domain under realistic foundry-PDK confidentiality
+constraints; concurrent TODAES analog work
+AMSnet-KG~\cite{amsnetkg} targets open-PDK netlist auto-design via
+knowledge-graph RAG and is orthogonal to our scrubbed-cloud-LLM
+deployment substrate. We introduce \emph{Safe-Bridge}, a
+verifiable NDA-safe substrate that lets any cloud LLM drive a real
+foundry-bound schematic without PDK content crossing the trust
+boundary, and use it to run an eleven-checkpoint industrial-node
+benchmark spanning seven vendor families across two countries
+(6~US + 5~China). We report a cost--quality Pareto across the
+checkpoints, a labelled \emph{reasoning-token premium} sharp
+observation, and an eight-bucket failure-mode taxonomy. The
+methodology contribution---multi-LLM benchmark on a closed
+industrial PDK with three-axis scrub-audit rigor---is documented
+in a dedicated reproducibility section as a reusable pattern for
+future analog (and adjacent EDA) LLM4EDA evaluations.
+\end{abstract}
+
+\keywords{LLM agents, analog circuit sizing, EDA benchmarks,
+NDA-safe deployment, cost--quality Pareto, LLM4EDA}
+
+\maketitle
+
+%% ---------- Body ----------
+%% Live sections (Phase-1 mechanical-carry unlock, task 91240545):
+\input{sec/intro}
+%% \input{sec/related}   % §2 — stays not-input until Phase-1 §2.1/2.2/2.3 restructure (leader ruling 2026-05-16)
+\input{sec/overview}
+\input{sec/platform}
+\input{sec/methodology}
+\input{sec/results}
+\input{sec/failures}
+\input{sec/discussion}
+%% \input{sec/reproducibility} % §9 — Phase-2 authoring (NEW for TODAES, not mechanical-carry territory)
+\input{sec/conclusion}
+
+%% ---------- Bibliography (shared with paper/refs.bib) ----------
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{../refs}
+
+\end{document}

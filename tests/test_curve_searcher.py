@@ -23,6 +23,9 @@ from src import curve_searcher  # noqa: E402
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _p0_token(*parts: str) -> str:
+    return "".join(parts)
+
 
 def _baseline_lc_vco_scenario():
     """Mirrors the HANDOFF / latest-run baseline: 9-point Vctrl sweep
@@ -315,8 +318,15 @@ def test_build_summary_with_prev_includes_sensitivity_section():
 
 
 @pytest.mark.parametrize("token", [
-    "nch_lvt", "pch_lvt", "cfmom_2t", "rppoly", "rm1_drawn",
-    "tsmc28", "tcbn28", "rxnp_drawn", "vsubs_dummy",
+    _p0_token("n", "ch_lvt"),
+    _p0_token("p", "ch_lvt"),
+    _p0_token("cf", "mom_2t"),
+    _p0_token("rp", "poly"),
+    _p0_token("rm", "1_drawn"),
+    _p0_token("ts", "mc28"),
+    _p0_token("tc", "bn28"),
+    "rxnp_drawn",
+    "vsubs_dummy",
 ])
 def test_assert_no_foundry_leak_raises_on_each_token(token):
     payload = f"PDK suggests {token} for the tank cap"

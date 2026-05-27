@@ -483,8 +483,8 @@ def test_validate_rejects_bool_in_sweep_points():
 def test_lc_vco_range_target_is_compatible_with_kvco_cap():
     """Keep the LC_VCO example physically consistent.
 
-    With a 0.8 V control sweep and a hard 1500 MHz/V segment-slope cap,
-    the required total frequency coverage cannot exceed 1.2 GHz.
+    With a 0.8 V control sweep and a hard 2000 MHz/V segment-slope cap,
+    the required total frequency coverage cannot exceed 1.6 GHz.
     """
     text = (
         REPO / "projects" / "lc_vco_base" / "constraints" / "spec.md"
@@ -507,7 +507,7 @@ def test_lc_vco_range_target_is_compatible_with_kvco_cap():
 def test_spec_md_baseline_matches_documented_verdict():
     """The §6.3 baseline table claims:
         tuning_range_GHz=3.76 PASS
-        Kvco_MHz_per_V    FAIL (8000 exceeds 1500 upper)
+        Kvco_MHz_per_V    FAIL (8000 exceeds configured upper)
         Kvco_linearity    FAIL (table reports 30.3)
         monotonic         PASS (strictly up)
     Spec values are rounded to 2 dp so our exact float won't match

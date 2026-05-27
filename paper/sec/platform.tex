@@ -1,0 +1,149 @@
+%% sec/platform.tex — §3 Platform: Safe-Bridge
+%% Source: paper/sec3_platform.md
+
+\section{Platform: Safe-Bridge}
+\label{sec:platform}
+
+\subsection{Trust boundary and threat actor}
+\label{sec:platform-threat}
+
+The benchmark runs across eleven cloud LLM endpoints drawn from
+seven provider families, with six US-based and five China-based
+checkpoints (full per-provider list at
+\S\ref{sec:method-protocol}). Following
+the v2 threat-model framing, we treat every such provider as
+\textbf{curious-but-passive}: it sees every prompt and every
+tool-result string we hand it, may log or train on that traffic,
+and can craft tool-call arguments designed to exfiltrate foundry
+content via its own sandbox---but is not assumed to mount active
+man-in-the-middle attacks against the Cadence host. Active MITM,
+OS-level insider threat, and direct PDK theft are out of scope.
+The protected asset is foundry NDA-bound PDK content in three
+forms: BSIM4 / BSIM-CMG model parameters, process-stack layer
+data, and proprietary cell topology and naming.
+
+Beyond the trust-boundary mechanics, of the eleven checkpoints,
+the five OpenAI-compatible vendors
+(Moonshot Kimi K2.5, MiniMax M2.7, OpenAI GPT-5.5 / GPT-5.4-mini,
+Xiaomi MiMo v2.5-pro, DeepSeek V4-pro / V4-flash) surface
+per-iteration \texttt{reasoning\_tokens} via
+\texttt{completion\_tokens\_details}; the Anthropic and Gemini
+families do not in v3 (see \S\ref{sec:method-threats} Threat~4).
+
+\subsection{Architecture --- Fig.~\ref{fig:arch}}
+\label{sec:platform-arch}
+
+Figure~\ref{fig:arch} shows the Safe-Bridge topology: a Python
+agent process calls a \filename{safe\_bridge.py} wrapper that talks
+to Cadence Virtuoso IC23.1 over the \texttt{virtuoso-bridge-lite}
+RAMIC TCP channel on \texttt{localhost:65061}. Six numbered
+crossings mark the trust boundary---tool call, allow-listed SKILL
+expression, TCP payload, scoped query, PDK reference, redacted
+return.
+
+\begin{figure}[h]
+  \centering
+  %% NB: figs/safe_bridge_arch.svg must be converted to PDF/PNG
+  %% before pdflatex build. See repo: paper/figs/safe_bridge_arch.svg.
+  \includegraphics[width=0.6\linewidth]{figs/safe_bridge_arch}
+  \caption{Safe-Bridge topology and six numbered trust-boundary
+    crossings. The verifiable NDA-safe substrate that enables the
+    \S\ref{sec:methodology} benchmark.}
+  \label{fig:arch}
+\end{figure}
+
+\subsection{Four scrub layers}
+\label{sec:platform-scrub}
+
+Safe-Bridge inserts four defense layers, each labelled on
+Fig.~\ref{fig:arch}:
+
+\begin{enumerate}
+  \item \textbf{Python parameter-name whitelist + identifier /
+    numeric-literal regex.}
+    \filename{\_is\_allowed\_param\_name}
+    (\filename{safe\_bridge.py:2310-2356}) admits only the
+    per-project YAML allow-list (defaulted to
+    \texttt{[w, l, nf, m, multi, wf, r, c, nfin, fingers, idc, vdc]}),
+    passing \filename{\_SAFE\_PARAM\_NAME\_RE}
+    (\filename{safe\_bridge.py:186}) and never
+    \filename{\_FOUNDRY\_LEAK\_RE}. A complementary numeric-atom
+    regex (\filename{safe\_bridge.py:35-37}) blocks SKILL injection
+    at the value boundary.
+
+  \item \textbf{20-name SKILL entrypoint allow-list (Cadence side).}
+    \filename{\_ALLOWED\_SKILL\_ENTRYPOINTS}
+    (\filename{safe\_bridge.py:125-176}); arbitrary
+    \texttt{load() / hiOpenLib / dbOpenCellViewByType} rejected at
+    \filename{\_check\_skill\_entrypoint}
+    (\filename{safe\_bridge.py:2149-2212}). Nested-call grep
+    extends the guarantee to embedded subexpressions; only the
+    pure data-constructor \texttt{list} is whitelisted as a
+    nested call (\filename{\_ALLOWED\_SKILL\_NESTED},
+    \filename{safe\_bridge.py:181}).
+
+  \item \textbf{Return-path scrubber.}
+    \filename{\_scrub} (\filename{safe\_bridge.py:255-277})
+    applies \filename{\_FOUNDRY\_LEAK\_RE}'s foundry-token deny-list
+    and absolute-path regexes to every string field of every SKILL
+    return value (15 anchored return sites) before it crosses back to
+    the agent loop.
+
+  \item \textbf{Reasoning-trace scrub.}
+    \texttt{reasoning\_content} / \texttt{thinking} is scrubbed at
+    every LLM-client sink (per-vendor reply sites enumerated in
+    \S\ref{sec:method-audit}) via the shared \filename{scrub} wrapper
+    (\filename{safe\_bridge.py:280-290}) before the trace re-enters
+    conversation history.
+\end{enumerate}
+
+\subsection{Five hard invariants (summary)}
+\label{sec:platform-invariants}
+
+Five composable invariants---PDK-token redaction, parameter-name
+whitelist, SKILL-entrypoint allow-list (with nested-call
+extension), inline-upload directory containment, and op-point key
+whitelist (\filename{\_SAFE\_OP\_POINT\_KEYS},
+\filename{safe\_bridge.py:41-56})---collectively close the
+trust-boundary tiers summarised in Table~\ref{tab:tiers}, so a
+misconfigured \texttt{allowed\_params} cannot reopen a closed
+channel; per-invariant code anchors are in the supplementary
+appendix.
+
+\subsection{Trust-boundary status}
+\label{sec:platform-status}
+
+\begin{table}[t]
+  \centering
+  \caption{Trust-boundary tier status under the
+    curious-but-passive threat model. Tiers~1--3 (replay) are
+    enforced by the four scrub layers
+    (\S\ref{sec:platform-scrub}) and five composable invariants
+    (\S\ref{sec:platform-invariants}); first-emission and
+    side-channel coverage are out of scope.}
+  \label{tab:tiers}
+  \footnotesize
+  \begin{tabular}{c l l}
+    \toprule
+    \textbf{Tier} & \textbf{Attack class} & \textbf{Status} \\
+    \midrule
+    1 & Naive prompt injection            & enforced \\
+    2 & Schema / SKILL injection          & enforced \\
+    3 & Reasoning-trace re-entry (replay) & enforced$^{\dagger}$ \\
+    3 & Reasoning-trace first-emission    & out of scope \\
+    4 & Timing / error-class side channel & partial \\
+    \bottomrule
+  \end{tabular}
+  \\[0.3em]
+  \begin{minipage}{0.95\linewidth}\footnotesize
+  $^{\dagger}$Replay closed via scrub layer~4,
+  \S\ref{sec:platform-scrub}.
+  \end{minipage}
+\end{table}
+
+The first-emission row remains out of scope under the
+curious-but-passive model---provider-side request logs capture
+unscrubbed reasoning bytes on first emission, but we do not claim
+coverage of near-active providers. Closing it requires a hash-only
+thinking channel or fully on-prem inference
+(\S\ref{sec:conclusion} future work).

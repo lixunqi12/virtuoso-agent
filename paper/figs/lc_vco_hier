@@ -1,0 +1,39 @@
+# Hierarchical schematic: GENERIC_PDK/LC_VCO
+Depth reached: 0 (cap: 49)
+
+## Root (ROOT, depth=0)
+### Instances
+- **M9** (GENERIC_PDK/NMOS_SVT): nfin=20, m=1, multi=1, l=76.0n, w=922.00n, fingers=nfin_cc
+  Connections: G->Vout_p, D->Ctrl, S->Ctrl, B->Ctrl
+- **M4** (GENERIC_PDK/NMOS_SVT): nfin=20, fingers=nfin_cc, w=922.00n, l=76.0n, multi=1, m=1
+  Connections: G->Vout_n, D->Ctrl, S->Ctrl, B->Ctrl
+- **M3** (GENERIC_PDK/NMOS_SVT): nfin=3, fingers=nfin_mirror, w=106.00n, l=20n, multi=1, m=1
+  Connections: G->net3, D->net3, S->gnd!, B->gnd!
+- **M2** (GENERIC_PDK/NMOS_SVT): w=106.00n, fingers=nfin_tail, l=20n, multi=1, m=1, nfin=3
+  Connections: G->net3, D->net1, S->gnd!, B->gnd!
+- **M1** (GENERIC_PDK/NMOS_SVT): nfin=3, fingers=nfin_neg, m=1, multi=1, l=20n, w=106.00n
+  Connections: G->Vout_p, D->Vout_n, S->net1, B->net1
+- **M0** (GENERIC_PDK/NMOS_SVT): w=106.00n, fingers=nfin_neg, nfin=3, m=1, multi=1, l=20n
+  Connections: G->Vout_n, D->Vout_p, S->net1, B->net1
+- **I0** (GENERIC_PDK/ISRC): idc=Ibias
+  Connections: PLUS->VDD, MINUS->net3
+- **C1** (GENERIC_PDK/IDEAL_CAP): c=C
+  Connections: MINUS->Vout_p, PLUS->VDD
+- **C0** (GENERIC_PDK/IDEAL_CAP): c=C
+  Connections: MINUS->Vout_n, PLUS->VDD
+- **L1** (GENERIC_PDK/IND): l=L
+  Connections: MINUS->Vout_p, PLUS->VDD
+- **L0** (GENERIC_PDK/IND): l=L
+  Connections: MINUS->Vout_n, PLUS->VDD
+- **R1** (GENERIC_PDK/RESISTOR): r=R
+  Connections: MINUS->Vout_p, PLUS->VDD
+- **R0** (GENERIC_PDK/RESISTOR): r=R
+  Connections: MINUS->Vout_n, PLUS->VDD
+- **V0** (GENERIC_PDK/VSRC): vdc=800.0m
+  Connections: PLUS->VDD, MINUS->gnd!
+- **V1** (GENERIC_PDK/VSRC): vdc=0
+  Connections: PLUS->Ctrl, MINUS->gnd!
+
+### Pins
+- Vout_p (output)
+- Vout_n (output)

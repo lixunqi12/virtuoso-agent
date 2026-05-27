@@ -1,0 +1,100 @@
+%% sec/failures.tex — §6 Failure-Mode Taxonomy
+%% Source: paper/sec6_failures.md
+%% NB: Table 4 frequency cells are TBD-from-D8 placeholders.
+
+\section{Failure-Mode Taxonomy}
+\label{sec:failures}
+
+\subsection{Reframe --- bucket matrix, not case studies}
+\label{sec:failures-reframe}
+
+We reframe \S\ref{sec:failures} as an \textbf{11 LLM $\times$ 1
+failure-probe spec bucket matrix}: a near-saturation variant of
+the LC\_VCO\_20G spec contract that surfaces failure modes
+comparably across vendors. At $\geq 5$ seeds per LLM, this is
+\textbf{55+~runs} separate from the \S\ref{sec:results}
+success-Pareto budget.
+
+\subsection{Failure buckets}
+\label{sec:failures-buckets}
+
+Each failed run classifies into one of eight buckets, ordered by
+the layer at which the failure surfaces:
+
+\begin{description}
+  \item[Empty-diff loop (stuck).] Design vector identical to the
+    previous iteration; 3-iter stuck-streak guard aborts
+    (\S\ref{sec:method-protocol} termination~(ii)).
+  \item[Iteration-budget exhausted (wandering).] Vectors change
+    but no all-metric-pass before \texttt{MAX\_ITER}
+    (termination~(iii)); diagnostic-distinct from stuck
+    (LLM-determinism vs search-strategy).
+  \item[Contract-violation repair termination.] Tool call violates
+    JSON contract; one repair-retry fails; run aborts.
+  \item[\texttt{UNMEASURABLE} saturation.] Evaluator declares one
+    or more metrics infeasible for several iterations running.
+  \item[Topology-induced sanity-range FAIL.] Design vector outside
+    the topology's physically reasonable range (e.g.\ tank
+    inductance below process minimum).
+  \item[PDK-content refusal (red-team probe).] Tool-call argument
+    explicitly requests foundry content; blocked by
+    \S\ref{sec:platform} scrub but counted as a failure event.
+  \item[Reasoning-content replay.] PDK-tainted prior-tool-result
+    content paraphrased inside the thinking channel; redacted
+    re-entry path means no foundry tokens reach history, but the
+    iteration is counted as anomalous (cross-link
+    \S\ref{sec:platform-scrub} Tier~3).
+  \item[Rate-limit / 429 cascade.] Provider rate-limits trip
+    exponential back-off that halts iteration before budget cap.
+\end{description}
+
+\subsection{Bucket $\times$ LLM frequency matrix}
+\label{sec:failures-matrix}
+
+\begin{table*}[t]
+  \centering
+  \caption{Failure-bucket $\times$ LLM frequency matrix on the
+    near-saturation probe spec. All cells are TBD-from-D8 counts;
+    \tbdeight\ resolves the pre-registered hypotheses below.}
+  \label{tab:failmatrix}
+  \tiny
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{l c c c c c c c c c c c}
+    \toprule
+    \textbf{Bucket} & \textbf{Opus} & \textbf{Sonnet} & \textbf{Haiku} & \textbf{GPT-5.5} & \textbf{5.4-mini} & \textbf{Gemini} & \textbf{Kimi} & \textbf{MiniMax} & \textbf{MiMo} & \textbf{DS-pro} & \textbf{DS-flash} \\
+    \midrule
+    Empty-diff loop (stuck)        & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    Budget exhausted (wandering)   & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    Contract-violation repair      & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    \texttt{UNMEASURABLE} saturation & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    Topology sanity-range FAIL     & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    PDK-content refusal probe      & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    Reasoning-content replay       & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    Rate-limit / 429 cascade       & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell & \tbdcell \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
+
+\subsection{Pre-registered hypotheses}
+\label{sec:failures-hypotheses}
+
+We \textbf{pre-register} the following predictions ahead of D8
+data collection; Table~\ref{tab:failmatrix} will be marked
+\yes/\no\ post-D8 independently of the SP3 Pareto findings.
+Pre-registration converts the skeleton-before-data temporal
+asymmetry from a defect into a methodological strength.
+
+\begin{itemize}
+  \item \textbf{H1.} Cost-floor checkpoints (Haiku 4.5,
+    GPT-5.4-mini, DeepSeek V4-flash, MiMo v2.5-pro) will be
+    over-represented in \emph{rate-limit / 429 cascade}.
+  \item \textbf{H2.} Frontier checkpoints (Opus 4.7, GPT-5.5,
+    Gemini 2.x) will be over-represented in
+    \emph{\texttt{UNMEASURABLE} saturation} (deeper push into
+    infeasible regions before giving up).
+  \item \textbf{H3.} \emph{Reasoning-content replay} (closed by
+    the e750189c patch on the re-entry leg) will be rarest on
+    patched checkpoints; whether DeepSeek and MiMo behave
+    equivalently is the open empirical question
+    Table~\ref{tab:failmatrix} answers.
+\end{itemize}

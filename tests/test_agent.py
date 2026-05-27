@@ -1574,7 +1574,7 @@ class TestDeriveMaestroSetupFromSpec:
         }]
 
     def test_outputs_one_entry_per_metric(self):
-        """Snapshot: 5 metrics → 5 outputs; expression matches signal kind."""
+        """Snapshot: 5 metrics -> 5 outputs; expression matches metric math."""
         agent = self._agent(self._lc_vco_spec())
         out = agent._derive_maestro_setup_from_spec("LC_VCO_tb")
         by_name = {o["name"]: o for o in out["outputs"]}
@@ -1583,33 +1583,36 @@ class TestDeriveMaestroSetupFromSpec:
             "f_osc_GHz", "V_diff_pp_V", "V_cm_V",
             "I_core_uA", "amp_hold_ratio",
         ])
-        # Canonical paren'd form (R2 P3 NIT 2): the derive helper now
-        # delegates to ``maestro_metric_sync._waveform_expr`` so derived
-        # and Option-I sync paths emit byte-identical strings.
-        # Vdiff signal → (VT(p) - VT(n))
+        # The derive helper delegates to ``maestro_metric_sync`` so
+        # derived outputs mirror the PC-side evaluator's metric math.
         assert by_name["f_osc_GHz"]["expr"] == (
-            '(VT("/Vout_p") - VT("/Vout_n"))'
+            '(frequency(clip((VT("/Vout_p") - VT("/Vout_n")) '
+            '1e-07 2e-07)) * 1e-09)'
         )
         assert by_name["V_diff_pp_V"]["expr"] == (
-            '(VT("/Vout_p") - VT("/Vout_n"))'
+            'peakToPeak(clip((VT("/Vout_p") - VT("/Vout_n")) '
+            '1.5e-07 2e-07))'
         )
-        # Vsum_half → ((VT(p) + VT(n)) / 2.0)
         assert by_name["V_cm_V"]["expr"] == (
-            '((VT("/Vout_p") + VT("/Vout_n")) / 2.0)'
+            'average(clip(((VT("/Vout_p") + VT("/Vout_n")) / 2.0) '
+            '1.5e-07 2e-07))'
         )
-        # I signal → IT(path)
-        assert by_name["I_core_uA"]["expr"] == 'IT("/I0/M2/D")'
-        # Compound ratio falls back to numerator signal (Vdiff)
+        assert by_name["I_core_uA"]["expr"] == (
+            '(average(abs(clip(IT("/I0/M2/D") 1.5e-07 2e-07))) * '
+            '1000000.0)'
+        )
         assert by_name["amp_hold_ratio"]["expr"] == (
-            '(VT("/Vout_p") - VT("/Vout_n"))'
+            '(rms(clip((VT("/Vout_p") - VT("/Vout_n")) '
+            '1.5e-07 2e-07)) / rms(clip((VT("/Vout_p") - '
+            'VT("/Vout_n")) 7.5e-08 1.25e-07)))'
         )
         # Every output is keyed to the scoped tb_cell as the test.
         for entry in out["outputs"]:
             assert entry["test"] == "LC_VCO_tb"
-            assert entry["output_type"] == "expr"
+            assert entry["output_type"] == ""
 
     def test_v_kind_uses_single_path(self):
-        """A signal of kind V (single ``path``) emits ``VT("/path")``."""
+        """A signal of kind V feeds the metric expression builder."""
         spec = (
             "```yaml\n"
             "signals:\n"
@@ -1623,7 +1626,7 @@ class TestDeriveMaestroSetupFromSpec:
         )
         agent = self._agent(spec)
         out = agent._derive_maestro_setup_from_spec("tb")
-        assert out["outputs"][0]["expr"] == 'VT("/A")'
+        assert out["outputs"][0]["expr"] == 'rms(clip(VT("/A") 0.0 1e-07))'
 
     def test_unknown_signal_kind_skipped_not_crash(self):
         """An unknown ``kind`` produces no output for that metric rather

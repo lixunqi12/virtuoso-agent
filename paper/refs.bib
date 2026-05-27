@@ -1,0 +1,233 @@
+%% refs.bib — Safe-Bridge / 11-LLM benchmark
+%%
+%% Entries are transcribed from paper/sec2_related_v3.md and other
+%% sec*_*.md files. arXiv IDs / venue metadata trust the source .md;
+%% any field marked "TBD" should be filled by hand against the
+%% canonical PDF before camera-ready (D10 typesetting pass).
+%%
+%% Convention:
+%%   - real arXiv ID where the source .md cites one
+%%   - venue + year for conference papers without DOI
+%%   - explicit "TBD: <field>" comment where a field cannot be
+%%     filled without web verification
+%%
+%% Last touched: 2026-05-16 (Crossref + arXiv batch resolution:
+%%   5 TODAES anchors via Crossref, analogcoderpro via WebSearch+arXiv)
+
+%% ============================================================
+%% Designer cluster
+%% ============================================================
+
+@inproceedings{analogcoder,
+  author    = {Lai, {TBD}},
+  title     = {{AnalogCoder}: {LLM}-Based Analog Circuit Code Generation},
+  booktitle = {Proc.\ AAAI Conference on Artificial Intelligence},
+  year      = {2025},
+  note      = {Transcribed from paper/sec2\_related\_v3.md;
+               full author list / DOI TBD}
+}
+
+%% analogcoderpro: Q-mig-4 re-ruled 2026-05-16 to option (c) KEEP +
+%% resolve. Initial REMOVE ruling was based on my (incorrect) audit
+%% premise; once leader's WebSearch + arXiv resolution confirmed this
+%% is a real paper (Yao Lai et al., arXiv:2508.02518, AnalogCoder
+%% follow-up), the entry is restored with full metadata. The §2.2
+%% prose framing risk (Pro overlaps our sizing work — not purely
+%% "complementary code-generation") is logged as Phase-2 reframe in
+%% phase1_carry_decisions.md.
+
+@article{analogcoderpro,
+  author        = {Lai, Yao and Poddar, Souradip and Lee, Sungyoung and Chen, Guojin and Hu, Mengkang and Yu, Bei and Luo, Ping and Pan, David Z.},
+  title         = {{AnalogCoder-Pro}: Unifying Analog Circuit Generation and Optimization via Multi-modal {LLMs}},
+  journal       = {arXiv preprint arXiv:2508.02518},
+  year          = {2025},
+  eprint        = {2508.02518},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AR},
+  url           = {https://arxiv.org/abs/2508.02518},
+  note          = {Code: \url{https://github.com/laiyao1/AnalogCoderPro}}
+}
+
+%% ============================================================
+%% Optimizer / sizer cluster
+%% ============================================================
+
+@inproceedings{adollm,
+  author    = {Yin, {TBD}},
+  title     = {{ADO-LLM}: {LLM}-Aided Bayesian Optimization for Analog Sizing},
+  booktitle = {Proc.\ ACM/IEEE Int.\ Conf.\ on Computer-Aided Design (ICCAD)},
+  year      = {2024},
+  note      = {Transcribed from paper/sec2\_related\_v3.md; full author list / DOI TBD}
+}
+
+@inproceedings{eesizer,
+  author    = {Liu, {TBD}},
+  title     = {{EEsizer}: {LLM}-Driven Analog Transistor Sizing via {ReAct} Loop},
+  booktitle = {Proc.\ IEEE NEWCAS},
+  year      = {2025},
+  note      = {Transcribed from paper/sec2\_related\_v3.md; cites 8 commercial LLMs across 6 basic circuits; full author list / DOI TBD}
+}
+
+@inproceedings{anaflow,
+  author    = {Ahmadzadeh, {TBD} and Gielen, Georges},
+  title     = {{AnaFlow}: A Four-Agent Explainable Analog Workflow on {BSIM} 45\,nm Predictive Models},
+  booktitle = {Proc.\ ACM/IEEE Int.\ Conf.\ on Computer-Aided Design (ICCAD)},
+  year      = {2025},
+  note      = {Transcribed from paper/sec2\_related\_v3.md; full author list / DOI TBD}
+}
+
+@inproceedings{ledro,
+  author    = {Kochar, {TBD}},
+  title     = {{LEDRO}: {LLM}-Aided Search-Box Shrinking for {TuRBO} on Analog Sizing},
+  booktitle = {Proc.\ Int.\ Conf.\ on LLM-Aided Design (ICLAD)},
+  year      = {2025},
+  note      = {Transcribed from paper/sec2\_related\_v3.md; full author list / DOI TBD}
+}
+
+@article{autosizer,
+  author       = {Cheng, {TBD}},
+  title        = {{AutoSizer}: Reflective Multi-Agent Meta-Optimization for Analog Sizing across 24 Circuits},
+  journal      = {arXiv preprint},
+  volume       = {arXiv:2602.02849},
+  year         = {2026},
+  eprint       = {2602.02849},
+  archivePrefix = {arXiv},
+  note         = {arXiv ID transcribed from paper/sec2\_related\_v3.md}
+}
+
+@article{analogsage,
+  author       = {Wang, {TBD}},
+  title        = {{AnalogSAGE}: Stratified Memory + Experience Replay for {LLM}-Driven Analog Sizing},
+  journal      = {arXiv preprint},
+  volume       = {arXiv:2512.22435},
+  year         = {2025},
+  eprint       = {2512.22435},
+  archivePrefix = {arXiv},
+  note         = {arXiv ID transcribed from paper/sec2\_related\_v3.md}
+}
+
+%% ============================================================
+%% Benchmark cluster
+%% ============================================================
+
+@inproceedings{analoggym,
+  author    = {Li, {TBD}},
+  title     = {{AnalogGym}: An Open Benchmark Suite for {LLM}-Driven Analog Sizing},
+  booktitle = {Proc.\ ACM/IEEE Int.\ Conf.\ on Computer-Aided Design (ICCAD)},
+  year      = {2024},
+  note      = {Transcribed from paper/sec2\_related\_v3.md; full author list / DOI TBD}
+}
+
+%% ============================================================
+%% Concurrent TODAES analog work (KG/RAG-augmented cluster)
+%% ============================================================
+%% AMSnet-KG (Crossref-resolved 2026-05-16, DOI 10.1145/3736166).
+%% Concurrent TODAES vol 30(6) 2025 analog LLM4EDA paper from
+%% He Lei lab; targets open-PDK netlist auto-design via KG retrieval
+%% + single LLM. Cited as concurrent + orthogonal to Safe-Bridge:
+%% open PDK / RAG / single LLM vs our NDA-PDK / scrub / 11-ckpt.
+
+@article{amsnetkg,
+  author    = {Shi, Yichen and Tao, Zhuofu and Gao, YuHao and Zhou, Tianjia
+               and Chang, Cheng and Wang, Yaxin and Chen, Bingyu and Zhang, Genhao
+               and Liu, Alvin and Yu, Zhiping and Lin, Ting-Jung and He, Lei},
+  title     = {{AMSnet-KG}: A Netlist Dataset for {LLM}-based {AMS} Circuit
+                Auto-design Using Knowledge Graph {RAG}},
+  journal   = {ACM Transactions on Design Automation of Electronic Systems},
+  year      = {2025},
+  volume    = {30},
+  number    = {6},
+  pages     = {1--37},
+  publisher = {ACM},
+  doi       = {10.1145/3736166}
+}
+
+%% ============================================================
+%% NDA-constrained cluster
+%% ============================================================
+
+@article{analogagent,
+  author       = {Bao, {TBD}},
+  title        = {{AnalogAgent}: On-Premise Tiny Open-Weight {LLM}s for {NDA}-Constrained Analog Design},
+  journal      = {arXiv preprint},
+  volume       = {arXiv:2603.23910},
+  year         = {2026},
+  eprint       = {2603.23910},
+  archivePrefix = {arXiv},
+  note         = {arXiv ID transcribed from paper/sec2\_related\_v3.md; concurrent work targeting NDA-constrained deployment via on-prem Qwen3 1.7B-14B; cited as orthogonal complementary to Safe-Bridge}
+}
+
+%% ============================================================
+%% TODAES LLM4EDA anchors (v4 — Crossref-resolved 2026-05-16)
+%% Five prior LLM4EDA application papers in ACM TODAES, used as
+%% style anchors and positioned in v4 §1 / §2.1 as the precedents
+%% our work extends from digital / HLS into analog / SPICE-loop.
+%% Author lists / titles / volume / number / pages resolved via
+%% Crossref API by leader; cite-strings in prose are system-name
+%% short forms ("AutoChip", "HLSRewriter", etc.) and remain valid
+%% even though canonical titles differ.
+%% ============================================================
+
+@article{autochip,
+  author    = {Blocklove, Jason and Thakur, Shailja and Tan, Benjamin and Pearce, Hammond and Garg, Siddharth and Karri, Ramesh},
+  title     = {Automatically Improving {LLM}-based {Verilog} Generation using {EDA} Tool Feedback},
+  journal   = {ACM Transactions on Design Automation of Electronic Systems},
+  year      = {2025},
+  volume    = {30},
+  number    = {6},
+  pages     = {1--26},
+  publisher = {ACM},
+  doi       = {10.1145/3723876}
+}
+
+@article{hlsrewriter,
+  author    = {Xu, Kangwei and Zhang, Grace Li and Yin, Xunzhao and Zhuo, Cheng and Schlichtmann, Ulf and Li, Bing},
+  title     = {{HLSRewriter}: Efficient Refactoring and Optimization of {C/C++} Code with {LLMs} for High-Level Synthesis},
+  journal   = {ACM Transactions on Design Automation of Electronic Systems},
+  year      = {2026},
+  volume    = {31},
+  number    = {4},
+  pages     = {1--21},
+  publisher = {ACM},
+  doi       = {10.1145/3749986}
+}
+
+@article{c2hlsc,
+  author    = {Collini, Luca and Garg, Siddharth and Karri, Ramesh},
+  title     = {{C2HLSC}: Leveraging Large Language Models to Bridge the Software-to-Hardware Design Gap},
+  journal   = {ACM Transactions on Design Automation of Electronic Systems},
+  year      = {2025},
+  volume    = {30},
+  number    = {6},
+  pages     = {1--24},
+  publisher = {ACM},
+  doi       = {10.1145/3734524}
+}
+
+@article{lhs,
+  author    = {Reddy, E Bhawani Eswar and Bhattacharyya, Sutirtha and Sarmah, Ankur and Nongpoh, Fedrick and Maddala, Karthik and Karfa, Chandan},
+  title     = {{LHS}: {LLM} Assisted Efficient High-level Synthesis of Deep Learning Tasks},
+  journal   = {ACM Transactions on Design Automation of Electronic Systems},
+  year      = {2025},
+  volume    = {30},
+  number    = {6},
+  pages     = {1--27},
+  publisher = {ACM},
+  doi       = {10.1145/3734523}
+}
+
+@article{confibench,
+  author    = {Qiu, Ruidi and Zhang, Grace Li and Drechsler, Rolf and Ho, Tsungyi and Schlichtmann, Ulf and Li, Bing},
+  title     = {{ConfiBench}: Automatic Testbench Generation with Confidence-Based Scenario Mask and Testbench Ensemble using {LLMs} for {HDL} Design},
+  journal   = {ACM Transactions on Design Automation of Electronic Systems},
+  year      = {2025},
+  note      = {Just Accepted, article \textnumero~3773087},
+  publisher = {ACM},
+  doi       = {10.1145/3773087}
+}
+
+%% ============================================================
+%% TBD entries (cited but venue not in v3 .md sources)
+%% ============================================================
+%% None at this revision. If §5/§6 numerical content introduces new
+%% citations during D6-D8 data fill, append here with TBD markers.

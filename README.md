@@ -15,6 +15,10 @@ for the PC ↔ remote-host SKILL IPC channel. virtuoso-agent layers a
 PDK scrub barrier, OCEAN sub-process isolation, spec evaluator, and
 LLM closed-loop control on top of it.
 
+Contributor and agent workflow guidance lives in `AGENTS.md` and
+`docs/agent-workflows.md`. `CLAUDE.md` is only a Claude Code compatibility
+shim.
+
 ---
 
 <a id="zh"></a>

@@ -1,0 +1,82 @@
+;;; _ocean_tuning_extract.ocn — extract f_osc per sweep point.
+;;;
+;;; Invoked by scripts/analyze_tuning_curve.py:
+;;;   setenv VB_TUNING_ROOT   /path/to/Interactive.0
+;;;   setenv VB_TUNING_OUT    /tmp/tuning_curve_<uuid>.json
+;;;   virtuoso -ocean -nograph -restore _ocean_tuning_extract.ocn
+;;;
+;;; Sweep point → Vctrl mapping is hard-coded below (matches the
+;;; existing Interactive.0 9-point sweep against Vctrl ∈ [0, 0.8] V).
+;;; Window 100ns..200ns matches the agreed steady-state observation
+;;; window used by f_osc_GHz output in spec.md.
+
+procedure(vbT_getenvOrDie(name)
+    let((v)
+        v = getShellEnvVar(name)
+        when(or(null(v) and(stringp(v) equal(v "")))
+            fprintf(stderr "[tuning_extract] ERROR: env %s not set\n" name)
+            printf("{\"status\":\"error\",\"msg\":\"missing env %s\"}\n" name)
+            exit(1)
+        )
+        v
+    )
+)
+
+let((root outPath points fh first)
+    root    = vbT_getenvOrDie("VB_TUNING_ROOT")
+    outPath = vbT_getenvOrDie("VB_TUNING_OUT")
+
+    ;; (point_idx Vctrl_V) for the existing 9-point sweep.
+    points = '(
+        (1 0.4)
+        (2 0.0)
+        (3 0.1)
+        (4 0.2)
+        (5 0.3)
+        (6 0.5)
+        (7 0.6)
+        (8 0.7)
+        (9 0.8)
+    )
+
+    fh = outfile(outPath "w")
+    when(null(fh)
+        fprintf(stderr "[tuning_extract] cannot open %s\n" outPath)
+        printf("{\"status\":\"error\",\"msg\":\"cannot open output\"}\n")
+        exit(1)
+    )
+
+    fprintf(fh "{\"points\":[\n")
+    first = t
+
+    foreach(p points
+        let((pidx vctrl psfDir errFlag val)
+            pidx  = car(p)
+            vctrl = cadr(p)
+            val = nil
+            psfDir = sprintf(nil "%s/%L/pll_LC_VCO_tb_1/psf" root pidx)
+            errFlag = errset(
+                progn(
+                    openResults(psfDir)
+                    selectResult('tran)
+                    val = frequency(clip((VT("/Vout_p") - VT("/Vout_n")) 1e-7 2e-7))
+                )
+                t
+            )
+            unless(first fprintf(fh ",\n"))
+            first = nil
+            if(or(null(errFlag) null(val) not(numberp(val)))
+                fprintf(fh "  {\"point\":%L,\"vctrl\":%L,\"f_osc_GHz\":null,\"error\":\"eval_failed\"}"
+                    pidx vctrl)
+                fprintf(fh "  {\"point\":%L,\"vctrl\":%L,\"f_osc_GHz\":%L}"
+                    pidx vctrl (val * 1.0e-9))
+            )
+            errset(unselectResult())
+        )
+    )
+
+    fprintf(fh "\n]}\n")
+    close(fh)
+    printf("{\"status\":\"ok\"}\n")
+    exit(0)
+)

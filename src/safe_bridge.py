@@ -347,8 +347,12 @@ _MAESTRO_OUTPUT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 # Allowed Maestro output_type values per virtuoso-bridge writer.add_output.
 # Empty string means "let Maestro infer" (signal vs expr); the writer omits
-# the ?outputType keyword in that case.
-_MAESTRO_OUTPUT_TYPES = frozenset({"", "signal", "expr"})
+# the ?outputType keyword in that case. Cadence's maeAddOutput uses
+# ?outputType for EvalType ("point"), not for the row kind. The row kind
+# is inferred from ?signalName vs ?expr. Keep "signal" / "expr" as
+# backwards-compatible caller aliases, but normalize them away before
+# dispatch so they cannot become live no-ops on ADE Assembler.
+_MAESTRO_OUTPUT_TYPES = frozenset({"", "signal", "expr", "point"})
 
 # Allow-list of OCEAN / Calculator function names permitted in a
 # user-supplied Maestro output expression. R1 (2026-05-14) switched
@@ -523,6 +527,11 @@ _MAESTRO_EXPR_NET_REF_RE = re.compile(
     rf'\b({_MAESTRO_EXPR_NET_REF_FUNC_RE_SOURCE})'
     rf'\("({_MAESTRO_EXPR_NET_REF_PATH_RE_SOURCE})"\)'
 )
+_MAESTRO_EXPR_ALLOWED_STRING_LITERALS = frozenset({
+    "rising", "falling", "either",
+})
+_MAESTRO_EXPR_STRING_RE = re.compile(r'"([^"]*)"')
+_MAESTRO_EXPR_STRING_PLACEHOLDER = "__STRING_LITERAL__"
 _OCEAN_SIGNAL_KINDS = frozenset({"V", "I", "Vdiff", "Vsum_half"})
 _OCEAN_CROSS_DIRS = frozenset({"rising", "falling", "either"})
 # Kinds whose waveform is built from exactly N probe paths. Used by PC
@@ -3025,6 +3034,15 @@ class SafeBridge:
         expr_stripped = _MAESTRO_EXPR_NET_REF_RE.sub(
             _MAESTRO_EXPR_NET_REF_PLACEHOLDER, expr,
         )
+        for literal in _MAESTRO_EXPR_STRING_RE.findall(expr_stripped):
+            if literal not in _MAESTRO_EXPR_ALLOWED_STRING_LITERALS:
+                raise ValueError(
+                    "Maestro output expr contains unsupported string "
+                    f"literal (len={len(literal)})."
+                )
+        expr_stripped = _MAESTRO_EXPR_STRING_RE.sub(
+            _MAESTRO_EXPR_STRING_PLACEHOLDER, expr_stripped,
+        )
         # Quote / backslash / backtick / pipe / apostrophe would let the
         # user terminate the SKILL string literal or invoke a reader macro.
         # Valid quoted net-ref tokens have been replaced above; any quote
@@ -3492,12 +3510,15 @@ class SafeBridge:
         # tokens; replacing them with \" yields valid SKILL string
         # contents that unescape back to the original expr remote-side.
         skill_expr = expr.replace('"', r'\"') if expr else expr
+        skill_output_type = output_type
+        if output_type in {"signal", "expr"}:
+            skill_output_type = ""
         raw = _cap_remote_output(
             _mae_writer.add_output(
                 self.client,
                 name,
                 resolved_test,
-                output_type=output_type,
+                output_type=skill_output_type,
                 signal_name=signal_name,
                 expr=skill_expr,
                 session=session,

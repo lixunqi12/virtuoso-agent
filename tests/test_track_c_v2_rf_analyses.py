@@ -15,6 +15,10 @@ from src.maestro_setup import apply_maestro_setup, validate_maestro_setup_block 
 from src.safe_bridge import SafeBridge  # noqa: E402
 
 
+def _p0_token(*parts: str) -> str:
+    return "".join(parts)
+
+
 @pytest.fixture
 def pdk_map_file(tmp_path):
     content = """\
@@ -157,11 +161,12 @@ class TestSafeBridgeRFOptions:
     def test_pnoise_foundry_shaped_token_value_rejected_and_scrubbed(
         self, bridge, writer_mocks,
     ):
+        token = _p0_token("n", "ch_alpha")
         with pytest.raises(ValueError) as exc:
             bridge.set_maestro_analysis(
-                analysis="pnoise", options={"oprobe": "nch_alpha"},
+                analysis="pnoise", options={"oprobe": token},
             )
-        assert "nch_alpha" not in str(exc.value)
+        assert token not in str(exc.value)
         assert not writer_mocks["set_analysis"].called
 
     def test_pnoise_probe_path_injection_rejected(

@@ -1,0 +1,109 @@
+%% main.tex — Safe-Bridge / 11-LLM industrial-node analog-sizing benchmark
+%% acmart sigconf, double-blind review build (anonymous, nonacm, review)
+%% Conversion of paper/*.md → paper/sec/*.tex; md remains source of truth
+%% until D10 (camera-ready submission window).
+%%
+%% Build chain (when LaTeX is provisioned):
+%%   pdflatex main.tex
+%%   bibtex   main
+%%   pdflatex main.tex
+%%   pdflatex main.tex
+
+\documentclass[sigconf,anonymous,nonacm,review]{acmart}
+
+%% ---------- Packages ----------
+\usepackage{booktabs}      % \toprule / \midrule / \bottomrule
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{rotating}
+\usepackage{makecell}
+\usepackage{xcolor}
+\usepackage{pifont}        % \ding{51} = ✓, \ding{55} = ✗
+%% NB: acmart loads newtxmath which already provides AMS symbols and
+%% \Bbbk; do not load amssymb here (clashes).
+\usepackage{amsmath}
+\usepackage{mathtools}   % \coloneqq
+\usepackage{microtype}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage[normalem]{ulem}
+\usepackage{tikz}
+\usetikzlibrary{decorations.pathreplacing}
+\usepackage{graphicx}
+%% NB: figs/safe_bridge_arch.svg must be rasterised to PDF before
+%% build. Suggested one-shot:
+%%   inkscape figs/safe_bridge_arch.svg --export-type=pdf --export-filename=figs/safe_bridge_arch.pdf
+%% pdflatex will then resolve \includegraphics{figs/safe_bridge_arch}.
+
+%% todonotes for D6/D8 TBD placeholders. Disable by switching to
+%% \usepackage[disable]{todonotes} after D8 data fills the cells.
+\usepackage[textsize=footnotesize,linecolor=red!50,backgroundcolor=red!10,bordercolor=red!50]{todonotes}
+
+%% ---------- Convenience macros ----------
+\newcommand{\yes}{\ding{51}}        % ✓
+\newcommand{\no}{\ding{55}}         % ✗
+\newcommand{\partyes}{\textit{partial}}
+\newcommand{\na}{\textit{n/a}}
+%% Compact inline markers (no todonotes box overhead) — page-budget-friendly.
+%% Switch back to \todo[inline] form once D6/D8 data lands and we're not page-budget-bound.
+\newcommand{\tbdsix}{\textcolor{red}{\textsf{\scriptsize[TBD-D6]}}}
+\newcommand{\tbdeight}{\textcolor{red}{\textsf{\scriptsize[TBD-D8]}}}
+\newcommand{\tbdcell}{\textit{TBD}}
+\newcommand{\filename}[1]{\texttt{#1}}
+
+%% ---------- ACM metadata (anonymous review build → suppressed) ----------
+\settopmatter{printacmref=false,printccs=false,printfolios=true}
+
+%% ---------- Title / author / abstract ----------
+\title{Six US + Five China Frontier LLMs vs.\ an Industrial Analog Sizing Task:\\
+A Cost--Quality Pareto Study}
+
+%% Anonymous review build: acmart anonymises automatically given the
+%% `anonymous' class option; the \author block is parsed but suppressed.
+\author{Anonymous Author(s)}
+\affiliation{%
+  \institution{Submission \#TBD}
+  \city{}\country{}}
+\email{anonymous@submission}
+
+\renewcommand{\shortauthors}{Anonymous}
+
+\begin{document}
+
+\begin{abstract}
+We present an eleven-LLM benchmark for industrial-node analog sizing
+running on \emph{Safe-Bridge}, a verifiable NDA-safe substrate that
+lets any cloud LLM drive a real foundry-bound schematic without PDK
+content crossing the trust boundary. The eleven checkpoints span
+seven vendor families across two countries (6~US + 5~China) with a
+four-vendor China-frontier cohort that turns cross-vendor
+domestic-China viability from a single-vendor anecdote into a
+cross-vendor pattern. We report a cost--quality Pareto across the
+checkpoints, a labelled \emph{reasoning-token premium} sharp
+observation, and an eight-bucket failure-mode taxonomy. The
+methodology contribution---multi-LLM benchmark on a closed
+industrial PDK with three-axis scrub-audit rigor---is reusable for
+future analog (and adjacent EDA) LLM evaluations.
+\end{abstract}
+
+\keywords{LLM agents, analog circuit sizing, EDA benchmarks,
+NDA-safe deployment, cost--quality Pareto}
+
+\maketitle
+
+%% ---------- Body ----------
+\input{sec/intro}
+\input{sec/related}
+\input{sec/platform}
+\input{sec/methodology}
+\input{sec/results}
+\input{sec/failures}
+\input{sec/discussion}
+\input{sec/conclusion}
+
+%% ---------- Bibliography ----------
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+
+\end{document}

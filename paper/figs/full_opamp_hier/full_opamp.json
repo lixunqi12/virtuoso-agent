@@ -1,0 +1,971 @@
+{
+  "lib": "GENERIC_PDK",
+  "cell": "full_opamp",
+  "max_depth": 49,
+  "max_depth_reached": 0,
+  "depth_limit_hit": false,
+  "root": {
+    "handle": "ROOT",
+    "depth": 0,
+    "lib": "GENERIC_PDK",
+    "cell": "full_opamp",
+    "instances": [
+      {
+        "instName": "M58",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_sc",
+          "D": "net072",
+          "S": "net056",
+          "B": "net056"
+        }
+      },
+      {
+        "instName": "M56",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n_sc",
+          "D": "net084",
+          "S": "net047",
+          "B": "net047"
+        }
+      },
+      {
+        "instName": "M48",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_sc",
+          "D": "net047",
+          "S": "net043",
+          "B": "net043"
+        }
+      },
+      {
+        "instName": "M57",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n_sc",
+          "D": "net086",
+          "S": "net072",
+          "B": "net072"
+        }
+      },
+      {
+        "instName": "M33",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "w": "n_width_sec*finger_n_sec",
+          "multi": "1",
+          "m": "1",
+          "fingers": "finger_n_sec",
+          "l": "200n"
+        },
+        "nets": {
+          "G": "cmfb_2",
+          "D": "Vop",
+          "S": "gnd!",
+          "B": "gnd!"
+        }
+      },
+      {
+        "instName": "M35",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "l": "200n",
+          "fingers": "finger_n_sec",
+          "m": "1",
+          "multi": "1",
+          "w": "n_width_sec*finger_n_sec"
+        },
+        "nets": {
+          "G": "cmfb_2",
+          "D": "Von",
+          "S": "gnd!",
+          "B": "gnd!"
+        }
+      },
+      {
+        "instName": "M29",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk",
+          "D": "Vo1p",
+          "S": "net041",
+          "B": "net041"
+        }
+      },
+      {
+        "instName": "M28",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk",
+          "D": "net024",
+          "S": "Vo1n",
+          "B": "Vo1n"
+        }
+      },
+      {
+        "instName": "M26",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n",
+          "D": "Vbias",
+          "S": "net032",
+          "B": "net032"
+        }
+      },
+      {
+        "instName": "M23",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n",
+          "D": "Vcm",
+          "S": "net041",
+          "B": "net041"
+        }
+      },
+      {
+        "instName": "M22",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n",
+          "D": "net024",
+          "S": "Vcm",
+          "B": "Vcm"
+        }
+      },
+      {
+        "instName": "M21",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk",
+          "D": "cmfb_1",
+          "S": "net032",
+          "B": "net032"
+        }
+      },
+      {
+        "instName": "M16",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk",
+          "D": "cmfb_2",
+          "S": "net19",
+          "B": "net19"
+        }
+      },
+      {
+        "instName": "M14",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n",
+          "D": "Vbias_2",
+          "S": "net19",
+          "B": "net19"
+        }
+      },
+      {
+        "instName": "M12",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n",
+          "D": "Vcm",
+          "S": "net24",
+          "B": "net24"
+        }
+      },
+      {
+        "instName": "M10",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk_n",
+          "D": "net16",
+          "S": "Vcm",
+          "B": "Vcm"
+        }
+      },
+      {
+        "instName": "M8",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk",
+          "D": "Vop",
+          "S": "net24",
+          "B": "net24"
+        }
+      },
+      {
+        "instName": "M6",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "G": "clk",
+          "D": "net16",
+          "S": "Von",
+          "B": "Von"
+        }
+      },
+      {
+        "instName": "M5",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "fingers": "finger_ref",
+          "l": "200n",
+          "m": "1",
+          "multi": "1",
+          "w": "ref_Width*finger_ref"
+        },
+        "nets": {
+          "G": "net7",
+          "D": "net7",
+          "S": "gnd!",
+          "B": "gnd!"
+        }
+      },
+      {
+        "instName": "M4",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "l": "200n",
+          "fingers": "finger_base",
+          "m": "1",
+          "multi": "1",
+          "w": "ref_Width*finger_base"
+        },
+        "nets": {
+          "G": "net7",
+          "D": "net11",
+          "S": "gnd!",
+          "B": "gnd!"
+        }
+      },
+      {
+        "instName": "M1",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "l": "200n",
+          "fingers": "finger_n",
+          "m": "1",
+          "multi": "1",
+          "w": "n_width*finger_n"
+        },
+        "nets": {
+          "G": "Vin_n",
+          "D": "Vo1p",
+          "S": "net11",
+          "B": "net11"
+        }
+      },
+      {
+        "instName": "M0",
+        "cell": "NMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "l": "200n",
+          "fingers": "finger_n",
+          "m": "1",
+          "multi": "1",
+          "w": "n_width*finger_n"
+        },
+        "nets": {
+          "G": "Vin_p",
+          "D": "Vo1n",
+          "S": "net11",
+          "B": "net11"
+        }
+      },
+      {
+        "instName": "M32",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "w": "p_width*finger_p_sec",
+          "multi": "1",
+          "m": "1",
+          "fingers": "finger_p_sec",
+          "l": "200n"
+        },
+        "nets": {
+          "D": "Vop",
+          "G": "Vo1n",
+          "B": "vdd",
+          "S": "vdd"
+        }
+      },
+      {
+        "instName": "M34",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "l": "200n",
+          "fingers": "finger_p_sec",
+          "m": "1",
+          "multi": "1",
+          "w": "p_width*finger_p_sec"
+        },
+        "nets": {
+          "D": "Von",
+          "G": "Vo1p",
+          "B": "vdd",
+          "S": "vdd"
+        }
+      },
+      {
+        "instName": "M27",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "Vbias",
+          "G": "clk",
+          "B": "net032",
+          "S": "net032"
+        }
+      },
+      {
+        "instName": "M25",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "Vo1p",
+          "G": "clk_n",
+          "B": "net041",
+          "S": "net041"
+        }
+      },
+      {
+        "instName": "M24",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "net024",
+          "G": "clk_n",
+          "B": "Vo1n",
+          "S": "Vo1n"
+        }
+      },
+      {
+        "instName": "M20",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "cmfb_1",
+          "G": "clk_n",
+          "B": "net032",
+          "S": "net032"
+        }
+      },
+      {
+        "instName": "M19",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "Vcm",
+          "G": "clk",
+          "B": "net041",
+          "S": "net041"
+        }
+      },
+      {
+        "instName": "M18",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "net024",
+          "G": "clk",
+          "B": "Vcm",
+          "S": "Vcm"
+        }
+      },
+      {
+        "instName": "M17",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "cmfb_2",
+          "G": "clk_n",
+          "B": "net19",
+          "S": "net19"
+        }
+      },
+      {
+        "instName": "M15",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "Vbias_2",
+          "G": "clk",
+          "B": "net19",
+          "S": "net19"
+        }
+      },
+      {
+        "instName": "M13",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "Vcm",
+          "G": "clk",
+          "B": "net24",
+          "S": "net24"
+        }
+      },
+      {
+        "instName": "M11",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "net16",
+          "G": "clk",
+          "B": "Vcm",
+          "S": "Vcm"
+        }
+      },
+      {
+        "instName": "M9",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "Vop",
+          "G": "clk_n",
+          "B": "net24",
+          "S": "net24"
+        }
+      },
+      {
+        "instName": "M7",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "D": "net16",
+          "G": "clk_n",
+          "B": "Von",
+          "S": "Von"
+        }
+      },
+      {
+        "instName": "M3",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "l": "200n",
+          "fingers": "finger_p",
+          "m": "1",
+          "multi": "1",
+          "w": "p_width*finger_p"
+        },
+        "nets": {
+          "D": "Vo1n",
+          "G": "cmfb_1",
+          "B": "vdd",
+          "S": "vdd"
+        }
+      },
+      {
+        "instName": "M2",
+        "cell": "PMOS",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "l": "200n",
+          "fingers": "finger_p",
+          "m": "1",
+          "multi": "1",
+          "w": "p_width*finger_p"
+        },
+        "nets": {
+          "D": "Vo1p",
+          "G": "cmfb_1",
+          "B": "vdd",
+          "S": "vdd"
+        }
+      },
+      {
+        "instName": "I0",
+        "cell": "ISRC",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "idc": "offset_current"
+        },
+        "nets": {
+          "PLUS": "vdd",
+          "MINUS": "net7"
+        }
+      },
+      {
+        "instName": "C17",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "MINUS": "net072",
+          "PLUS": "net085"
+        }
+      },
+      {
+        "instName": "C15",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "MINUS": "net047",
+          "PLUS": "net083"
+        }
+      },
+      {
+        "instName": "C18",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "1n"
+        },
+        "nets": {
+          "MINUS": "Vin_p",
+          "PLUS": "Vo1n"
+        }
+      },
+      {
+        "instName": "C19",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "1n"
+        },
+        "nets": {
+          "MINUS": "Vin_n",
+          "PLUS": "Vo1p"
+        }
+      },
+      {
+        "instName": "C20",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "1n"
+        },
+        "nets": {
+          "MINUS": "net082",
+          "PLUS": "Vop"
+        }
+      },
+      {
+        "instName": "C21",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "1n"
+        },
+        "nets": {
+          "MINUS": "net081",
+          "PLUS": "Von"
+        }
+      },
+      {
+        "instName": "C9",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "miller_cap"
+        },
+        "nets": {
+          "MINUS": "net063",
+          "PLUS": "Von"
+        }
+      },
+      {
+        "instName": "C6",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "MINUS": "gnd!",
+          "PLUS": "Vop"
+        }
+      },
+      {
+        "instName": "C5",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "100.0f"
+        },
+        "nets": {
+          "MINUS": "net024",
+          "PLUS": "net032"
+        }
+      },
+      {
+        "instName": "C4",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "100.0f"
+        },
+        "nets": {
+          "MINUS": "net041",
+          "PLUS": "net032"
+        }
+      },
+      {
+        "instName": "C8",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "miller_cap"
+        },
+        "nets": {
+          "MINUS": "net064",
+          "PLUS": "Vop"
+        }
+      },
+      {
+        "instName": "C7",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "MINUS": "gnd!",
+          "PLUS": "Von"
+        }
+      },
+      {
+        "instName": "C1",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "100.0f"
+        },
+        "nets": {
+          "MINUS": "net24",
+          "PLUS": "net19"
+        }
+      },
+      {
+        "instName": "C0",
+        "cell": "IDEAL_CAP",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "c": "100.0f"
+        },
+        "nets": {
+          "MINUS": "net16",
+          "PLUS": "net19"
+        }
+      },
+      {
+        "instName": "V10",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "PLUS": "clk_n_sc",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V9",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "PLUS": "clk_sc",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V1",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "PLUS": "clk_n",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V0",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "PLUS": "clk",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V8",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "vdc": "bias_voltage_2"
+        },
+        "nets": {
+          "PLUS": "Vbias_2",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V7",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "vdc": "cmfb_1"
+        },
+        "nets": {
+          "PLUS": "cmfb_1",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V6",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "vdc": "cmfb_2"
+        },
+        "nets": {
+          "PLUS": "cmfb_2",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V5",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "vdc": "Vdd"
+        },
+        "nets": {
+          "PLUS": "vdd",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V4",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "vdc": "bias_voltage"
+        },
+        "nets": {
+          "PLUS": "Vbias",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "V2",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "vdc": "Input_offset"
+        },
+        "nets": {
+          "PLUS": "Vcm",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "E1",
+        "cell": "GENERIC_DEVICE",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "NC+": "net3",
+          "NC-": "gnd!",
+          "PLUS": "Vin+",
+          "MINUS": "Vcm"
+        }
+      },
+      {
+        "instName": "E0",
+        "cell": "GENERIC_DEVICE",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "NC+": "net3",
+          "NC-": "gnd!",
+          "PLUS": "Vin-",
+          "MINUS": "Vcm"
+        }
+      },
+      {
+        "instName": "V3",
+        "cell": "VSRC",
+        "lib": "GENERIC_PDK",
+        "params": {},
+        "nets": {
+          "PLUS": "net3",
+          "MINUS": "gnd!"
+        }
+      },
+      {
+        "instName": "R6",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.9K"
+        },
+        "nets": {
+          "MINUS": "Vin_p",
+          "PLUS": "Vin+"
+        }
+      },
+      {
+        "instName": "R7",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.9K"
+        },
+        "nets": {
+          "MINUS": "Vin_n",
+          "PLUS": "Vin-"
+        }
+      },
+      {
+        "instName": "R8",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.12K"
+        },
+        "nets": {
+          "MINUS": "Vo1n",
+          "PLUS": "Vin_p"
+        }
+      },
+      {
+        "instName": "R9",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.12K"
+        },
+        "nets": {
+          "MINUS": "Vo1p",
+          "PLUS": "Vin_n"
+        }
+      },
+      {
+        "instName": "R10",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.9K"
+        },
+        "nets": {
+          "MINUS": "Von",
+          "PLUS": "Vin_p"
+        }
+      },
+      {
+        "instName": "R11",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.9K"
+        },
+        "nets": {
+          "MINUS": "net082",
+          "PLUS": "Vo1n"
+        }
+      },
+      {
+        "instName": "R12",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.9K"
+        },
+        "nets": {
+          "MINUS": "net081",
+          "PLUS": "Vo1p"
+        }
+      },
+      {
+        "instName": "R13",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "15.9K"
+        },
+        "nets": {
+          "MINUS": "Vop",
+          "PLUS": "Vin_n"
+        }
+      },
+      {
+        "instName": "R1",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "1.000m"
+        },
+        "nets": {
+          "MINUS": "Vo1p",
+          "PLUS": "net063"
+        }
+      },
+      {
+        "instName": "R0",
+        "cell": "RESISTOR",
+        "lib": "GENERIC_PDK",
+        "params": {
+          "r": "1.000m"
+        },
+        "nets": {
+          "MINUS": "Vo1n",
+          "PLUS": "net064"
+        }
+      }
+    ],
+    "pins": []
+  },
+  "subcells": []
+}

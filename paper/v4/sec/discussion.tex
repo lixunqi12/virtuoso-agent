@@ -1,0 +1,98 @@
+%% v4/sec/discussion.tex — §8 Discussion (TODAES long-form)
+%%
+%% Provenance: verbatim mechanical carry of paper/sec/discussion.tex
+%% (2026-05-16) under Phase-1 task 91240545. v3 source is frozen.
+%%
+%% PHASE-2 expansion targets (from outline_v4.md §8 plan, ~1.5pp):
+%%   - 8.1 Viability question — sharpen the
+%%     "cohort pattern vs vendor-specific" distinction with explicit
+%%     decision-rule predicate (cross-vendor spread <= 2pp implies
+%%     pattern; > 5pp implies vendor-specific)
+%%   - 8.2 Quality — un-trim once D8 lands ($\varepsilon$ + spread
+%%     are TBD); add per-vendor regression argument
+%%   - 8.3 Cost — explicit derivation of when reasoning-token
+%%     premium swamps the list-price advantage (cross-ref
+%%     §6.4 $r/(1-r)$ formula)
+%%   - 8.4 Operational maturity — promote each bullet to a
+%%     subsubsection with concrete vendor-by-vendor evidence
+%%   - 8.5 Take-aways — un-trim methodology-reusability argument
+%%     into a paragraph that names downstream LLM4EDA workloads
+%%     (digital fab, mixed-signal, packaging) where the pattern
+%%     transfers
+
+\section{Discussion: Cross-Vendor Domestic-China Viability + Take-aways}
+\label{sec:discussion}
+
+\subsection{The viability question, framed cross-vendor}
+\label{sec:disc-question}
+
+Can an industrial analog-sizing flow depend on domestic-China LLM
+inference? Prior work cannot answer this;
+AnalogAgent~\cite{analogagent} takes the on-prem-tiny route,
+leaving cloud-frontier viability open. Our four-vendor
+China-frontier cohort lets us answer in three dimensions---quality,
+cost, and operational maturity---and crucially to detect whether
+viability is a \emph{cohort pattern} or \emph{vendor-specific}.
+%% PHASE-2: sharpen cohort-vs-vendor-specific predicate with explicit decision rule (spread <=2pp implies pattern; >5pp implies vendor-specific).
+
+\subsection{Quality}
+\label{sec:disc-quality}
+
+\tbdeight\ Across the four China-frontier checkpoints, median
+success rate on LC\_VCO\_20G is within $\varepsilon\%$ of the
+US-frontier-3 (Opus 4.7, GPT-5.5, Gemini 2.x), with $\varepsilon =
+\tbdcell$. The cross-vendor spread within China
+($\tbdcell$~percentage points) is the key indicator: a narrow
+spread argues the pattern is robust; a wide spread argues that
+picking a specific China vendor matters more than picking
+US-vs-China. Either outcome is publishable.
+%% PHASE-2: un-trim once D8 lands; add per-vendor regression argument.
+
+\subsection{Cost}
+\label{sec:disc-cost}
+
+\tbdeight\ Under the 2026-05-01 public pricing snapshot (appendix),
+the China-frontier cohort lists at $\tbdcell\times$~lower
+per-output-token price than the US frontier; whether this
+list-price advantage survives the per-iteration reasoning-token
+premium (\S\ref{sec:results-premium}) to yield a lower
+\emph{per-run} cost ordering---and in particular whether DeepSeek
+V4-flash and MiMo v2.5-pro fall below GPT-5.4-mini / Haiku 4.5 on
+per-run USD---is the open empirical question D8 answers. The
+cost-quality story for practitioners reduces to whether
+$\varepsilon$-loss on quality (\S\ref{sec:disc-quality}) is
+acceptable for the cost saving---answered as a per-budget operating
+point in \S\ref{sec:results-ops}.
+%% PHASE-2: explicit derivation of when reasoning-token premium swamps list-price advantage (cross-ref §6.4 $r/(1-r)$ formula).
+
+\subsection{Operational maturity}
+\label{sec:disc-ops}
+
+Three concerns appear in any LLM rollout against a real workload:
+%% PHASE-2: promote each bullet to a subsubsection with vendor-by-vendor evidence.
+\begin{itemize}
+  \item \textbf{Rate-limit / 429 behaviour} --- surfaced per LLM
+    by the \S\ref{sec:failures} bucket matrix.
+  \item \textbf{Reasoning-token accounting reliability} ---
+    surfaced by \S\ref{sec:results-premium}.
+  \item \textbf{API-surface stability} across revision pairs
+    (V4-pro vs V4-flash; Sonnet 4.6 vs Haiku 4.5) --- reported
+    qualitatively per vendor in the appendix.
+\end{itemize}
+
+\subsection{Take-aways}
+\label{sec:disc-takeaways}
+
+The Pareto recommendation reduces to a per-budget table
+(\S\ref{sec:results-ops}): where the China-frontier cohort is
+within $\varepsilon$ of US-frontier, the cost saving justifies the
+choice, with operational caveats (\S\ref{sec:disc-ops}) feeding the
+procurement risk decision. The reusable methodology
+contribution---multi-LLM benchmark on an industrial PDK,
+spanning platform (\S\ref{sec:platform}), seed-handling and
+three-axis scrub audit (\S\ref{sec:method-seed},
+\S\ref{sec:method-audit}), and cost-quality / failure-bucket
+reporting (\S\ref{sec:results}, \S\ref{sec:failures})---outlives
+the specific numbers: the $11\times$~spec-contract matrix shape
+does not age.
+%% PHASE-2: un-trim methodology-reusability argument; name downstream LLM4EDA workloads (digital fab, mixed-signal, packaging) where pattern transfers.

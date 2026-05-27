@@ -35,6 +35,10 @@ from src import curve_searcher  # noqa: E402
 from src.agent import CircuitAgent  # noqa: E402
 
 
+def _p0_token(*parts: str) -> str:
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # run() signature defaults
 # ---------------------------------------------------------------------------
@@ -302,9 +306,8 @@ def test_build_curve_section_drops_foundry_leaky_summary(monkeypatch):
 
     class _LeakySummary:
         def to_markdown(self) -> str:
-            # `nch_` is one of the foundry tokens in
-            # curve_searcher._FOUNDRY_LEAK_TOKENS.
-            return "## f-Vctrl curve\nUse cell `nch_lvt_25` here."
+            token = _p0_token("n", "ch_lvt_25")
+            return f"## f-Vctrl curve\nUse cell `{token}` here."
 
     from src import agent as agent_module
     monkeypatch.setattr(

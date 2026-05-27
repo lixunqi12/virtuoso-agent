@@ -1,0 +1,100 @@
+%% v4/sec/overview.tex — §3 Approach Overview (NEW for TODAES v4)
+%%
+%% Status (2026-05-16): Round-19 unlock — leader Q2 ruling: write
+%% prose to ~0.5 p first, then commission Fig. 3 once we can read the
+%% prose and decide which boxes / arrows deserve the figure's
+%% emphasis. Figure is a placeholder until that pass.
+%%
+%% Target length: 0.75-1.0 page in acmsmall single-column
+%% (~350-450 words + one figure). Current draft: ~370 words.
+%% AutoChip~\cite{autochip} places its system-overview section here
+%% as a one-figure-one-paragraph onramp; we follow that template.
+
+\section{Approach Overview}
+\label{sec:overview}
+
+Before treating Safe-Bridge (\S\ref{sec:platform}), the benchmark
+methodology (\S\ref{sec:methodology}), and the results
+(\S\ref{sec:results}) in depth, this section gives a single-figure
+overview of how the three components compose into one closed loop.
+We adopt an AutoChip~\cite{autochip}-style onramp: one figure, one
+paragraph per component, no quantitative claims---those are
+deferred to \S\ref{sec:results}.
+
+\paragraph{The closed loop in one figure.}
+Figure~\ref{fig:overview} shows the three components and the arrows
+between them. The \textbf{Agent} (left) is the cloud-hosted LLM
+checkpoint under evaluation. The \textbf{Safe-Bridge substrate}
+(centre) is the NDA-safe wrapper that scrubs every byte crossing
+the trust boundary. The \textbf{spec-contract evaluator} (right) is
+the SPICE-driven oracle that converts a candidate netlist into a
+PASS/FAIL signal on each spec metric. The control loop turns once
+per agent iteration: the agent emits a JSON tool call, Safe-Bridge
+forwards it to the foundry-bound host, SKILL/SPICE executes it,
+Safe-Bridge scrubs the response, and the agent observes only the
+scrubbed result.
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox{0.85\linewidth}{\centering\itshape
+    \vspace{1.2em}
+    [Fig. 3 PLACEHOLDER --- system-overview diagram]\\[0.5em]
+    Three boxes: Agent (left, cloud LLM ckpt) $\rightarrow$
+    Safe-Bridge substrate (centre, four scrub layers) $\rightarrow$
+    Spec-contract evaluator (right, SPICE + YAML metrics).
+    Arrows: agent JSON tool calls flow right through scrub-out;
+    scrubbed SPICE results flow left through scrub-in. Trust
+    boundary drawn between Agent and Safe-Bridge.
+    \vspace{1.2em}}}
+  \caption{System overview: cloud LLM agent (left) iterating against
+    a foundry-bound spec-contract evaluator (right) through the
+    Safe-Bridge NDA-safe substrate (centre). Trust boundary lies
+    between the agent and Safe-Bridge; PDK content never crosses
+    it. Diagram to be commissioned in TikZ once prose stabilises
+    (Round-19 Q2 leader ruling).}
+  \label{fig:overview}
+\end{figure}
+
+\paragraph{Agent.}
+Each of the eleven checkpoints in the benchmark
+(\S\ref{sec:methodology}) is a frozen cloud-LLM checkpoint accessed
+through its vendor's public chat-completion or messages API. No
+fine-tuning is performed; only the system prompt and the JSON tool
+schema are fixed across all eleven checkpoints, so that the only
+controlled variable is the \texttt{-{}-llm} flag at the
+\filename{run\_benchmark.py} entry point. The agent receives the
+spec contract, the scrubbed simulation history, and the tool
+schema; it returns either a tool call (read a node, run a
+simulation, write a netlist) or a final answer.
+
+\paragraph{Safe-Bridge substrate.}
+Safe-Bridge sits between the agent and the foundry host. Four
+code-anchored scrub layers (\S\ref{sec:platform}) intercept every
+byte in either direction: an allow-listed SKILL-entrypoint filter
+on outbound tool calls, a regex-based PDK-token redactor on
+inbound SPICE output, a numeric-range sanity check on returned
+metrics, and a final whole-payload audit against a foundry-leak
+regex. Five hard invariants (\S\ref{sec:platform}) and a
+three-axis audit methodology guarantee that no PDK token, device
+model name, or foundry-internal identifier ever reaches any cloud
+LLM.
+
+\paragraph{Spec-contract evaluator.}
+The evaluator (\S\ref{sec:methodology}) is a thin YAML-metrics
+layer over Cadence Spectre, returning a per-metric PASS/FAIL
+verdict and the underlying numeric value. The metrics are
+expressed in the AnalogGym~\cite{analoggym} YAML idiom but bound
+to the closed industrial PDK; the cells in the contract list
+(power, phase noise, tuning range, output swing, etc.) define the
+33-cell PASS threshold that gates each run.
+
+\paragraph{Why the overview matters.}
+Three claims of the rest of the paper rest on the loop in
+Figure~\ref{fig:overview}: (i) the cost--quality Pareto
+(\S\ref{sec:results}) is a property of the agent box and the
+\texttt{-{}-llm} flag only; (ii) the NDA-safe substrate claim
+(\S\ref{sec:platform}) is a property of the Safe-Bridge box and
+the trust boundary it enforces; and (iii) the failure-mode taxonomy
+(\S\ref{sec:failures}) is the disaggregation of where the closed
+loop fails when it does. The remainder of the paper drills each
+box, in order.

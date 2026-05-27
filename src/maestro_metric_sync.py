@@ -24,6 +24,7 @@ This sync is an authoring-time convenience, not a correctness gate.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from .safe_bridge import SafeBridge, _PROBE_PATH_RE
@@ -135,15 +136,26 @@ def _windowed_stat_expr(
 def _scale_expr(expr: str, scale: Any) -> str:
     """If ``scale`` is a non-unit finite number, multiply ``expr`` by it.
 
-    Otherwise return ``expr`` unchanged. Non-numeric scale silently
-    falls through (the spec_evaluator already would have rejected such
-    a spec at parse time).
+    Otherwise return ``expr`` unchanged. YAML accepts exponent literals
+    such as ``1.0e6`` as strings on some PyYAML versions; mirror the
+    PC evaluator by accepting finite numeric strings here too.
     """
-    if not isinstance(scale, (int, float)) or isinstance(scale, bool):
+    if scale is None or isinstance(scale, bool):
         return expr
-    if scale == 1.0 or scale == 1:
+    if isinstance(scale, (int, float)):
+        scale_value = float(scale)
+    elif isinstance(scale, str):
+        try:
+            scale_value = float(scale)
+        except ValueError:
+            return expr
+    else:
         return expr
-    return f"({expr} * {_format_skill_number(scale)})"
+    if not math.isfinite(scale_value):
+        return expr
+    if scale_value == 1.0:
+        return expr
+    return f"({expr} * {_format_skill_number(scale_value)})"
 
 
 def _window_bounds(
