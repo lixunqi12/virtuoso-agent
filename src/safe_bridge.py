@@ -18,6 +18,7 @@ import math
 import os
 import posixpath
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,10 @@ _PARAM_ATOM_RE = re.compile(
 _SAFE_PSF_DIR_RE = re.compile(r"^[A-Za-z0-9_./~:\-]+$")
 _SAFE_RESULT_DIR_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
 _SAFE_NET_NAME_RE = re.compile(r"^/[A-Za-z0-9_]+$")
+_SAFE_OP_HISTORY_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
+_SAFE_OP_RESULT_PATH_RE = re.compile(r"^/[A-Za-z0-9_./!]{1,255}$")
+_MAX_MAESTRO_OP_NETS = 64
+_MAX_MAESTRO_OP_INSTANCES = 128
 # Path-2 (2026-05-19): Maestro Interactive.<N> sweep root. Same alphabet
 # as _SAFE_PSF_DIR_RE; require a `/Interactive.<digits>` tail so the
 # manifest reader cannot be repurposed as a generic file slurp.
@@ -63,6 +68,25 @@ _SAFE_OP_POINT_KEYS = {
     # Non-MOS attrs (resistor/inductor/cap from tranOp)
     "i", "v", "pwr",
 }
+_LLM_OP_POINT_COLUMNS = (
+    "vgs", "vds", "vov", "id", "gm", "gds",
+    "vth", "cgs", "cgd",
+)
+_SAVE_OP_POINT_EFFECT_KEYS = {
+    "vgs", "vds", "ids", "id", "gm", "gds", "vth", "vdsat", "cgs", "cgd",
+}
+_TRUE_VDSAT_ALIAS_CANDIDATES = (
+    "vdsat", "vdssat", "vdsat_eff", "vdsatEff", "Vdsat",
+    "vdsatcv", "vdsatCV", "vdsat_cv", "vdsatc", "vdsatC",
+    "vdsat_c", "VDSAT",
+)
+_NEARBY_VDSAT_DIAGNOSTIC_CANDIDATES = (
+    "vdsat_vadj", "vdsat_vdl",
+    "vdseff", "vdsEff", "vds_eff", "vgst", "vgsteff", "vgstEff",
+)
+_VDSAT_ALIAS_PROBE_CANDIDATES = (
+    _TRUE_VDSAT_ALIAS_CANDIDATES + _NEARBY_VDSAT_DIAGNOSTIC_CANDIDATES
+)
 
 # Saturation-region enum (Spectre tranOp). Used to render `region` int into
 # a human-readable label for LLM feedback. Values observed on IC23.1 /
@@ -144,6 +168,17 @@ _ALLOWED_SKILL_ENTRYPOINTS = frozenset({
     # DC analysis required. Dual-signed by probe 7 v3+v4 (dr: handle +
     # hard-coded handle->prop dispatcher in safe_read_op_point.il).
     "safeReadOpPointAfterTran",
+    # 2026-06-04: read-only Maestro history DC operating-point summary.
+    # Request-scoped: caller passes explicit node/instance paths. Remote
+    # side selects only 'dc and 'instance; never model/primitives.
+    "safeReadMaestroDcOpPoint",
+    # 2026-06-04: current-run PSF DC operating-point summary. Used by
+    # AC/DC optimizer loops after safeOceanRun; same explicit path list
+    # and same dc/instance-only result selection as the Maestro reader.
+    "safeReadDcOpPointFromResults",
+    # 2026-06-05: bounded alias probe for Spectre OP vdsat naming. Reads
+    # only caller-provided DUT paths and a hard-coded vdsat candidate set.
+    "safeReadVdsatAliasProbeFromResults",
     "safeSetParam",
     "safeOceanRun",
     "safeOceanMeasure",
@@ -179,6 +214,7 @@ _ALLOWED_SKILL_ENTRYPOINTS = frozenset({
     # nodes get a deliberate asymmetric kick. See src/plan_auto.py.
     "safePatchNetlistIC",
     "safeMaeWriteAndSave",
+    "safeMaeSetupSummary",
     # Diagnostic-only, read-only. See skill/safe_maestro_debug.il.
     "safeMae_debugInfo",
     # 2026-04-22: auto-discover Maestro input.scs under $HOME/simulation
@@ -474,7 +510,85 @@ _MAESTRO_EXPR_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 # string values â€“ mirrors safeOcean_isEnumKwarg in skill/safe_ocean.il.
 _OCEAN_ENUM_KWARGS: dict[str, frozenset[str]] = {
     "skipdc": frozenset({"yes", "no"}),
+    "oppoint": frozenset({"rawfile"}),
+    "detail": frozenset({"node", "oppoint", "device", "all"}),
 }
+
+
+def assess_op_point_save_effectiveness(
+    run_result: dict | None,
+    op_point: dict | None,
+) -> dict[str, Any]:
+    """Summarize whether per-DUT saveOpPoint produced useful OP scalars.
+
+    ``safeOceanRun`` can request saveOpPoint successfully while a simulator
+    exposes only sparse instance metadata. Treat the check as effective only
+    when at least one requested DUT instance has a non-region numeric scalar
+    such as vgs/gm/cgs. The result is intentionally aggregate-only: no raw
+    paths, model names, or unallowlisted OP keys leave this function.
+    """
+    requested_raw = (
+        run_result.get("opPointsRequested")
+        if isinstance(run_result, dict) else 0
+    )
+    try:
+        requested = int(requested_raw or 0)
+    except (TypeError, ValueError):
+        requested = 0
+
+    instances = (
+        op_point.get("instances")
+        if isinstance(op_point, dict) and isinstance(op_point.get("instances"), dict)
+        else {}
+    )
+    saved_keys: set[str] = set()
+    devices_with_scalars = 0
+    vdsat_devices = 0
+    region_only_devices = 0
+    for params in instances.values():
+        if not isinstance(params, dict):
+            continue
+        numeric_keys = {
+            key for key, value in params.items()
+            if key in _SAVE_OP_POINT_EFFECT_KEYS
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        }
+        scalar_keys = numeric_keys - {"region"}
+        if scalar_keys:
+            devices_with_scalars += 1
+            saved_keys.update(scalar_keys)
+        elif (
+            isinstance(params.get("region"), (int, float))
+            and not isinstance(params.get("region"), bool)
+            and math.isfinite(float(params["region"]))
+        ):
+            region_only_devices += 1
+        if "vdsat" in numeric_keys:
+            vdsat_devices += 1
+
+    issues: list[str] = []
+    if requested <= 0:
+        issues.append("saveOpPoint requested zero DUT instances")
+    if instances and devices_with_scalars == 0:
+        issues.append("instance OP readback returned only sparse metadata")
+    if not instances:
+        issues.append("no instance OP rows returned")
+    ok = requested > 0 and devices_with_scalars > 0
+    return {
+        "ok": ok,
+        "opPointsRequested": requested,
+        "instancesReturned": len(instances),
+        "devicesWithSavedScalars": devices_with_scalars,
+        "regionOnlyDevices": region_only_devices,
+        "vdsatDevices": vdsat_devices,
+        "savedScalarKeys": sorted(saved_keys),
+        "optionalScalarKeysMissing": (
+            ["vdsat"] if ok and vdsat_devices == 0 else []
+        ),
+        "issues": issues,
+    }
 
 # Matches the leading identifier of a SKILL call: "funcName(".
 _SKILL_ENTRYPOINT_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -510,7 +624,7 @@ _PROBE_PATH_RE = re.compile(r"\A(/[A-Za-z_][A-Za-z0-9_]*){1,8}\Z")
 # quoted-token form past the forbidden-char gate but then get rejected
 # by the call-allow-list — confusing failure mode. Keep both in sync.
 _MAESTRO_EXPR_NET_REF_FUNCS = frozenset({
-    "VT", "IT", "v", "i", "VS", "IS", "getData",
+    "VT", "IT", "VF", "IF", "v", "i", "VS", "IS", "getData",
 })
 _MAESTRO_EXPR_NET_REF_PATH_MAX_LEN = 128
 _MAESTRO_EXPR_NET_REF_PLACEHOLDER = "__NETREF__"
@@ -581,6 +695,42 @@ def scrub(value: Any) -> Any:
     return _scrub(value)
 
 
+def assert_llm_feedback_safe(text: str, *, context: str = "feedback") -> str:
+    """Fail closed if LLM-facing feedback still contains sensitive tokens.
+
+    This is deliberately a *post*-sanitization gate. SafeBridge and SKILL
+    helpers should already strip PDK data at source; this function catches
+    any residual foundry/model-shaped token or absolute path immediately
+    before text is replayed into an LLM prompt.
+    """
+    safe_context = (
+        context if isinstance(context, str)
+        and re.fullmatch(r"[A-Za-z0-9_. -]{1,80}", context)
+        else "feedback"
+    )
+    if not isinstance(text, str):
+        raise TypeError(
+            f"{safe_context} must be a string; "
+            f"got type={type(text).__name__}"
+        )
+    hits: list[str] = []
+    if _FOUNDRY_LEAK_RE.search(text):
+        hits.append("foundry/model token")
+    if (
+        _UNC_PATH_RE.search(text)
+        or _FORWARD_UNC_PATH_RE.search(text)
+        or _ABS_WIN_PATH_RE.search(text)
+        or _ABS_UNIX_PATH_RE.search(text)
+    ):
+        hits.append("absolute path")
+    if hits:
+        raise ValueError(
+            f"{safe_context} failed sensitive-token scan "
+            f"({', '.join(hits)}); withheld from LLM"
+        )
+    return text
+
+
 def _cap_remote_output(value: Any, *, label: str) -> Any:
     """Reject cobi-returned string values larger than the size cap.
 
@@ -627,6 +777,53 @@ def _validate_name(name: str, label: str = "name") -> None:
             f"Invalid {label} (len={len(name)}). "
             "Only alphanumeric, underscore, dot, and hyphen are allowed."
         )
+
+
+def _is_safe_op_result_path(path: str) -> bool:
+    """True for schematic result paths such as /Vout_p or /I0/M0 only."""
+    if not isinstance(path, str) or not _SAFE_OP_RESULT_PATH_RE.fullmatch(path):
+        return False
+    if _FOUNDRY_LEAK_RE.search(path):
+        return False
+    if (
+        _UNC_PATH_RE.search(path)
+        or _FORWARD_UNC_PATH_RE.search(path)
+        or _ABS_WIN_PATH_RE.search(path)
+        or _ABS_UNIX_PATH_RE.search(path)
+    ):
+        return False
+    return True
+
+
+def _normalize_maestro_op_paths(
+    paths: Iterable[str] | None,
+    *,
+    label: str,
+    max_items: int,
+) -> list[str]:
+    """Validate, deduplicate, and bound requested Maestro OP result paths."""
+    if paths is None:
+        return []
+    if isinstance(paths, str):
+        raise ValueError(f"{label} must be an iterable of paths, not str")
+    try:
+        raw_paths = list(paths)
+    except TypeError as exc:
+        raise ValueError(f"{label} must be an iterable of paths") from exc
+    if len(raw_paths) > max_items:
+        raise ValueError(f"{label} exceeds max items ({max_items})")
+    out: list[str] = []
+    seen: set[str] = set()
+    for idx, path in enumerate(raw_paths):
+        if not _is_safe_op_result_path(path):
+            raise ValueError(
+                f"{label} item {idx} has invalid path shape "
+                "(must be a schematic result path, len<=255)"
+            )
+        if path not in seen:
+            out.append(path)
+            seen.add(path)
+    return out
 
 
 def _format_param_atom_value(value: Any) -> str:
@@ -1341,6 +1538,294 @@ class SafeBridge:
         sanitized = self._sanitize_op_point(raw)
         return self._decorate_op_point(sanitized)
 
+    def read_dc_op_point_from_results(
+        self,
+        *,
+        nets: Iterable[str] | None = None,
+        instances: Iterable[str] | None = None,
+    ) -> dict:
+        """Read request-scoped DC OP data from the latest OCEAN PSF run.
+
+        This is the current-run AC/DC companion to
+        :meth:`read_maestro_dc_op_point`. It uses ``self._last_results_dir``
+        populated by ``run_ocean_sim()``, opens that PSF directory on the
+        SKILL side, and reads only the requested node/instance paths from
+        ``dc`` / ``instance`` result containers.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "read_dc_op_point_from_results requires the remote-side "
+                "SKILL helpers. Pass --remote-skill-dir so "
+                "safe_read_op_point.il can be loaded."
+            )
+        psf_dir = self._last_results_dir
+        if not psf_dir:
+            raise RuntimeError(
+                "read_dc_op_point_from_results: no results dir available "
+                "(run_ocean_sim has not been called yet this session)"
+            )
+        if not _SAFE_PSF_DIR_RE.fullmatch(psf_dir):
+            raise RuntimeError(
+                f"read_dc_op_point_from_results: psf_dir contains unsafe "
+                f"characters (len={len(psf_dir)})"
+            )
+        net_list = _normalize_maestro_op_paths(
+            nets,
+            label="nets",
+            max_items=_MAX_MAESTRO_OP_NETS,
+        )
+        inst_list = _normalize_maestro_op_paths(
+            instances,
+            label="instances",
+            max_items=_MAX_MAESTRO_OP_INSTANCES,
+        )
+        if not net_list and not inst_list:
+            raise ValueError(
+                "read_dc_op_point_from_results requires at least one net "
+                "or instance path."
+            )
+
+        def _skill_list(values: list[str]) -> str:
+            return "list(" + " ".join(f'"{value}"' for value in values) + ")"
+
+        raw = self._execute_skill_json(
+            f'safeReadDcOpPointFromResults("{psf_dir}" '
+            f"{_skill_list(net_list)} {_skill_list(inst_list)})",
+            timeout=120,
+        )
+        if not raw.get("ok", False):
+            raise RuntimeError(
+                "safeReadDcOpPointFromResults failed: "
+                f"{_scrub(str(raw.get('error', 'unknown')))}"
+            )
+        sanitized = self._sanitize_maestro_dc_op_point(
+            raw,
+            requested_nets=net_list,
+            requested_instances=inst_list,
+        )
+        return self._decorate_op_point(sanitized)
+
+    def probe_vdsat_aliases_from_results(
+        self,
+        *,
+        instances: Iterable[str],
+    ) -> dict:
+        """Probe the real Spectre OP scalar name used for MOS vdsat.
+
+        The probe is current-run and request-scoped like
+        :meth:`read_dc_op_point_from_results`: it opens
+        ``self._last_results_dir`` and asks remote SKILL to test only the
+        hard-coded vdsat candidate names against caller-provided instance
+        paths. It never enumerates model/primitives result containers.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "probe_vdsat_aliases_from_results requires the remote-side "
+                "SKILL helpers. Pass --remote-skill-dir so "
+                "safe_read_op_point.il can be loaded."
+            )
+        psf_dir = self._last_results_dir
+        if not psf_dir:
+            raise RuntimeError(
+                "probe_vdsat_aliases_from_results: no results dir available "
+                "(run_ocean_sim has not been called yet this session)"
+            )
+        if not _SAFE_PSF_DIR_RE.fullmatch(psf_dir):
+            raise RuntimeError(
+                f"probe_vdsat_aliases_from_results: psf_dir contains unsafe "
+                f"characters (len={len(psf_dir)})"
+            )
+        inst_list = _normalize_maestro_op_paths(
+            instances,
+            label="instances",
+            max_items=_MAX_MAESTRO_OP_INSTANCES,
+        )
+        if not inst_list:
+            raise ValueError(
+                "probe_vdsat_aliases_from_results requires at least one "
+                "instance path."
+            )
+
+        def _skill_list(values: list[str]) -> str:
+            return "list(" + " ".join(f'"{value}"' for value in values) + ")"
+
+        raw = self._execute_skill_json(
+            f'safeReadVdsatAliasProbeFromResults("{psf_dir}" '
+            f"{_skill_list(inst_list)})",
+            timeout=240,
+        )
+        if not raw.get("ok", False):
+            raise RuntimeError(
+                "safeReadVdsatAliasProbeFromResults failed: "
+                f"{_scrub(str(raw.get('error', 'unknown')))}"
+            )
+        return self._sanitize_vdsat_alias_probe(
+            raw,
+            requested_instances=inst_list,
+        )
+
+    def read_maestro_dc_op_point(
+        self,
+        *,
+        history: str,
+        nets: Iterable[str] | None = None,
+        instances: Iterable[str] | None = None,
+    ) -> dict:
+        """Read request-scoped DC OP data from a Maestro run history.
+
+        Remote SKILL selects only ``dc`` and ``instance`` results. It never
+        selects ``model`` or ``primitives``. The caller passes explicit
+        paths so the feedback surface stays bounded and audit-friendly.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "read_maestro_dc_op_point requires the remote-side SKILL "
+                "helpers. Pass --remote-skill-dir so safe_read_op_point.il "
+                "can be loaded."
+            )
+        self._require_scope_for_maestro("read_maestro_dc_op_point")
+        if not isinstance(history, str) or not _SAFE_OP_HISTORY_RE.fullmatch(
+            history
+        ):
+            raise ValueError(
+                "Invalid Maestro history name; expected "
+                "[A-Za-z0-9_.-]{1,128}."
+            )
+        net_list = _normalize_maestro_op_paths(
+            nets,
+            label="nets",
+            max_items=_MAX_MAESTRO_OP_NETS,
+        )
+        inst_list = _normalize_maestro_op_paths(
+            instances,
+            label="instances",
+            max_items=_MAX_MAESTRO_OP_INSTANCES,
+        )
+        if not net_list and not inst_list:
+            raise ValueError(
+                "read_maestro_dc_op_point requires at least one net or "
+                "instance path."
+            )
+
+        def _skill_list(values: list[str]) -> str:
+            return "list(" + " ".join(f'"{value}"' for value in values) + ")"
+
+        expr = (
+            f'safeReadMaestroDcOpPoint("{history}" '
+            f"{_skill_list(net_list)} {_skill_list(inst_list)})"
+        )
+        raw = self._execute_skill_json(expr, timeout=120)
+        if not raw.get("ok", False):
+            raise RuntimeError(
+                "safeReadMaestroDcOpPoint failed: "
+                f"{_scrub(str(raw.get('error', 'unknown')))}"
+            )
+        sanitized = self._sanitize_maestro_dc_op_point(
+            raw,
+            requested_nets=net_list,
+            requested_instances=inst_list,
+        )
+        return self._decorate_op_point(sanitized)
+
+    def _sanitize_vdsat_alias_probe(
+        self,
+        data: dict,
+        *,
+        requested_instances: Iterable[str],
+    ) -> dict[str, Any]:
+        """Defense-in-depth filter for vdsat alias probe payloads."""
+        requested = [
+            path for path in requested_instances
+            if isinstance(path, str) and _is_safe_op_result_path(path)
+        ]
+        out: dict[str, Any] = {
+            "ok": bool(data.get("ok", True)),
+            "source": "psf",
+            "analysis": "dc",
+            "resultKinds": [],
+            "instancesTested": len(requested),
+            "actualName": None,
+            "candidates": {},
+            "issues": [],
+        }
+
+        result_kinds = data.get("resultKinds")
+        if isinstance(result_kinds, list):
+            out["resultKinds"] = [
+                kind for kind in result_kinds
+                if kind in {"dc", "dcOp", "dcOpInfo", "finalTimeOP", "instance"}
+            ]
+
+        raw_candidates = data.get("candidates")
+        if isinstance(raw_candidates, dict):
+            for name in _VDSAT_ALIAS_PROBE_CANDIDATES:
+                raw_stats = raw_candidates.get(name)
+                if not isinstance(raw_stats, dict):
+                    continue
+                try:
+                    hits = int(raw_stats.get("hits") or 0)
+                except (TypeError, ValueError):
+                    hits = 0
+                example_raw = raw_stats.get("example")
+                example: float | None
+                if (
+                    isinstance(example_raw, (int, float))
+                    and not isinstance(example_raw, bool)
+                    and math.isfinite(float(example_raw))
+                ):
+                    example = float(example_raw)
+                else:
+                    example = None
+                values: dict[str, float] = {}
+                raw_values = raw_stats.get("values")
+                if isinstance(raw_values, dict):
+                    for path, value in raw_values.items():
+                        if path not in requested:
+                            continue
+                        if (
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                        ):
+                            values[path] = float(value)
+                out["candidates"][name] = {
+                    "hits": max(hits, 0),
+                    "example": example,
+                    "trueVdsat": name in _TRUE_VDSAT_ALIAS_CANDIDATES,
+                    "values": values,
+                }
+
+        actual_name = data.get("actualName")
+        if (
+            isinstance(actual_name, str)
+            and actual_name in _TRUE_VDSAT_ALIAS_CANDIDATES
+            and out["candidates"].get(actual_name, {}).get("hits", 0) > 0
+        ):
+            out["actualName"] = actual_name
+        else:
+            for name in _TRUE_VDSAT_ALIAS_CANDIDATES:
+                if out["candidates"].get(name, {}).get("hits", 0) > 0:
+                    out["actualName"] = name
+                    break
+
+        issues = data.get("issues")
+        if isinstance(issues, list):
+            for issue in issues[:20]:
+                if not isinstance(issue, str):
+                    continue
+                safe_issue = str(_scrub(issue))[:200]
+                try:
+                    assert_llm_feedback_safe(
+                        safe_issue,
+                        context="vdsat alias probe issue",
+                    )
+                except ValueError:
+                    safe_issue = "redacted issue"
+                out["issues"].append(safe_issue)
+        if out["actualName"] is None:
+            out["issues"].append("no true vdsat OP alias returned numeric values")
+        return out
+
     def _decorate_op_point(self, sanitized: dict) -> dict:
         """Post-process op-point data: compute vov, map region ? label.
 
@@ -1355,6 +1840,12 @@ class SafeBridge:
         for inst_name, params in instances.items():
             if not isinstance(params, dict):
                 continue
+            # Spectre/PDK variants commonly expose the device drain-source
+            # current as ids. saveOpPoint may also expose an id terminal
+            # current with a simulator sign convention; the LLM-facing table
+            # uses canonical ids under the generic column name id.
+            if isinstance(params.get("ids"), (int, float)):
+                params["id"] = params["ids"]
             # Derived vov from (vgs - vth) when both are numeric and vov
             # wasn't already returned by SKILL.
             if "vov" not in params:
@@ -1370,6 +1861,190 @@ class SafeBridge:
                 label = _REGION_LABELS.get(int(region), "unknown")
                 params["region_label"] = label
         return sanitized
+
+    def _sanitize_maestro_dc_op_point(
+        self,
+        data: dict,
+        *,
+        requested_nets: Iterable[str] | None = None,
+        requested_instances: Iterable[str] | None = None,
+    ) -> dict:
+        """Defense-in-depth filter for safeReadMaestroDcOpPoint payloads."""
+        out: dict[str, Any] = {
+            "ok": bool(data.get("ok", True)),
+            "analysis": "dc",
+            "nodes": {},
+            "instances": {},
+            "resultKinds": [],
+            "issues": [],
+        }
+        history = data.get("history")
+        if isinstance(history, str) and _SAFE_OP_HISTORY_RE.fullmatch(history):
+            out["history"] = history
+        source = data.get("source")
+        if source in {"maestro", "psf"}:
+            out["source"] = source
+
+        nodes = data.get("nodes")
+        if isinstance(nodes, dict):
+            for path, value in nodes.items():
+                if not _is_safe_op_result_path(path):
+                    continue
+                if isinstance(value, (int, float)) and not isinstance(
+                    value, bool
+                ) and math.isfinite(float(value)):
+                    out["nodes"][path] = value
+
+        raw_instances = data.get("instances")
+        if isinstance(raw_instances, dict):
+            safe_instances = self._sanitize_op_point(
+                {"instances": raw_instances}
+            )
+            for path, params in safe_instances.items():
+                if not _is_safe_op_result_path(path):
+                    continue
+                if not isinstance(params, dict):
+                    continue
+                numeric_params = {
+                    metric: metric_value
+                    for metric, metric_value in params.items()
+                    if isinstance(metric_value, (int, float))
+                    and not isinstance(metric_value, bool)
+                    and math.isfinite(float(metric_value))
+                }
+                if numeric_params:
+                    out["instances"][path] = numeric_params
+
+                    missing = [
+                        key for key in _LLM_OP_POINT_COLUMNS
+                        if key not in numeric_params
+                        and not (
+                            key == "vov"
+                            and "vgs" in numeric_params
+                            and "vth" in numeric_params
+                        )
+                        and not (key == "id" and "ids" in numeric_params)
+                    ]
+                    if missing:
+                        out["issues"].append(
+                            f"{path} missing OP fields: {','.join(missing)}"
+                        )
+
+        result_kinds = data.get("resultKinds")
+        if isinstance(result_kinds, list):
+            out["resultKinds"] = [
+                kind for kind in result_kinds
+                if kind in {"dc", "dcOp", "dcOpInfo", "finalTimeOP", "instance"}
+            ]
+
+        issues = data.get("issues")
+        if isinstance(issues, list):
+            for issue in issues[:20]:
+                if not isinstance(issue, str):
+                    continue
+                safe_issue = str(_scrub(issue))[:200]
+                try:
+                    assert_llm_feedback_safe(
+                        safe_issue,
+                        context="Maestro OP issue",
+                    )
+                except ValueError:
+                    safe_issue = "redacted issue"
+                out["issues"].append(safe_issue)
+        self._annotate_requested_op_readback(
+            out,
+            requested_nets=requested_nets,
+            requested_instances=requested_instances,
+        )
+        return out
+
+    def _append_safe_op_issue(self, payload: dict, issue: str) -> None:
+        safe_issue = str(_scrub(issue))[:200]
+        try:
+            assert_llm_feedback_safe(
+                safe_issue,
+                context="Maestro OP issue",
+            )
+        except ValueError:
+            safe_issue = "redacted issue"
+        issues = payload.setdefault("issues", [])
+        if isinstance(issues, list) and safe_issue not in issues:
+            issues.append(safe_issue)
+
+    def _annotate_requested_op_readback(
+        self,
+        payload: dict,
+        *,
+        requested_nets: Iterable[str] | None,
+        requested_instances: Iterable[str] | None,
+    ) -> None:
+        """Add bounded, PDK-safe diagnostics for requested OP paths missed.
+
+        The remote SKILL reader is request-scoped: it never enumerates model
+        result containers. When a requested path is absent from the sanitized
+        payload, make that absence explicit so the LLM does not mistake a
+        sparse readback for a real circuit fact.
+        """
+        nodes = payload.get("nodes") if isinstance(
+            payload.get("nodes"), dict
+        ) else {}
+        instances = payload.get("instances") if isinstance(
+            payload.get("instances"), dict
+        ) else {}
+
+        returned_net_leafs = {
+            str(path).rsplit("/", 1)[-1]
+            for path in nodes
+            if isinstance(path, str)
+        }
+        missing_net_leafs: list[str] = []
+        seen_leafs: set[str] = set()
+        for path in requested_nets or []:
+            if not isinstance(path, str):
+                continue
+            leaf = path.rsplit("/", 1)[-1]
+            if path in nodes or leaf in returned_net_leafs:
+                continue
+            if leaf in seen_leafs:
+                continue
+            if not _SAFE_OP_RESULT_PATH_RE.fullmatch(path):
+                continue
+            seen_leafs.add(leaf)
+            missing_net_leafs.append(leaf)
+
+        for leaf in missing_net_leafs[:12]:
+            self._append_safe_op_issue(
+                payload,
+                f"requested node {leaf} returned no safe dc value",
+            )
+        if len(missing_net_leafs) > 12:
+            self._append_safe_op_issue(
+                payload,
+                f"{len(missing_net_leafs) - 12} more requested nodes "
+                "returned no safe dc value",
+            )
+
+        missing_instances: list[str] = []
+        for path in requested_instances or []:
+            if not isinstance(path, str):
+                continue
+            if path in instances:
+                continue
+            if not _SAFE_OP_RESULT_PATH_RE.fullmatch(path):
+                continue
+            missing_instances.append(path)
+
+        for path in missing_instances[:24]:
+            self._append_safe_op_issue(
+                payload,
+                f"{path} returned no safe OP data",
+            )
+        if len(missing_instances) > 24:
+            self._append_safe_op_issue(
+                payload,
+                f"{len(missing_instances) - 24} more requested instances "
+                "returned no safe OP data",
+            )
 
     def _sanitize(self, data: dict) -> dict:
         """Replace PDK cell names with generic names and strip model params.
@@ -1624,6 +2299,23 @@ class SafeBridge:
                     f"Analysis {_scrub(repr(name))} not allowed. "
                     f"Allowed: {sorted(_OCEAN_ALLOWED_ANALYSES)}"
                 )
+            if name == "dc":
+                # Current-run OP readback depends on Spectre writing the
+                # operating-point rawfile. This is output verbosity, not a
+                # circuit stimulus change, so make it a SafeBridge default
+                # even when Maestro's input.scs listed a sparse dc line.
+                by_lower = {
+                    str(k).lower(): idx for idx, (k, _v) in enumerate(kwargs)
+                }
+                for default_key, default_value in (
+                    ("oppoint", "rawfile"),
+                    ("detail", "all"),
+                ):
+                    idx = by_lower.get(default_key)
+                    if idx is None:
+                        kwargs.append((default_key, default_value))
+                    else:
+                        kwargs[idx] = (kwargs[idx][0], default_value)
             analyses_specs.append((name, kwargs))
 
         # Stage 1 rev 3 M2 (2026-04-18): validate dut_path BEFORE the
@@ -1669,7 +2361,8 @@ class SafeBridge:
         # headroom; the watchdog will still kill genuine hangs.
         result_json = self._execute_skill_json(
             f'safeOceanRun("{lib}" "{cell}" "{tb_cell}" '
-            f"list({var_pairs}) list({analyses_literal}))",
+            f'list({var_pairs}) list({analyses_literal}) "schematic" '
+            f'"schematic" "{dut_path}")',
             timeout=600,
         )
         if not result_json.get("ok", False):
@@ -2012,6 +2705,7 @@ class SafeBridge:
         fc_path: str,
         perturb_nodes: list[dict[str, Any]],
         v_cm_hint_V: float = 0.4,
+        exclude_nodes: list[str] | None = None,
     ) -> dict[str, Any]:
         """Rewrite input.scs's ``ic`` line from a spectre.fc snapshot.
 
@@ -2025,7 +2719,8 @@ class SafeBridge:
              nodes' fc values (falls back to ``v_cm_hint_V``);
           3. builds a new ``ic`` line where every fc node keeps its
              equilibrium value, and each perturb node is set to
-             ``V_cm + offset_mV/1000``;
+             ``V_cm + offset_mV/1000``. Nodes listed in
+             ``exclude_nodes`` are omitted from the generated ``ic`` line;
           4. rewrites ``scs_path`` replacing the existing ``ic`` line
              (or inserting one before ``tran``) in place.
 
@@ -2037,6 +2732,10 @@ class SafeBridge:
         ``perturb_nodes`` shape: ``[{"name": str, "offset_mV": float},
         ...]``. Names are validated (identifier + optional dotted
         hierarchy); offsets are coerced to numeric literals.
+
+        ``exclude_nodes`` shape: ``["I0.Ctrl", ...]`` with the same dotted
+        identifier validation. Use it for source-driven control nodes that
+        must follow a sweep variable rather than Plan Auto's fc snapshot.
         """
         if not isinstance(scs_path, str) or not scs_path:
             raise ValueError("scs_path must be a non-empty string")
@@ -2080,6 +2779,15 @@ class SafeBridge:
                 )
             skill_items.append(f'list("{name}" {off_val:g})')
 
+        exclude_items: list[str] = []
+        for raw_name in exclude_nodes or []:
+            if not isinstance(raw_name, str) or not name_re.fullmatch(raw_name):
+                raise ValueError(
+                    f"bad exclude node name (len={len(str(raw_name))}) "
+                    "must match dotted-identifier pattern"
+                )
+            exclude_items.append(f'"{raw_name}"')
+
         try:
             vcm_hint = float(v_cm_hint_V)
         except (TypeError, ValueError) as exc:
@@ -2098,9 +2806,10 @@ class SafeBridge:
             )
 
         perturb_list_expr = "list(" + " ".join(skill_items) + ")"
+        exclude_list_expr = "list(" + " ".join(exclude_items) + ")"
         skill_expr = (
             f'safePatchNetlistIC("{scs_path}" "{fc_path}" '
-            f'{perturb_list_expr} {vcm_hint:g})'
+            f'{perturb_list_expr} {vcm_hint:g} {exclude_list_expr})'
         )
         result_json = self._execute_skill_json(skill_expr)
         if not result_json.get("ok", False):
@@ -2803,9 +3512,10 @@ class SafeBridge:
                 "safeMaeWriteAndSave returned saved=False; opening Maestro "
                 "will show the pre-optimization netlist."
             )
-        # R13: Maestro GUI Design Variables panel is NOT updated by
-        # maeSetVar/axlSetVarValue (EXPLORER-8127 edit lock). Log a
-        # copy-pasteable table so the user can manually sync if needed.
+        # R13/R14: the SKILL helper mirrors values into test-local
+        # Design Variables entries when Cadence exposes the open test
+        # list. Keep the copy-pasteable table as a UI-cache fallback:
+        # an already-open ADE Explorer pane can lag until redraw/reopen.
         self._log_manual_sync_table(
             design_vars,
             scope_lib=self._scope_lib,
@@ -2813,6 +3523,162 @@ class SafeBridge:
             session=result_json.get("session", ""),
         )
         return _scrub(result_json)
+
+    def read_maestro_setup_summary(
+        self, *, test: str | None = None,
+    ) -> dict:
+        """Read a bounded, PDK-scrubbed summary of the scoped Maestro setup.
+
+        This is the readback half of Maestro writeback. It intentionally
+        returns only setup metadata that the agent needs to verify writes:
+        existing tests, enabled analyses, output row names/expressions,
+        test-local design-variable values, and saved spec bounds. Full
+        ``active.state`` / ``maestro.sdb`` contents are never returned.
+
+        ``test=None`` means all tests in the scoped ADE session. Passing a
+        test name filters the summary to that row.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "read_maestro_setup_summary requires the remote-side SKILL "
+                "helpers. Pass --remote-skill-dir so safe_maestro.il can be "
+                "loaded."
+            )
+        self._require_scope_for_maestro("read_maestro_setup_summary")
+        if test is not None:
+            self._resolve_maestro_test(test)
+            resolved_test = test
+        else:
+            resolved_test = ""
+        skill_expr = (
+            f'safeMaeSetupSummary("{self._scope_lib}" '
+            f'"{self._scope_tb_cell}" "{resolved_test}")'
+        )
+        result_json = self._execute_skill_json(skill_expr)
+        if not result_json.get("ok", False):
+            raise RuntimeError(
+                "safeMaeSetupSummary failed: "
+                f"{_scrub(str(result_json.get('error', 'unknown')))}"
+            )
+        if not result_json.get("specsRaw"):
+            specs_raw = self._read_maestro_specs_raw_via_ssh()
+            if specs_raw:
+                result_json["specsRaw"] = specs_raw
+        return _scrub(result_json)
+
+    def _read_maestro_specs_raw_via_ssh(self) -> str:
+        """Best-effort bounded read of the saved ``<specs>`` section.
+
+        Some Cadence builds expose saved pass/fail specs in ``maestro.sdb``
+        but not through ``maeGetSetup(?typeName "specs")``. This helper keeps
+        the public summary API complete without returning the whole setup
+        file: it resolves the scoped Maestro directory internally, validates
+        the remote path, and returns at most 20 KiB between ``<specs>`` tags.
+        """
+        runner = getattr(self.client, "ssh_runner", None)
+        if runner is None:
+            return ""
+        if self._scope_lib is None or self._scope_tb_cell is None:
+            return ""
+        expr = (
+            f'ddGetObj("{self._scope_lib}" '
+            f'"{self._scope_tb_cell}" "maestro")~>readPath'
+        )
+        try:
+            result = self.client.execute_skill(expr)
+        except Exception:  # noqa: BLE001 - summary fallback only
+            return ""
+        if getattr(result, "errors", None):
+            return ""
+        raw = (getattr(result, "output", "") or "").strip()
+        if not raw or raw == "nil":
+            return ""
+        try:
+            dir_path = json.loads(raw)
+        except Exception:  # noqa: BLE001 - tolerate SKILL raw string shape
+            dir_path = raw.strip('"')
+        if not isinstance(dir_path, str) or not dir_path:
+            return ""
+        remote_path = posixpath.normpath(posixpath.join(dir_path, "maestro.sdb"))
+        try:
+            self._validate_remote_maestro_sdb_path(remote_path)
+        except ValueError:
+            return ""
+        command = (
+            "sed -n '/<specs>/,/<\\/specs>/p' "
+            f"{shlex.quote(remote_path)} | head -c 20000"
+        )
+        try:
+            ssh_result = runner.run_command(command, timeout=10)
+        except Exception:  # noqa: BLE001 - summary fallback only
+            return ""
+        if getattr(ssh_result, "returncode", 1) != 0:
+            return ""
+        return getattr(ssh_result, "stdout", "") or ""
+
+    @staticmethod
+    def _validate_remote_maestro_sdb_path(path: str) -> None:
+        """Validate an internally resolved read-only ``maestro.sdb`` path.
+
+        This is intentionally narrower than ``_validate_remote_output_dir``:
+        the input comes from ``ddGetObj(... "maestro")~>readPath`` for the
+        already-open scoped ADE setup, not from the LLM or user prompt. Real
+        project trees may include process-node-looking directory names, so this
+        validator does not reject ``_FOUNDRY_LEAK_RE`` in the path itself.
+        The path is never returned to callers; only the bounded ``<specs>``
+        excerpt is returned and then scrubbed by ``read_maestro_setup_summary``.
+        """
+        if not isinstance(path, str) or not path:
+            raise ValueError("maestro path must be a non-empty string")
+        if len(path) > 1024:
+            raise ValueError(f"maestro path too long (len={len(path)})")
+        if "//" in path:
+            raise ValueError(
+                f"maestro path contains empty path component '//' "
+                f"(len={len(path)})."
+            )
+        normalized = posixpath.normpath(path)
+        if normalized != path:
+            raise ValueError(
+                f"maestro path is not normalized (len={len(path)})."
+            )
+        if not _SAFE_PSF_DIR_RE.fullmatch(path):
+            raise ValueError(
+                f"maestro path contains forbidden characters "
+                f"(len={len(path)})."
+            )
+        segments = path.split("/")
+        if any(seg == ".." for seg in segments):
+            raise ValueError(
+                f"maestro path contains '..' traversal (len={len(path)})."
+            )
+        if len(segments) < 3 or segments[-2:] != ["maestro", "maestro.sdb"]:
+            raise ValueError(
+                "maestro path must end with /maestro/maestro.sdb "
+                f"(len={len(path)})."
+            )
+        forbidden_prefixes = (
+            "/proc/", "/sys/", "/dev/", "/etc/", "/root/",
+            "/bin/", "/sbin/", "/usr/", "/lib/", "/lib64/",
+            "/boot/", "/opt/", "/cadence/", "/cad/", "/pdk/",
+            "/eda/", "/tools/",
+        )
+        for fp in forbidden_prefixes:
+            if path == fp.rstrip("/") or path.startswith(fp):
+                raise ValueError(
+                    f"maestro path starts with forbidden system prefix "
+                    f"(len={len(path)})."
+                )
+        if "~" in path:
+            raise ValueError(
+                f"maestro path contains '~' (len={len(path)})."
+            )
+        active_roots = _resolve_remote_output_roots()
+        if not any(path.startswith(p) for p in active_roots):
+            raise ValueError(
+                f"maestro path must start with one of {list(active_roots)} "
+                f"(len={len(path)})."
+            )
 
     # ------------------------------------------------------------------ #
     #  Maestro Outputs Setup writers (add_output / set_spec /

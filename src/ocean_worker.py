@@ -87,6 +87,7 @@ class OceanWorkerConfig:
     remote_tmp_dir: str = DEFAULT_REMOTE_TMP_DIR
     wall_timeout_s: float = DEFAULT_WALL_TIMEOUT_S
     ssh_connect_timeout_s: int = DEFAULT_SSH_CONNECT_TIMEOUT_S
+    remote_init_cmd: str = ""
 
     def ssh_target(self) -> str:
         return f"{self.remote_user}@{self.remote_host}"
@@ -322,7 +323,8 @@ class OceanWorker:
         budget_s: float,
         run_id: str,
     ) -> None:
-        # Wrapper shell: (a) record PID, (b) setenv, (c) exec virtuoso.
+        # Wrapper shell: (a) record PID, (b) optionally initialise the
+        # remote EDA environment, (c) setenv, (d) exec virtuoso.
         # Using bash -lc so the env inherits module system etc. We write
         # PID *before* exec so a timeout kill can find it even if virtuoso
         # is stuck during startup.
@@ -335,11 +337,15 @@ class OceanWorker:
         exports_line = " ".join(
             f"export {k}={shlex.quote(v)};" for k, v in env_exports.items()
         )
+        init_line = ""
+        if self.cfg.remote_init_cmd.strip():
+            init_line = self.cfg.remote_init_cmd.strip().rstrip(";") + "; "
         worker_ocn = (
             f"{self.cfg.remote_skill_dir}/psf_dump_worker.ocn"
         )
         wrapper = (
             f"echo $$ > {shlex.quote(remote_pidfile)}; "
+            f"{init_line}"
             f"{exports_line} "
             f"exec {shlex.quote(self.cfg.virtuoso_bin)} "
             f"-ocean -nograph -restore {shlex.quote(worker_ocn)}"
@@ -527,6 +533,7 @@ def worker_from_env() -> OceanWorker:
       - VB_REMOTE_SKILL_DIR: remote SKILL dir (defaulted to the value
         we've been using on remote host)
       - VB_VIRTUOSO_BIN: optional override
+      - VB_OCEAN_INIT_CMD: optional remote bash snippet to load Cadence env
       - VB_OCEAN_TIMEOUT_S: optional wall-clock override
     """
     host = os.environ.get("VB_REMOTE_HOST")
@@ -549,6 +556,7 @@ def worker_from_env() -> OceanWorker:
         virtuoso_bin=os.environ.get(
             "VB_VIRTUOSO_BIN", DEFAULT_VIRTUOSO_BIN,
         ),
+        remote_init_cmd=os.environ.get("VB_OCEAN_INIT_CMD", ""),
         wall_timeout_s=float(
             os.environ.get("VB_OCEAN_TIMEOUT_S", DEFAULT_WALL_TIMEOUT_S)
         ),

@@ -322,6 +322,59 @@ class TestOpenAIFactory:
         _, kwargs = mock_sdk.call_args
         assert kwargs["base_url"] == "https://right.example/v1"
 
+    def test_global_http_timeout_reaches_sdk(self):
+        with patch.dict(
+            "os.environ",
+            {"LLM_HTTP_TIMEOUT": "123"},
+            clear=False,
+        ), patch("openai.OpenAI") as mock_sdk:
+            OpenAIClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert kwargs["timeout"] == 123.0
+
+    def test_provider_http_timeout_overrides_global(self):
+        with patch.dict(
+            "os.environ",
+            {"LLM_HTTP_TIMEOUT": "123", "OPENAI_HTTP_TIMEOUT": "45"},
+            clear=False,
+        ), patch("openai.OpenAI") as mock_sdk:
+            OpenAIClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert kwargs["timeout"] == 45.0
+
+    def test_invalid_http_timeout_falls_back(self):
+        with patch.dict(
+            "os.environ",
+            {"OPENAI_HTTP_TIMEOUT": "not-a-number"},
+            clear=False,
+        ), patch("openai.OpenAI") as mock_sdk:
+            client = OpenAIClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert client.timeout == 300.0
+        assert kwargs["timeout"] == 300.0
+
+    def test_global_sdk_max_retries_reaches_sdk(self):
+        with patch.dict(
+            "os.environ",
+            {"LLM_SDK_MAX_RETRIES": "1"},
+            clear=False,
+        ), patch("openai.OpenAI") as mock_sdk:
+            client = OpenAIClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert client.max_retries == 1
+        assert kwargs["max_retries"] == 1
+
+    def test_invalid_sdk_max_retries_falls_back(self):
+        with patch.dict(
+            "os.environ",
+            {"OPENAI_SDK_MAX_RETRIES": "not-a-number"},
+            clear=False,
+        ), patch("openai.OpenAI") as mock_sdk:
+            client = OpenAIClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert client.max_retries == 5
+        assert kwargs["max_retries"] == 5
+
 
 class TestOpenAIReasoningScrub:
     def test_content_path(self, openai_client):
@@ -565,6 +618,43 @@ class TestMimoFactory:
             MimoClient(api_key="test-key")
         _, kwargs = mock_sdk.call_args
         assert kwargs["base_url"] == "https://proxy.example/v1"
+
+    def test_provider_http_timeout_overrides_global(self):
+        with patch.dict(
+            "os.environ",
+            {"LLM_HTTP_TIMEOUT": "123", "MIMO_HTTP_TIMEOUT": "90"},
+            clear=False,
+        ), patch("openai.OpenAI") as mock_sdk:
+            client = MimoClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert client.timeout == 90.0
+        assert kwargs["timeout"] == 90.0
+
+    def test_mimo_default_timeout_and_retries_are_bounded(self):
+        import os
+        with patch.dict("os.environ", {}, clear=False), \
+             patch("openai.OpenAI") as mock_sdk:
+            os.environ.pop("MIMO_HTTP_TIMEOUT", None)
+            os.environ.pop("LLM_HTTP_TIMEOUT", None)
+            os.environ.pop("MIMO_SDK_MAX_RETRIES", None)
+            os.environ.pop("LLM_SDK_MAX_RETRIES", None)
+            client = MimoClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert client.timeout == 120.0
+        assert client.max_retries == 0
+        assert kwargs["timeout"] == 120.0
+        assert kwargs["max_retries"] == 0
+
+    def test_provider_sdk_max_retries_overrides_global(self):
+        with patch.dict(
+            "os.environ",
+            {"LLM_SDK_MAX_RETRIES": "3", "MIMO_SDK_MAX_RETRIES": "0"},
+            clear=False,
+        ), patch("openai.OpenAI") as mock_sdk:
+            client = MimoClient(api_key="test-key")
+        _, kwargs = mock_sdk.call_args
+        assert client.max_retries == 0
+        assert kwargs["max_retries"] == 0
 
 
 class TestMimoReasoningScrub:

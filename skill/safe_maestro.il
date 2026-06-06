@@ -138,8 +138,16 @@ procedure(safeMaestro_findSessionForScope(libName cellName)
 ;;;   non-nil result wins. Probe on IC23.1 remote host confirmed
 ;;;   isCallable('axlSetVarValue) = t.
 ;;; ----------------------------------------------------------------
+procedure(safeMaestro_validSetupDb(sdb)
+    ;; ADE Explorer can return numeric 0 when no setup DB handle is
+    ;; available.  In SKILL, 0 is truthy, so a plain when(sdb) would
+    ;; still call axl* APIs and trigger repeated EXPLORER-2404 errors.
+    and(sdb not(and(numberp(sdb) zerop(sdb))))
+)
+
 procedure(safeMaeWriteAndSave(libName cellName varList)
-    prog((session sdb errors appliedCount setupDbCount
+    prog((session sdb errors appliedCount setupDbCount testScopedCount
+           testNames testName testSetResult
            varName varVal varNameLower result varHandle
            sigA sigB sigC setupDbNames snapshotParts)
 
@@ -165,8 +173,30 @@ procedure(safeMaeWriteAndSave(libName cellName varList)
         ;; ---- Get the setup DB for axl* writes ----
         sdb = nil
         errset(sdb = axlGetMainSetupDB(session))
+        unless(safeMaestro_validSetupDb(sdb)
+            sdb = nil
+        )
         ;; sdb may be nil on older Virtuoso; axl* path will be skipped.
         ;; maeSetVar path still runs as fallback.
+
+        ;; Explorer's visible Design Variables pane is backed by test-local
+        ;; sevVariableStruct/expression entries.  Plain maeSetVar writes the
+        ;; runtime/global value used for netlisting, but leaves those
+        ;; test-local expressions blank.  Discover open tests once and mirror
+        ;; every variable write into each test scope below.
+        testNames = nil
+        when(sdb
+            let((testsResult)
+                errset(testsResult = axlGetTests(sdb))
+                ;; axlGetTests returns (handle ("test1" "test2" ...)).
+                when(and(listp(testsResult) cdr(testsResult))
+                    testNames = cadr(testsResult)
+                )
+            )
+        )
+        unless(listp(testNames)
+            errset(testNames = maeGetSetup(?session session))
+        )
 
         ;; ---- Validate all (name value) pairs first ----
         errors = nil
@@ -199,6 +229,7 @@ procedure(safeMaeWriteAndSave(libName cellName varList)
         ;; ---- Apply each var: dual-write (axl* + mae*) ----
         appliedCount = 0
         setupDbCount = 0
+        testScopedCount = 0
         foreach(pair varList
             varName = car(pair)
             varVal  = cadr(pair)
@@ -253,6 +284,24 @@ procedure(safeMaeWriteAndSave(libName cellName varList)
                 ))
             )
             appliedCount = appliedCount + 1
+
+            ;; ---- Path 3: test-local GUI variable expression write ----
+            when(listp(testNames)
+                foreach(testName testNames
+                    when(stringp(testName)
+                        testSetResult = nil
+                        errset(testSetResult =
+                            maeSetVar(varName varVal
+                                      ?typeName "test"
+                                      ?typeValue list(testName)
+                                      ?session session)
+                        )
+                        when(testSetResult
+                            testScopedCount = testScopedCount + 1
+                        )
+                    )
+                )
+            )
         )
 
         ;; ---- Save against the SAME pinned session ----
@@ -294,8 +343,188 @@ procedure(safeMaeWriteAndSave(libName cellName varList)
             "{\"ok\":true,"
             "\"varsWritten\":" sprintf(nil "%d" appliedCount) ","
             "\"setupDbWritten\":" sprintf(nil "%d" setupDbCount) ","
+            "\"testScopedWritten\":" sprintf(nil "%d" testScopedCount) ","
             "\"saved\":true,"
             "\"setupDbVars\":[" buildString(reverse(snapshotParts) ",") "]"
+            "}"
+        ))
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; safeMaeSetupSummary -- read-only bounded setup summary.
+;;;
+;;; Returns only safe setup metadata needed by PC-side verification:
+;;; tests, enabled analyses, output row names/expr/signal, variable
+;;; values visible at each test, and raw saved specs. It deliberately
+;;; does not return active.state / maestro.sdb file contents.
+;;; ----------------------------------------------------------------
+procedure(safeMae_jsonString(value)
+    let((s)
+        s = ""
+        when(value
+            if(stringp(value) then
+                s = value
+            else
+                s = sprintf(nil "%L" value)
+            )
+        )
+        strcat("\"" safeHelpers_jsonEscape(s) "\"")
+    )
+)
+
+
+procedure(safeMaeSetupSummary(libName cellName testFilter)
+    prog((session sdb testsResult testNames varsResult varNames
+           specsRaw testParts testName includeTest
+           anas ana anaParts rawAna outputs o outputParts
+           outName outSignal outExpr varParts varName varVal)
+
+        unless(safeSetParam_validateName(libName "lib")
+            return("{\"ok\":false,\"error\":\"Invalid library name\"}")
+        )
+        unless(safeSetParam_validateName(cellName "cell")
+            return("{\"ok\":false,\"error\":\"Invalid cell name\"}")
+        )
+        unless(stringp(testFilter)
+            return("{\"ok\":false,\"error\":\"test filter must be string\"}")
+        )
+
+        session = safeMaestro_findSessionForScope(libName cellName)
+        unless(session
+            return(strcat(
+                "{\"ok\":false,\"error\":\""
+                "No open Maestro session for scope -- open Maestro for the "
+                "scoped testbench cell in ADE before retrying."
+                "\"}"
+            ))
+        )
+
+        sdb = nil
+        errset(sdb = axlGetMainSetupDB(session))
+        unless(safeMaestro_validSetupDb(sdb)
+            sdb = nil
+        )
+
+        testNames = nil
+        when(sdb
+            errset(testsResult = axlGetTests(sdb))
+            when(and(listp(testsResult) cdr(testsResult))
+                testNames = cadr(testsResult)
+            )
+        )
+        unless(listp(testNames)
+            errset(testNames = maeGetSetup(?session session))
+        )
+        unless(listp(testNames)
+            testNames = nil
+        )
+
+        varNames = nil
+        when(sdb
+            errset(varsResult = axlGetVars(sdb))
+            when(and(listp(varsResult) cdr(varsResult))
+                varNames = cadr(varsResult)
+            )
+        )
+        unless(listp(varNames)
+            varNames = nil
+        )
+
+        ;; Saved spec bounds live in maestro.sdb on some Cadence builds, while
+        ;; maeGetSetup(?typeName "specs") can be slow or return nil. Keep this
+        ;; SKILL helper bounded to live ADE APIs; Python fills specsRaw through
+        ;; a read-only, path-validated SSH read of just the <specs> section.
+        specsRaw = ""
+
+        testParts = nil
+        foreach(testName testNames
+            when(stringp(testName)
+                includeTest = nil
+                when(or(equal(testFilter "") equal(testFilter testName))
+                    includeTest = t
+                )
+                when(includeTest
+                    anaParts = nil
+                    anas = nil
+                    errset(anas = maeGetEnabledAnalysis(testName ?session session))
+                    when(listp(anas)
+                        foreach(ana anas
+                            when(stringp(ana)
+                                rawAna = ""
+                                errset(rawAna = maeGetAnalysis(testName ana ?session session))
+                                anaParts = cons(strcat(
+                                    safeMae_jsonString(ana)
+                                    ":{\"enabled\":true,\"raw\":"
+                                    safeMae_jsonString(rawAna) "}"
+                                ) anaParts)
+                            )
+                        )
+                    )
+
+                    outputParts = nil
+                    outputs = nil
+                    errset(outputs = maeGetTestOutputs(testName ?session session))
+                    when(listp(outputs)
+                        foreach(o outputs
+                            outName = nil
+                            outSignal = nil
+                            outExpr = nil
+                            errset(outName = o~>name)
+                            errset(outSignal = o~>signal)
+                            errset(outExpr = o~>expression)
+                            when(outName
+                                outputParts = cons(strcat(
+                                    "{\"name\":" safeMae_jsonString(outName)
+                                    ",\"signal\":" safeMae_jsonString(outSignal)
+                                    ",\"expr\":" safeMae_jsonString(outExpr)
+                                    "}"
+                                ) outputParts)
+                            )
+                        )
+                    )
+
+                    varParts = nil
+                    when(listp(varNames)
+                        foreach(varName varNames
+                            when(stringp(varName)
+                                varVal = nil
+                                errset(varVal = maeGetVar(varName
+                                                          ?typeName "test"
+                                                          ?typeValue list(testName)
+                                                          ?session session))
+                                unless(varVal
+                                    errset(varVal = maeGetVar(varName
+                                                              ?session session))
+                                )
+                                varParts = cons(strcat(
+                                    safeMae_jsonString(varName) ":"
+                                    safeMae_jsonString(varVal)
+                                ) varParts)
+                            )
+                        )
+                    )
+
+                    testParts = cons(strcat(
+                        safeMae_jsonString(testName)
+                        ":{\"analyses\":{"
+                        buildString(reverse(anaParts) ",")
+                        "},\"outputs\":["
+                        buildString(reverse(outputParts) ",")
+                        "],\"variables\":{"
+                        buildString(reverse(varParts) ",")
+                        "}}"
+                    ) testParts)
+                )
+            )
+        )
+
+        return(strcat(
+            "{\"ok\":true,"
+            "\"session\":" safeMae_jsonString(session) ","
+            "\"tests\":{" buildString(reverse(testParts) ",") "},"
+            "\"specsRaw\":" safeMae_jsonString(specsRaw)
             "}"
         ))
     )
@@ -351,6 +580,9 @@ procedure(safeMae_debugInfo(libName cellName)
         sdb = nil
         when(stringp(resolvedSess)
             errset(sdb = axlGetMainSetupDB(resolvedSess))
+        )
+        unless(safeMaestro_validSetupDb(sdb)
+            sdb = nil
         )
         printf("[SETUP-DB] sdb=%L\n" sdb)
 

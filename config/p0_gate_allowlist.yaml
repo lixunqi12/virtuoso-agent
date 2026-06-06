@@ -47,14 +47,11 @@ paths:
   # Pattern configuration yamls — the patterns themselves contain the
   # foundry strings they exist to redact. The .private.yaml is
   # gitignored and holds real tokens; the others are public.
-  - config/hspice_scrub_patterns.yaml
   - config/hspice_scrub_patterns.template.yaml
-  - config/hspice_scrub_patterns.private.yaml
 
   # Project / configuration docs that discuss the leak surface.
   - CLAUDE.md
   - README.md
-  - config/pdk_map.yaml
 
   # Per-DUT spec markdowns are gitignored (see .gitignore) but a developer
   # working a hspice loop will have them locally. They legitimately
@@ -71,18 +68,15 @@ path_prefixes:
   - reviews/
 
   # SKILL source code (foundry-aware Cadence integration).
-  - skill/
 
   # Agent transcript logs (gitignored; written next to specs during runs).
   # These hold raw scrubbed hspice transcript output and may legitimately
   # contain foundry-shaped tokens that survived a partial scrub of a
   # third-party log line. Allowlisted so the P0 gate doesn't trip on
   # local-only artifacts; .gitignore prevents them being committed.
-  - config/logs/
 
   # Per-project artifacts (gitignored — see .gitignore `projects/*`).
   # Each project subdir holds the local copy of the spec, the scrubbed
   # netlist read back from the remote host, simulation outputs, and run
   # logs. None of this ships to GitHub; allowlisted so the local P0
   # gate stays quiet while the developer iterates.
-  - projects/

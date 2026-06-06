@@ -71,7 +71,9 @@ let((root outPath points fh first)
                 fprintf(fh "  {\"point\":%L,\"vctrl\":%L,\"f_osc_GHz\":%L}"
                     pidx vctrl (val * 1.0e-9))
             )
-            errset(unselectResult())
+            when(isCallable('unselectResult)
+                errset(unselectResult() t)
+            )
         )
     )
 

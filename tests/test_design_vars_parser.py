@@ -48,6 +48,27 @@ class TestNormalParse:
         result = _load_allowed_design_vars(valid_spec)
         assert result == ("Ibias", "nfin_neg", "C", "L")
 
+    def test_yaml_design_vars_block(self, tmp_path):
+        spec = tmp_path / "opamp_spec.md"
+        spec.write_text(
+            "## 3. Design variables\n\n"
+            "```yaml\n"
+            "design_vars:\n"
+            "  ac_magnitude: \"1\"\n"
+            "  cmfb_bias: \"1\"\n"
+            "  miller_c: \"1\"\n"
+            "  nfin_p_bias: \"1\"\n"
+            "```\n\n"
+            "## 4. Required setup\n",
+            encoding="utf-8",
+        )
+        assert _load_allowed_design_vars(spec) == (
+            "ac_magnitude",
+            "cmfb_bias",
+            "miller_c",
+            "nfin_p_bias",
+        )
+
 
 class TestFileMissing:
     def test_raises_runtime_error(self, tmp_path):

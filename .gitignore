@@ -63,6 +63,11 @@ reviews/
 
 # Paper build artifacts (generated; can carry local paths / stale prose)
 paper/data/*.bak
+paper/data/lc_vco_evidence_*.jsonl
+paper/data/lc_vco_evidence_*.csv
+paper/repro/
+paper/opamp_schematic/
+paper/opamp_topology_papers/
 paper/main.aux
 paper/main.bbl
 paper/main.blg

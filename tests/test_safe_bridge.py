@@ -21,7 +21,13 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.safe_bridge import SafeBridge, _scrub, _validate_name
+from src.safe_bridge import (
+    SafeBridge,
+    _scrub,
+    _validate_name,
+    assess_op_point_save_effectiveness,
+    assert_llm_feedback_safe,
+)
 
 
 @pytest.fixture
@@ -754,6 +760,8 @@ class TestSkillEntrypointAllowlist:
             'safeReadSchematic("lib" "cell")',
             'safeReadOpPoint("lib" "cell")',
             'safeSetParam("lib" "cell" "M1" list())',
+            'safeReadMaestroDcOpPoint("ExplorerRun.0" list("/Vout_p") list("/I0/M0"))',
+            'safeReadDcOpPointFromResults("/home/user/sim/opamp/spectre/schematic" list("/Vout_p") list("/I0/M0"))',
             'read_schematic("lib" "cell")',
             'read_op_point("lib" "cell")',
             'set_instance_param("lib" "cell" "M1" list())',
@@ -1449,6 +1457,470 @@ class TestReadOpPointAfterTran:
         with pytest.raises(RuntimeError, match="unsafe characters"):
             op_bridge.read_op_point_after_tran()
         op_bridge.client.execute_skill.assert_not_called()
+
+
+class TestReadDcOpPointFromResults:
+    """Current-run dc/instance OP readback after run_ocean_sim."""
+
+    @pytest.fixture
+    def op_bridge(self, pdk_map_file, tmp_path):
+        b = SafeBridge(
+            MagicMock(),
+            pdk_map_file,
+            skill_dir=tmp_path / "no_skill",
+        )
+        b._skill_loaded = True
+        b._last_results_dir = "/home/user/sim/opamp_test/spectre/schematic"
+        return b
+
+    def test_skill_call_and_sanitized_payload(self, op_bridge, monkeypatch):
+        captured = {}
+
+        def fake_exec(expr, **kwargs):
+            captured["expr"] = expr
+            return {
+                "ok": True,
+                "source": "psf",
+                "analysis": "dc",
+                "resultKinds": ["dc", "instance", "primitives", "model"],
+                "nodes": {
+                    "/Vout_p": 0.401,
+                    "/Vout_n": 0.399,
+                    "/home/user/sim": 9.9,
+                },
+                "instances": {
+                    "/I0/M0": {
+                        "region": 2,
+                        "vgs": 0.62,
+                        "ids": 11e-6,
+                        "vth": 0.41,
+                        "vdsat": 0.12,
+                        "cgs": 2e-15,
+                        "cgd": 1e-15,
+                        "toxe": 1.23,
+                        "model": "raw_model",
+                    },
+                    "/I0/M1": {"u0": 350},
+                    "/home/user/M2": {"region": 1},
+                },
+                "issues": ["instance result not available"],
+            }
+
+        monkeypatch.setattr(op_bridge, "_execute_skill_json", fake_exec)
+        result = op_bridge.read_dc_op_point_from_results(
+            nets=["/Vout_p", "/Vout_n", "/Vout_p"],
+            instances=["/I0/M0"],
+        )
+
+        assert captured["expr"] == (
+            'safeReadDcOpPointFromResults('
+            '"/home/user/sim/opamp_test/spectre/schematic" '
+            'list("/Vout_p" "/Vout_n") list("/I0/M0"))'
+        )
+        assert result["source"] == "psf"
+        assert result["nodes"] == {"/Vout_p": 0.401, "/Vout_n": 0.399}
+        assert result["resultKinds"] == ["dc", "instance"]
+        assert "/I0/M1" not in result["instances"]
+        assert "/home/user/M2" not in result["instances"]
+        m0 = result["instances"]["/I0/M0"]
+        assert m0["region_label"] == "saturation"
+        assert m0["id"] == pytest.approx(11e-6)
+        assert m0["vov"] == pytest.approx(0.21)
+        assert m0["vdsat"] == 0.12
+        assert m0["cgs"] == 2e-15
+        assert m0["cgd"] == 1e-15
+        assert "toxe" not in m0
+        assert "model" not in m0
+        assert any(
+            issue.startswith("/I0/M0 missing OP fields:")
+            for issue in result["issues"]
+        )
+
+    def test_ids_overrides_terminal_id_for_llm_column(
+        self, op_bridge, monkeypatch
+    ):
+        def fake_exec(expr, **kwargs):
+            return {
+                "ok": True,
+                "source": "psf",
+                "analysis": "dc",
+                "resultKinds": ["dc", "instance"],
+                "nodes": {},
+                "instances": {
+                    "/I0/M0": {
+                        "region": 2,
+                        "id": -23e-3,
+                        "ids": 6.9e-6,
+                    },
+                },
+                "issues": [],
+            }
+
+        monkeypatch.setattr(op_bridge, "_execute_skill_json", fake_exec)
+        result = op_bridge.read_dc_op_point_from_results(
+            instances=["/I0/M0"],
+        )
+
+        assert result["instances"]["/I0/M0"]["id"] == pytest.approx(6.9e-6)
+
+    def test_requested_but_missing_paths_are_reported(self, op_bridge, monkeypatch):
+        def fake_exec(expr, **kwargs):
+            return {
+                "ok": True,
+                "source": "psf",
+                "analysis": "dc",
+                "resultKinds": ["dc", "instance"],
+                "nodes": {"/Vout_p": 0.401},
+                "instances": {"/I0/M9": {"region": 0}},
+                "issues": [],
+            }
+
+        monkeypatch.setattr(op_bridge, "_execute_skill_json", fake_exec)
+        result = op_bridge.read_dc_op_point_from_results(
+            nets=["/Vout_p", "/I0/Vout_p", "/net3", "/I0/net3"],
+            instances=["/I0/M0", "/I0/M1", "/I0/M9"],
+        )
+
+        assert "requested node net3 returned no safe dc value" in result["issues"]
+        assert "/I0/M0 returned no safe OP data" in result["issues"]
+        assert "/I0/M1 returned no safe OP data" in result["issues"]
+        assert "/I0/M9 returned no safe OP data" not in result["issues"]
+
+    def test_missing_psf_dir_raises(self, op_bridge):
+        op_bridge._last_results_dir = None
+        with pytest.raises(RuntimeError, match="no results dir"):
+            op_bridge.read_dc_op_point_from_results(nets=["/Vout_p"])
+        op_bridge.client.execute_skill.assert_not_called()
+
+    def test_unsafe_psf_dir_raises(self, op_bridge):
+        op_bridge._last_results_dir = "/tmp; load(\"evil\")"
+        with pytest.raises(RuntimeError, match="unsafe characters"):
+            op_bridge.read_dc_op_point_from_results(nets=["/Vout_p"])
+        op_bridge.client.execute_skill.assert_not_called()
+
+    def test_requires_at_least_one_requested_path(self, op_bridge):
+        with pytest.raises(ValueError, match="at least one"):
+            op_bridge.read_dc_op_point_from_results()
+
+    def test_dc_op_info_result_kind_survives_sanitizer(
+        self, op_bridge, monkeypatch
+    ):
+        def fake_exec(expr, **kwargs):
+            return {
+                "ok": True,
+                "source": "psf",
+                "analysis": "dc",
+                "resultKinds": ["dcOpInfo", "model"],
+                "nodes": {},
+                "instances": {"/I0/M0": {"region": 2}},
+                "issues": [],
+            }
+
+        monkeypatch.setattr(op_bridge, "_execute_skill_json", fake_exec)
+        result = op_bridge.read_dc_op_point_from_results(
+            instances=["/I0/M0"],
+        )
+        assert result["resultKinds"] == ["dcOpInfo"]
+        assert result["instances"]["/I0/M0"]["region_label"] == "saturation"
+
+    def test_probe_vdsat_aliases_from_results(self, op_bridge, monkeypatch):
+        captured = {}
+
+        def fake_exec(expr, **kwargs):
+            captured["expr"] = expr
+            captured["timeout"] = kwargs.get("timeout")
+            return {
+                "ok": True,
+                "source": "psf",
+                "analysis": "dc",
+                "resultKinds": ["dc", "instance", "primitives", "model"],
+                "instancesTested": 2,
+                "actualName": "vdssat",
+                "candidates": {
+                    "vdsat": {"hits": 0, "example": None, "values": {}},
+                    "vdssat": {
+                        "hits": 2,
+                        "example": 0.123,
+                        "values": {
+                            "/I0/M0": 0.123,
+                            "/I0/M1": 0.124,
+                            "/I0/M2": 0.999,
+                        },
+                    },
+                    "vdseff": {
+                        "hits": 1,
+                        "example": 0.3,
+                        "values": {"/I0/M0": 0.3},
+                    },
+                    "toxe": {
+                        "hits": 1,
+                        "example": 1.2,
+                        "values": {"/I0/M0": 1.2},
+                    },
+                },
+                "issues": ["selectResult('instance) failed"],
+            }
+
+        monkeypatch.setattr(op_bridge, "_execute_skill_json", fake_exec)
+        result = op_bridge.probe_vdsat_aliases_from_results(
+            instances=["/I0/M0", "/I0/M1"],
+        )
+
+        assert captured["expr"] == (
+            'safeReadVdsatAliasProbeFromResults('
+            '"/home/user/sim/opamp_test/spectre/schematic" '
+            'list("/I0/M0" "/I0/M1"))'
+        )
+        assert captured["timeout"] == 240
+        assert result["resultKinds"] == ["dc", "instance"]
+        assert result["actualName"] == "vdssat"
+        assert result["candidates"]["vdssat"]["trueVdsat"] is True
+        assert result["candidates"]["vdssat"]["values"] == {
+            "/I0/M0": 0.123,
+            "/I0/M1": 0.124,
+        }
+        assert result["candidates"]["vdseff"]["trueVdsat"] is False
+        assert "toxe" not in result["candidates"]
+
+
+class TestOpPointAliasProbeSource:
+    def test_vdsat_probe_entrypoint_is_allowed(self):
+        from src.safe_bridge import _ALLOWED_SKILL_ENTRYPOINTS
+
+        assert "safeReadVdsatAliasProbeFromResults" in _ALLOWED_SKILL_ENTRYPOINTS
+
+    def test_vdsat_alias_probe_is_bounded(self):
+        source = (
+            PROJECT_ROOT / "skill" / "safe_read_op_point.il"
+        ).read_text(encoding="utf-8")
+
+        assert "safeReadOpPoint_paramAliases" in source
+        assert 'equal(key "vdsat")' in source
+        assert '"vdssat"' in source
+        assert '"vdsat_eff"' in source
+        assert '"vdsat_c"' in source
+        assert '"vdsat_vadj"' in source
+        assert "safeReadVdsatAliasProbeFromResults" in source
+        assert "safeReadOpPoint_vdsatProbeCandidates" in source
+        assert "asiListInstOpPointNames" in source
+        assert "safeReadOpPoint_getNumericParam" in source
+        alias_block = source.split(
+            "procedure(safeReadOpPoint_paramAliases", 1
+        )[1].split(
+            "procedure(safeReadOpPoint_readCandidateParam", 1
+        )[0]
+        assert "foreach" not in alias_block
+
+
+class TestOpPointSaveEffectiveness:
+    def test_effective_when_saved_scalars_present(self):
+        check = assess_op_point_save_effectiveness(
+            {"opPointsRequested": 11},
+            {
+                "instances": {
+                    "/I0/M0": {
+                        "region": 2,
+                        "vgs": 0.61,
+                        "gm": 1e-3,
+                        "cgs": 2e-15,
+                    },
+                    "/I0/M1": {"region": 2},
+                },
+            },
+        )
+
+        assert check["ok"] is True
+        assert check["devicesWithSavedScalars"] == 1
+        assert check["regionOnlyDevices"] == 1
+        assert check["savedScalarKeys"] == ["cgs", "gm", "vgs"]
+        assert check["optionalScalarKeysMissing"] == ["vdsat"]
+        assert "vdsat alias probe returned no numeric values" not in check["issues"]
+
+    def test_ineffective_when_only_region_returned(self):
+        check = assess_op_point_save_effectiveness(
+            {"opPointsRequested": 3},
+            {"instances": {"/I0/M0": {"region": 2}}},
+        )
+
+        assert check["ok"] is False
+        assert check["devicesWithSavedScalars"] == 0
+        assert check["regionOnlyDevices"] == 1
+        assert "instance OP readback returned only sparse metadata" in check["issues"]
+
+    def test_ineffective_when_saveopoint_not_requested(self):
+        check = assess_op_point_save_effectiveness(
+            {"opPointsRequested": 0},
+            {"instances": {"/I0/M0": {"vgs": 0.6}}},
+        )
+
+        assert check["ok"] is False
+        assert "saveOpPoint requested zero DUT instances" in check["issues"]
+
+
+class TestReadMaestroDcOpPoint:
+    """General Maestro DC OP readback through safeReadMaestroDcOpPoint."""
+
+    @pytest.fixture
+    def maestro_bridge(self, pdk_map_file, tmp_path):
+        b = SafeBridge(
+            MagicMock(),
+            pdk_map_file,
+            skill_dir=tmp_path / "no_skill",
+        )
+        b._skill_loaded = True
+        b.set_scope("pll", "opamp", tb_cell="opamp_test")
+        return b
+
+    def test_skill_call_and_sanitized_payload(
+        self, maestro_bridge, monkeypatch
+    ):
+        captured = {}
+
+        def fake_exec(expr, **kwargs):
+            captured["expr"] = expr
+            return {
+                "ok": True,
+                "history": "ExplorerRun.0",
+                "analysis": "dc",
+                "resultKinds": ["dc", "instance", "model"],
+                "nodes": {
+                    "/Vout_p": 0.401,
+                    "/home/user/sim": 9.9,
+                },
+                "instances": {
+                    "/I0/M0": {
+                        "region": 2,
+                        "vgs": 0.62,
+                        "vth": 0.41,
+                        "vdsat": 0.12,
+                        "cgs": 2e-15,
+                        "cgd": 1e-15,
+                        "toxe": 1.23,
+                        "model": "raw_model",
+                    },
+                    "/home/user/M1": {"region": 1},
+                    "/I0/M1": {"u0": 350},
+                },
+                "issues": ["instance result not available"],
+            }
+
+        monkeypatch.setattr(maestro_bridge, "_execute_skill_json", fake_exec)
+        result = maestro_bridge.read_maestro_dc_op_point(
+            history="ExplorerRun.0",
+            nets=["/Vout_p", "/Vout_p"],
+            instances=["/I0/M0"],
+        )
+
+        assert captured["expr"] == (
+            'safeReadMaestroDcOpPoint("ExplorerRun.0" '
+            'list("/Vout_p") list("/I0/M0"))'
+        )
+        assert result["nodes"] == {"/Vout_p": 0.401}
+        assert result["resultKinds"] == ["dc", "instance"]
+        assert "/home/user/M1" not in result["instances"]
+        assert "/I0/M1" not in result["instances"]
+        assert result["instances"]["/I0/M0"]["region_label"] == "saturation"
+        assert result["instances"]["/I0/M0"]["vov"] == pytest.approx(0.21)
+        assert result["instances"]["/I0/M0"]["cgs"] == 2e-15
+        assert "toxe" not in result["instances"]["/I0/M0"]
+        assert "model" not in result["instances"]["/I0/M0"]
+
+    def test_invalid_history_rejected_before_skill(self, maestro_bridge):
+        with pytest.raises(ValueError, match="Invalid Maestro history"):
+            maestro_bridge.read_maestro_dc_op_point(
+                history='ExplorerRun.0")',
+                nets=["/Vout_p"],
+            )
+        maestro_bridge.client.execute_skill.assert_not_called()
+
+    def test_invalid_requested_paths_rejected(self, maestro_bridge):
+        with pytest.raises(ValueError, match="not str"):
+            maestro_bridge.read_maestro_dc_op_point(
+                history="ExplorerRun.0",
+                nets="/Vout_p",
+            )
+        with pytest.raises(ValueError, match="invalid path shape"):
+            maestro_bridge.read_maestro_dc_op_point(
+                history="ExplorerRun.0",
+                nets=["/home/user/sim"],
+            )
+        maestro_bridge.client.execute_skill.assert_not_called()
+
+    def test_requires_at_least_one_requested_path(self, maestro_bridge):
+        with pytest.raises(ValueError, match="at least one"):
+            maestro_bridge.read_maestro_dc_op_point(history="ExplorerRun.0")
+
+
+class TestReadMaestroSetupSummary:
+    """Read-only Maestro setup summary and specs fallback."""
+
+    def test_specs_fallback_allows_internal_maestro_path_but_scrubs_payload(
+        self, pdk_map_file, tmp_path, monkeypatch
+    ):
+        client = MagicMock()
+        client.execute_skill.return_value = SimpleNamespace(
+            output='"/project/user/tsmc_demo/pll/opamp_test/maestro"',
+            errors=[],
+        )
+        client.ssh_runner = MagicMock()
+        client.ssh_runner.run_command.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "<specs><row output=\"A0_diff_db\" gt=\"50\" />"
+                "<note>tsmc_demo</note></specs>"
+            ),
+        )
+        bridge = SafeBridge(
+            client,
+            pdk_map_file,
+            skill_dir=tmp_path / "no_skill",
+        )
+        bridge._skill_loaded = True
+        bridge.set_scope("pll", "opamp", tb_cell="opamp_test")
+
+        def fake_exec(expr, **kwargs):
+            assert expr == (
+                'safeMaeSetupSummary("pll" "opamp_test" '
+                '"pll_opamp_test_1")'
+            )
+            return {
+                "ok": True,
+                "session": "Explorer.0",
+                "tests": {"pll_opamp_test_1": {}},
+                "specsRaw": "",
+            }
+
+        monkeypatch.setattr(bridge, "_execute_skill_json", fake_exec)
+        summary = bridge.read_maestro_setup_summary(test="pll_opamp_test_1")
+
+        assert "A0_diff_db" in summary["specsRaw"]
+        assert "tsmc_demo" not in summary["specsRaw"].lower()
+        assert "<redacted>" in summary["specsRaw"]
+        command = client.ssh_runner.run_command.call_args.args[0]
+        assert "maestro.sdb" in command
+        assert "head -c 20000" in command
+
+
+class TestLlmFeedbackGate:
+    def test_accepts_clean_feedback(self):
+        text = "Device /I0/M0: region=saturation, vth=410mV"
+        assert assert_llm_feedback_safe(text, context="unit feedback") == text
+
+    def test_rejects_foundry_token_without_echoing_it(self):
+        raw = "bad token nch_synthetic_device"
+        with pytest.raises(ValueError) as exc_info:
+            assert_llm_feedback_safe(raw, context="unit feedback")
+        msg = str(exc_info.value)
+        assert "nch_synthetic_device" not in msg
+        assert "foundry/model token" in msg
+
+    def test_rejects_absolute_path_without_echoing_it(self):
+        raw = "bad path C:\\Users\\alice\\secret"
+        with pytest.raises(ValueError) as exc_info:
+            assert_llm_feedback_safe(raw, context="unit feedback")
+        msg = str(exc_info.value)
+        assert "C:\\Users\\alice\\secret" not in msg
+        assert "absolute path" in msg
 
 
 # ---------------------------------------------------------------- #
@@ -2337,6 +2809,7 @@ class TestSafeBridgeFindInputScs:
     def test_entrypoint_in_allowlist(self):
         from src.safe_bridge import _ALLOWED_SKILL_ENTRYPOINTS
         assert "safeMaeFindInputScs" in _ALLOWED_SKILL_ENTRYPOINTS
+        assert "safeMaeSetupSummary" in _ALLOWED_SKILL_ENTRYPOINTS
 
     def test_safe_mae_find_il_in_helper_list(self):
         bridge_source = (

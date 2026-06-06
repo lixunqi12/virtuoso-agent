@@ -93,6 +93,26 @@ def test_sweep_results_root_undoes_msys_path_conversion(monkeypatch) -> None:
     assert args.sweep_results_root == "/home/u/sim/Interactive.0"
 
 
+def test_fixed_design_var_and_ignore_setup_args(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_agent.py",
+            "--spec", "spec.md",
+            "--lib", "pll",
+            "--cell", "opamp",
+            "--tb-cell", "opamp_test",
+            "--fixed-design-var", "Vicm,ac_magnitude",
+            "--fixed-design-var", "n_phase",
+            "--ignore-llm-maestro-setup",
+        ],
+    )
+    args = parse_args()
+    assert args.fixed_design_var == ["Vicm,ac_magnitude", "n_phase"]
+    assert args.ignore_llm_maestro_setup is True
+
+
 @pytest.mark.parametrize("llm", LLM_CHOICES)
 def test_every_argparse_choice_is_dispatchable(llm: str, monkeypatch) -> None:
     """The reverse direction: every CLI choice must correspond to a real

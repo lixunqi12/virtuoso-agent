@@ -42,6 +42,51 @@ Set-Location $RepoRoot
 
 $Banned = 'nch_|pch_|cfmom|rppoly|rm1_|tsmc|tcbn'
 
+$RepoLeakPatterns = @(
+    [pscustomobject]@{
+        Category = 'foundry_seed'
+        Regex = [regex]::new(
+            '\b(?:' + $Banned + ')\w*',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    },
+    [pscustomobject]@{
+        Category = 'absolute_path'
+        Regex = [regex]::new(
+            '((?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s''"<>|*?]+)|' +
+            '(/(?:home|project|proj|nfs|mnt|scratch|cadence|cad|pdk|eda|tools|private|work)/[^\s''"<>|*?]+)',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    },
+    [pscustomobject]@{
+        Category = 'secret_or_license_assignment'
+        Regex = [regex]::new(
+            '\b(?:[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)|LM_LICENSE_FILE|CDS_LIC_FILE)\s*=\s*[^#\s][^#]*',
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+    }
+)
+
+# Paths that must never be tracked, even with `git add -f`. These are
+# local secrets, private scrub configs, runtime artifacts, and generated
+# paper packages that can carry host paths or PDK-shaped transcript text.
+$ForbiddenTrackedExact = @(
+    'config/.env',
+    'config/.sync.local',
+    'config/hspice_scrub_patterns.private.yaml',
+    'config/hspice_scrub_patterns.yaml'
+)
+$ForbiddenTrackedPrefixes = @(
+    'config/logs/',
+    'projects/',
+    'paper/repro/',
+    'paper/opamp_schematic/'
+)
+$ForbiddenTrackedWildcards = @(
+    'paper/data/lc_vco_evidence_*.jsonl',
+    'paper/data/lc_vco_evidence_*.csv'
+)
+
 # Excluded top-level directories (third-party, isolated artifacts, or
 # runtime scratch). `tmp` is operator-local scratch — anything that
 # matters out of `tmp` should land in a tracked location first.
@@ -60,6 +105,41 @@ $ExcludedAnywhere = @('__pycache__', '.pytest_cache')
 # Top-level files that are excluded outright (transient logs / chat
 # captures that naturally carry foundry token discussion).
 $ExcludedFiles = @('.chat_recent.jsonl')
+
+
+function Test-P0PlaceholderLine {
+    param([Parameter(Mandatory)][string]$Line)
+    if ($Line -match '<[^>]+>') { return $true }
+    if ($Line -match '\.\.\.') { return $true }
+    if ($Line -match 'example\.(com|edu|org)') { return $true }
+    if ($Line -match 'your[-_][A-Za-z0-9_-]+') { return $true }
+    if ($Line -match '/remote/path') { return $true }
+    return $false
+}
+
+
+function Test-ForbiddenTrackedPath {
+    param([Parameter(Mandatory)][string]$RelPath)
+    if ($RelPath -eq 'projects/.gitkeep') { return $false }
+    if ($ForbiddenTrackedExact -contains $RelPath) { return $true }
+    foreach ($pfx in $ForbiddenTrackedPrefixes) {
+        if ($RelPath.StartsWith($pfx)) { return $true }
+    }
+    foreach ($pat in $ForbiddenTrackedWildcards) {
+        if ($RelPath -like $pat) { return $true }
+    }
+    return $false
+}
+
+
+function Test-GitIgnoredPath {
+    param([Parameter(Mandatory)][string]$RelPath)
+    if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot '.git'))) {
+        return $false
+    }
+    & git -C $RepoRoot check-ignore -q -- $RelPath 2>$null
+    return ($LASTEXITCODE -eq 0)
+}
 
 
 function Read-AllowlistYaml {
@@ -151,21 +231,20 @@ try {
     exit 1
 }
 
-# T8.9 R2: hard-fail if any path under config/logs/ is tracked by git.
-# config/logs/ is gitignored runtime scratch (HSpice transcripts, agent
-# logs). The phase-1 allowlist's path_prefixes entry for "config/logs/"
-# short-circuits the banned-token scan via a pure prefix match - which
-# is the correct posture for ignored local artifacts, but silently
-# admits any file that was force-added with `git add -f` past .gitignore.
-# Close the loop by forbidding *tracked* paths under config/logs/
-# outright; ignored / untracked artifacts are unaffected.
+# T8.9 R2 / publish hardening: hard-fail if protected local/private
+# paths are tracked by git. These paths are gitignored runtime or
+# generated artifacts, but `git add -f` can bypass .gitignore. Check
+# tracked paths before the allowlist so whole-prefix allowlist entries
+# cannot admit a force-added secret, transcript, or repro artifact.
 $gitMarker = Join-Path $RepoRoot '.git'
 if (Test-Path -LiteralPath $gitMarker) {
-    $tracked = & git -C $RepoRoot ls-files -- 'config/logs' 2>$null
+    $tracked = & git -C $RepoRoot ls-files 2>$null
     if ($LASTEXITCODE -eq 0 -and $tracked) {
-        $trackedList = @($tracked | Where-Object { $_ -and $_.Trim() })
+        $trackedList = @($tracked | Where-Object {
+            $_ -and $_.Trim() -and (Test-ForbiddenTrackedPath $_.Trim())
+        })
         if ($trackedList.Count -gt 0) {
-            Write-Host "P0 GATE FAIL (repo): config/logs/ has $($trackedList.Count) tracked file(s) - gitignored runtime artifacts must NEVER be committed (force-add bypass detected):" -ForegroundColor Red
+            Write-Host "P0 GATE FAIL (repo): protected local/private path has $($trackedList.Count) tracked file(s) - these artifacts must NEVER be committed (force-add bypass detected):" -ForegroundColor Red
             foreach ($t in $trackedList) { Write-Host "  $t" -ForegroundColor Red }
             exit 1
         }
@@ -181,6 +260,7 @@ $files = Get-ChildItem -Path $RepoRoot -Recurse -File -Force |
         $top = $parts[0]
         if ($ExcludedTop -contains $top) { return $false }
         if ($parts.Count -eq 1 -and $ExcludedFiles -contains $top) { return $false }
+        if (Test-GitIgnoredPath $rel) { return $false }
         foreach ($p in $parts) {
             if ($ExcludedAnywhere -contains $p) { return $false }
         }
@@ -197,22 +277,36 @@ foreach ($f in $files) {
     }
     if ($prefixHit) { continue }
     try {
-        $hit = Select-String -Path $f.FullName -Pattern $Banned -CaseSensitive:$false -SimpleMatch:$false -List -ErrorAction SilentlyContinue
+        $lineNo = 0
+        foreach ($line in Get-Content -LiteralPath $f.FullName -Encoding UTF8 -ErrorAction Stop) {
+            $lineNo++
+            if (Test-P0PlaceholderLine $line) { continue }
+            foreach ($pat in $RepoLeakPatterns) {
+                if ($pat.Regex.IsMatch($line)) {
+                    $leaks += [pscustomobject]@{
+                        Path = $rel
+                        Category = $pat.Category
+                        Line = $lineNo
+                    }
+                    break
+                }
+            }
+        }
     } catch {
         continue
-    }
-    if ($hit) {
-        $leaks += $rel
     }
 }
 
 $exitCode = 0
 if ($leaks.Count -gt 0) {
-    Write-Host "P0 GATE FAIL (repo): banned tokens found in $($leaks.Count) file(s):" -ForegroundColor Red
-    foreach ($l in $leaks) { Write-Host "  $l" -ForegroundColor Red }
+    Write-Host "P0 GATE FAIL (repo): sensitive patterns found in $($leaks.Count) location(s):" -ForegroundColor Red
+    foreach ($l in $leaks) {
+        Write-Host ("  {0} | category={1} | line={2}" -f `
+            $l.Path, $l.Category, $l.Line) -ForegroundColor Red
+    }
     $exitCode = 1
 } else {
-    Write-Host "P0 GATE PASS (repo): no banned tokens in PC-side source workspace." -ForegroundColor Green
+    Write-Host "P0 GATE PASS (repo): no sensitive patterns in PC-side source workspace." -ForegroundColor Green
 }
 
 

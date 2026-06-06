@@ -35,7 +35,14 @@ from src.agent import (  # noqa: E402
     TOPOLOGY_SANITY_VIOLATION_LIMIT,
     _VALID_DESIGN_VAR_NAMES,
     _coerce_float,
+    _enrich_op_point_terminal_biases,
+    _enforce_legacy_hard_pass_bounds,
+    _extract_legacy_hard_pass_bounds,
+    _format_op_point_summary,
+    _format_topology_with_live_vars,
+    _guard_llm_feedback,
     _has_sanity_violation,
+    _op_point_probe_paths,
 )
 from src.hspice_worker import HspiceRunResult  # noqa: E402
 
@@ -59,6 +66,148 @@ def agent():
 # ---------------------------------------------------------------- #
 #  _all_pass Ã¢â‚¬â€ convergence predicate
 # ---------------------------------------------------------------- #
+
+class TestOpPointFeedbackFormatting:
+    def test_maestro_dc_wrapper_renders_nodes_and_capacitances(self):
+        summary = _format_op_point_summary({
+            "nodes": {
+                "/Vout_p": 0.401,
+                "/Vout_n": 0.399,
+                "/net3": 0.32,
+                "/net6": 0.34,
+                "/net5": 0.405,
+                "/net1": 0.4,
+            },
+            "instances": {
+                "/I0/M0": {
+                    "region": 2,
+                    "region_label": "saturation",
+                    "vgs": 0.62,
+                    "vth": 0.41,
+                    "vdsat": 0.12,
+                    "cgs": 2e-15,
+                    "cgd": 1e-15,
+                    "vov": 0.21,
+                },
+            },
+        })
+
+        assert "DC node voltages" in summary
+        assert "/Vout_p" in summary
+        assert "Device operating point" in summary
+        assert "cgs" in summary
+        assert "cgd" in summary
+        assert "saturation(2)" in summary
+        assert "Derived DC diagnostics" in summary
+        assert "Vout_cm" in summary
+        assert "cmfb_error" in summary
+
+    def test_op_point_probe_paths_include_internal_safe_nets(self):
+        nets, instances = _op_point_probe_paths([
+            {
+                "instName": "M0",
+                "cell": "NMOS_SVT",
+                "nets": {"D": "net3", "G": "Vin_p", "S": "net2"},
+            },
+            {"instName": "I0", "cell": "ISRC", "nets": {"MINUS": "net9"}},
+            {"instName": "C1", "cell": "IDEAL_CAP", "nets": {"PLUS": "net4"}},
+            {"instName": "bad-name", "nets": {"D": "../../bad"}},
+            {"instName": "M10", "cell": "PMOS_SVT", "nets": {"D": "p_bias", "S": "vdd!"}},
+        ])
+
+        for expected in (
+            "/Vout_p", "/Vout_n", "/Vin_p", "/Vin_n", "/net2",
+            "/net3", "/net6", "/net9", "/p_bias", "/cmfb_out",
+            "/I0/net2", "/I0/net3", "/I0/net6", "/I0/net9",
+            "/I0/p_bias", "/I0/cmfb_out",
+        ):
+            assert expected in nets
+        assert "/../../bad" not in nets
+        assert "/I0/M0" in instances
+        assert "/I0/M10" in instances
+        assert "/I0/I0" not in instances
+        assert "/I0/C1" not in instances
+        assert "/I0/bad-name" not in instances
+
+    def test_dc_diagnostics_accept_dut_internal_node_aliases(self):
+        text = _format_op_point_summary({
+            "nodes": {
+                "/I0/Vout_p": 0.405,
+                "/I0/Vout_n": 0.395,
+                "/I0/net3": 0.31,
+                "/I0/net6": 0.35,
+                "/I0/net5": 0.402,
+                "/I0/net1": 0.4,
+            },
+            "instances": {},
+        })
+
+        assert "Vout_cm" in text
+        assert "first_stage_output_cm" in text
+        assert "cmfb_error" in text
+
+    def test_terminal_biases_are_derived_from_nodes_and_topology(self):
+        op_point = {
+            "nodes": {
+                "/I0/net2": 0.25,
+                "/I0/net3": 0.31,
+                "/I0/vdd!": 0.8,
+            },
+            "instances": {
+                "/I0/M0": {"region": 3, "region_label": "subthreshold"},
+            },
+            "issues": [
+                "/I0/M0 missing OP fields: vgs,vds,vov,id,gm,gds",
+            ],
+        }
+        _enrich_op_point_terminal_biases(
+            op_point,
+            [
+                {
+                    "instName": "M0",
+                    "cell": "NMOS_SVT",
+                    "nets": {
+                        "G": "Vin_p",
+                        "D": "net3",
+                        "S": "net2",
+                        "B": "net2",
+                    },
+                },
+            ],
+            {"Vicm": "0.4"},
+        )
+
+        m0 = op_point["instances"]["/I0/M0"]
+        assert m0["vgs"] == pytest.approx(0.15)
+        assert m0["vds"] == pytest.approx(0.06)
+        assert m0["vbs"] == pytest.approx(0.0)
+        assert op_point["issues"] == [
+            "/I0/M0 missing OP fields: vov,id,gm,gds",
+        ]
+        text = _format_op_point_summary(op_point)
+        assert "150mV" in text
+        assert "60mV" in text
+
+    def test_topology_marks_common_opamp_roles(self):
+        text = _format_topology_with_live_vars([
+            {"instName": "M5", "cell": "NMOS", "nets": {}, "params": {}},
+            {"instName": "M8", "cell": "PMOS", "nets": {}, "params": {}},
+        ], {})
+
+        assert "M5 NMOS role=tail current source" in text
+        assert "M8 PMOS role=second-stage PMOS pull-up" in text
+
+    def test_feedback_guard_withholds_absolute_path(self, caplog):
+        with caplog.at_level("ERROR"):
+            guarded = _guard_llm_feedback(
+                "bad path C:\\Users\\alice\\secret",
+                context="unit feedback",
+            )
+
+        assert guarded == "(withheld: unit feedback failed sensitive-token scan)"
+        assert "C:\\Users\\alice\\secret" not in caplog.text
+        assert "absolute path" in caplog.text
+
 
 class TestAllPass:
     def test_all_pass_strings_accepted(self):
@@ -266,6 +415,138 @@ class TestSkillMeasurementsOverride:
 
         assert agent.history[0].measurements["amp_hold_ratio"] == 0.91
 
+    def test_run_ocean_failure_surfaces_as_feedback(self, agent):
+        """A Spectre/OCEAN no-result failure should burn an iteration,
+        not crash the whole optimization run.
+        """
+        agent.llm.chat.side_effect = [
+            self._make_llm_response({"nfin_cc": 12}, amp_hold=0.0),
+            self._make_llm_response({"nfin_cc": 13}, amp_hold=0.91),
+            self._make_llm_response({"nfin_cc": 14}, amp_hold=0.91),
+        ]
+        agent.bridge.run_ocean_sim.side_effect = [
+            RuntimeError(
+                "Spectre produced no requested analysis results; "
+                "check design variables, analyses, and spectre.out"
+            ),
+            {
+                "ok": True,
+                "measurements": {
+                    "amp_hold_ratio": 0.95,
+                    "f_osc_GHz": 19.9,
+                },
+            },
+        ]
+        agent.bridge.write_and_save_maestro.return_value = {
+            "ok": True, "saved": True, "wrote": 1,
+        }
+
+        result = agent.run(
+            lib="pll", cell="LC_VCO", tb_cell="LC_VCO_tb", max_iter=2
+        )
+
+        assert result["abort_reason"] == "max_iter"
+        assert agent.bridge.run_ocean_sim.call_count == 2
+        assert len(agent.history) == 2
+        assert agent.history[0].diagnostic.dump_status == "sim_failed"
+        assert "Spectre produced no requested analysis results" in (
+            agent.history[0].diagnostic.dump_raw_error
+        )
+
+
+class TestLegacyHardPassBounds:
+    """Legacy Markdown specs still need PC-side hard-pass enforcement."""
+
+    OPAMP_SPEC = """
+# OpAmp Spec
+
+| Metric | Meaning | Pass target | Notes |
+|---|---|---:|---|
+| `A0_diff_db` | low-frequency differential gain | `>= 50 dB` | hard pass |
+| `UGB_Hz` | unity-gain bandwidth | `>= 100e6 Hz` | secondary diagnostic |
+
+Hard pass for this first MIMO run is `A0_diff_db >= 50 dB`.
+"""
+
+    def test_extracts_only_marked_hard_pass_bounds(self):
+        bounds = _extract_legacy_hard_pass_bounds(self.OPAMP_SPEC)
+
+        assert set(bounds) == {"A0_diff_db"}
+        assert bounds["A0_diff_db"].op == ">="
+        assert bounds["A0_diff_db"].value == pytest.approx(50.0)
+        assert bounds["A0_diff_db"].unit == "dB"
+
+    def test_enforced_bound_overrides_llm_pass(self):
+        bounds = _extract_legacy_hard_pass_bounds(self.OPAMP_SPEC)
+
+        pass_fail = _enforce_legacy_hard_pass_bounds(
+            {"A0_diff_db": 34.3971814778, "UGB_Hz": 446982761.47},
+            {"A0_diff_db": "PASS", "UGB_Hz": "PASS"},
+            bounds,
+        )
+
+        assert pass_fail["A0_diff_db"].startswith("FAIL")
+        assert pass_fail["UGB_Hz"] == "PASS"
+
+    def test_run_does_not_converge_when_llm_marks_failing_gain_pass(
+        self, tmp_path
+    ):
+        import json as _json
+
+        llm_resp = _json.dumps({
+            "iteration": 1,
+            "design_vars": {"C": "1.5f"},
+            "measurements": {"A0_diff_db": 51.0},
+            "pass_fail": {"A0_diff_db": "PASS", "UGB_Hz": "PASS"},
+            "reasoning": "mock says converged",
+        })
+        llm = MagicMock()
+        llm.chat.side_effect = [llm_resp, llm_resp]
+
+        bridge = MagicMock()
+        bridge._scope_lib = "pll"
+        bridge._scope_tb_cell = "opamp_test"
+        bridge.list_design_vars.return_value = [{"name": "C", "default": "1f"}]
+        bridge.run_ocean_sim.return_value = {
+            "ok": True,
+            "resultsDir": "/tmp",
+            "varsApplied": 1,
+            "analyses": ["dc", "ac"],
+            "measurements": {
+                "A0_diff_db": 34.3971814778,
+                "UGB_Hz": 446982761.47,
+            },
+        }
+        bridge._is_allowed_param_name.return_value = True
+        bridge.read_circuit.return_value = {"instances": []}
+        bridge.last_results_dir = "/sim/out"
+        bridge.read_dc_op_point_from_results.return_value = {}
+
+        agent = CircuitAgent(
+            bridge=bridge,
+            llm=llm,
+            spec=self.OPAMP_SPEC,
+            analysis_type="ac",
+            ocean_worker=MagicMock(),
+            valid_design_vars=("C",),
+            allow_llm_maestro_setup=False,
+        )
+
+        result = agent.run(
+            "pll", "opamp", "opamp_test",
+            max_iter=1,
+            scs_path="/fake/input.scs",
+            transcript_path=str(tmp_path / "t.jsonl"),
+            writeback_enabled=False,
+        )
+
+        assert result["converged"] is False
+        assert result["abort_reason"] == "max_iter"
+        assert result["pass_fail"]["A0_diff_db"].startswith("FAIL")
+        assert result["measurements"]["A0_diff_db"] == pytest.approx(
+            34.3971814778
+        )
+
 
 # ---------------------------------------------------------------- #
 #  Writeback preservation (Q2 directive)
@@ -397,6 +678,34 @@ class TestSpecEmbedding:
         assert "```json" in prompt
         assert '"f_osc": "19.5"' in prompt
         assert '"V_diff_pp": "0.40-0.90"' in prompt
+
+    def test_first_prompt_includes_sanitized_topology(self, agent):
+        agent.bridge.read_circuit.return_value = {
+            "instances": [
+                {
+                    "instName": "M0",
+                    "cell": "NMOS",
+                    "nets": {
+                        "G": "Vin_p",
+                        "D": "net3",
+                        "S": "net2",
+                        "B": "net2",
+                    },
+                    "params": {"fingers": "nfin_n", "l": "16n"},
+                },
+            ],
+        }
+        agent.llm.chat.return_value = ""  # no_changes abort
+
+        agent.run(lib="pll", cell="opamp", tb_cell="opamp_test", max_iter=1)
+
+        prompt = agent.llm.chat.call_args[0][0][0]["content"]
+        assert "## Topology (instances x design-var references)" in prompt
+        assert "M0 NMOS" in prompt
+        assert "G=Vin_p" in prompt
+        assert "D=net3" in prompt
+        assert "fingers=nfin_n" in prompt
+        agent.bridge.read_circuit.assert_called_once_with("pll", "opamp")
 
 
 # ---------------------------------------------------------------- #
@@ -738,6 +1047,94 @@ class TestJSONSchemaValidation:
         }
         assert CircuitAgent._check_contract_violation(parsed) is None
 
+    def test_design_vars_custom_whitelist(self):
+        """run_agent can validate against the active --spec whitelist."""
+        parsed = {
+            "measurements": {},
+            "pass_fail": {},
+            "reasoning": "",
+            "design_vars": {"cmfb_bias": "1", "miller_c": "100f"},
+        }
+        assert CircuitAgent._check_contract_violation(
+            parsed, {"cmfb_bias", "miller_c"}
+        ) is None
+        reason = CircuitAgent._check_contract_violation(parsed, {"C", "L"})
+        assert reason is not None
+        assert "cmfb_bias" in reason
+
+    def test_current_design_var_requires_engineering_suffix(self):
+        parsed = {
+            "measurements": {},
+            "pass_fail": {},
+            "reasoning": "",
+            "design_vars": {"Ibias": "1", "nfin_n": "4"},
+        }
+
+        reason = CircuitAgent._check_contract_violation(
+            parsed, {"Ibias", "nfin_n"}
+        )
+
+        assert reason is not None
+        assert "bare current" in reason
+        assert "10u" in reason
+
+    def test_integer_sizing_design_var_rejects_suffix(self):
+        parsed = {
+            "measurements": {},
+            "pass_fail": {},
+            "reasoning": "",
+            "design_vars": {"nfin_n": "10u"},
+        }
+
+        reason = CircuitAgent._check_contract_violation(parsed, {"nfin_n"})
+
+        assert reason is not None
+        assert "bare integer" in reason
+
+    def test_initial_prompt_uses_runtime_design_var_whitelist(self):
+        """The LLM contract must reflect the active --spec, not defaults."""
+        import json
+
+        llm = MagicMock()
+        llm.chat.return_value = json.dumps({
+            "measurements": {},
+            "pass_fail": {},
+            "reasoning": "",
+            "design_vars": {},
+        })
+        agent = CircuitAgent(
+            bridge=MagicMock(),
+            llm=llm,
+            spec={"target": "custom"},
+            analysis_type="tran",
+            ocean_worker=MagicMock(),
+            valid_design_vars=("cmfb_bias", "miller_c", "Vicm"),
+            fixed_design_vars=("Vicm",),
+            allow_llm_maestro_setup=False,
+        )
+
+        agent.run("pll", "opamp", "opamp_test", max_iter=1)
+
+        prompt = llm.chat.call_args.args[0][0]["content"]
+        whitelist_line = next(
+            line for line in prompt.splitlines()
+            if line.startswith("- **Valid `design_vars` variable names**:")
+        )
+        assert "cmfb_bias" in whitelist_line
+        assert "miller_c" in whitelist_line
+        assert "Vicm" not in whitelist_line
+        assert "nfin_cc" not in whitelist_line
+        fixed_line = next(
+            line for line in prompt.splitlines()
+            if line.startswith("- **Fixed `design_vars`")
+        )
+        assert "Vicm" in fixed_line
+        setup_line = next(
+            line for line in prompt.splitlines()
+            if line.startswith("- **Maestro setup policy**:")
+        )
+        assert "Maestro setup is already configured" in setup_line
+
 
 class TestRepairFlowE2E:
     """End-to-end: one-shot repair triggers LLM re-request."""
@@ -823,6 +1220,28 @@ class TestRepairFlowE2E:
             m for m in repair_call_msgs if m["role"] == "user"
         ]
         assert any("HARD CONSTRAINTS" in m["content"] for m in repair_user_msgs)
+
+    def test_writeback_can_be_disabled(self, tmp_path):
+        """Benchmark ablations can suppress final Maestro persistence."""
+        import json
+
+        good_resp = json.dumps({
+            "iteration": 1,
+            "design_vars": {"C": "1.5f"},
+            "measurements": {"f_osc_GHz": 20.0},
+            "pass_fail": {"f_osc_GHz": "PASS"},
+            "reasoning": "tuned C",
+        })
+        agent, _llm = self._make_agent_with_responses(good_resp, good_resp)
+        result = agent.run(
+            "pll", "LC_VCO", "LC_VCO_tb",
+            max_iter=1,
+            scs_path="/fake/input.scs",
+            transcript_path=str(tmp_path / "t.jsonl"),
+            writeback_enabled=False,
+        )
+        assert result["writeback_status"] == "skipped: disabled"
+        agent.bridge.write_and_save_maestro.assert_not_called()
 
     def test_valid_response_no_repair(self, tmp_path):
         """Valid first response does NOT trigger a repair call."""
@@ -1119,6 +1538,89 @@ class TestUnselectResultCleanup:
 
 _SUSPECT_HI = "UNMEASURABLE (suspect: value 1e6 > sanity hi 1e3)"
 _SUSPECT_LO = "UNMEASURABLE (suspect: value -5 < sanity lo 0)"
+
+
+class TestAcDcOpPointReadback:
+    """AC/DC loops should read current dc/instance PSF OP, not tranOp."""
+
+    def test_ac_dc_uses_current_results_dc_reader(self, tmp_path):
+        import json as _json
+
+        good_resp = _json.dumps({
+            "iteration": 1,
+            "design_vars": {"C": "1.5f"},
+            "measurements": {"gain_diff_db": 55.0},
+            "pass_fail": {"gain_diff_db": "PASS"},
+            "reasoning": "tuned gain",
+        })
+        llm = MagicMock()
+        llm.chat.side_effect = [good_resp]
+
+        bridge = MagicMock()
+        bridge._scope_lib = "pll"
+        bridge._scope_tb_cell = "opamp_test"
+        bridge.list_design_vars.return_value = [{"name": "C", "default": "1f"}]
+        bridge.list_analyses.return_value = [
+            {"name": "dc", "kwargs": []},
+            {"name": "ac", "kwargs": [("start", "1"), ("stop", "100G")]},
+        ]
+        bridge.run_ocean_sim.return_value = {
+            "ok": True,
+            "resultsDir": "/tmp",
+            "varsApplied": 1,
+            "analyses": ["dc", "ac"],
+            "measurements": {"gain_diff_db": 55.0, "amp_hold_ratio": 0.95},
+        }
+        bridge.write_and_save_maestro.return_value = {
+            "ok": True, "saved": True, "varsWritten": 1,
+        }
+        bridge._is_allowed_param_name.return_value = True
+        bridge.read_circuit.return_value = {
+            "instances": [
+                {"instName": "M0"},
+                {"instName": "M1"},
+                {"instName": "bad-name"},
+            ],
+        }
+        bridge.last_results_dir = "/sim/out"
+        bridge.read_dc_op_point_from_results.return_value = {
+            "source": "psf",
+            "nodes": {"/Vout_p": 0.4},
+            "instances": {
+                "/I0/M0": {
+                    "region": 2,
+                    "vgs": 0.5,
+                    "vth": 0.3,
+                    "region_label": "saturation",
+                    "vov": 0.2,
+                },
+            },
+        }
+
+        agent = CircuitAgent(
+            bridge=bridge,
+            llm=llm,
+            spec={"gain_diff_db": "50"},
+            analysis_type="ac",
+            ocean_worker=MagicMock(),
+        )
+        agent.eval_block = None
+
+        result = agent.run(
+            "pll", "opamp", "opamp_test",
+            max_iter=1, scs_path="/fake/input.scs",
+            transcript_path=str(tmp_path / "t.jsonl"),
+        )
+
+        assert result["converged"] is True
+        bridge.read_dc_op_point_from_results.assert_called_once()
+        kwargs = bridge.read_dc_op_point_from_results.call_args.kwargs
+        assert "/Vout_p" in kwargs["nets"]
+        assert "/Vout_n" in kwargs["nets"]
+        assert "/I0/M0" in kwargs["instances"]
+        assert "/I0/M1" in kwargs["instances"]
+        assert "/I0/bad-name" not in kwargs["instances"]
+        bridge.read_op_point_after_tran.assert_not_called()
 
 
 class TestHasSanityViolation:
@@ -1735,6 +2237,25 @@ class TestStripLLMSetupBlocksWhenDerived:
         agent._strip_llm_setup_blocks_if_derived(parsed, iter_idx=0)
         assert parsed == before  # untouched
 
+    def test_strip_honors_preconfigured_maestro_policy(self):
+        """Preconfigured Maestro runs can ignore LLM setup blocks even
+        without a spec eval block."""
+        agent = CircuitAgent(
+            bridge=MagicMock(), llm=MagicMock(),
+            spec={"f_osc": "19.5"}, ocean_worker=MagicMock(),
+            allow_llm_maestro_setup=False,
+        )
+        parsed = {
+            "outputs": [{"name": "m", "expr": 'VT("/V")'}],
+            "analyses": [{"test": "tb", "analysis": "ac", "enable": True}],
+            "measurements": {}, "pass_fail": {},
+            "reasoning": "x", "design_vars": {},
+        }
+        agent._strip_llm_setup_blocks_if_derived(parsed, iter_idx=0)
+        assert "outputs" not in parsed
+        assert "analyses" not in parsed
+        assert CircuitAgent._check_contract_violation(parsed) is None
+
     def test_strip_is_noop_when_no_setup_keys_present(self):
         """When the LLM correctly omits all four blocks (the new
         steady-state behavior under the path-2.5 prompt), the helper
@@ -2037,6 +2558,33 @@ class TestEnsureSweepManifest:
         reason = agent._ensure_sweep_manifest(self._ROOT)
         assert reason is None
         bridge.write_sweep_manifest.assert_not_called()
+
+    def test_skips_write_and_filters_when_existing_is_superset(self):
+        """A wider old ADE sweep can be reused without overwriting it.
+
+        The current run should evaluate only the spec-grid subset, not the
+        extra endpoint points present in the on-disk manifest.
+        """
+        bridge = MagicMock()
+        bridge.read_sweep_manifest.return_value = {
+            10: -0.1,
+            11: 0.9,
+            **{i + 1: round(i * 0.1, 1) for i in range(9)},
+        }
+        bridge.write_sweep_manifest = MagicMock(
+            side_effect=AssertionError("must not overwrite a superset file")
+        )
+        agent = self._agent_with_sweep(bridge)
+        reason = agent._ensure_sweep_manifest(self._ROOT)
+        assert reason is None
+        bridge.write_sweep_manifest.assert_not_called()
+
+        cached = agent._sweep_manifest_cache[self._ROOT]
+        assert sorted(cached.values()) == pytest.approx(
+            [round(i * 0.1, 1) for i in range(9)]
+        )
+        assert -0.1 not in cached.values()
+        assert 0.9 not in cached.values()
 
     def test_aborts_with_mismatch_when_existing_disagrees(self, caplog):
         """Hand-written manifest takes precedence over the spec — the

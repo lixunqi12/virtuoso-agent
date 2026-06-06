@@ -10,13 +10,14 @@
 ;;; so every non-perturb node is warm-started at its equilibrium value.
 ;;;
 ;;; Entry point:
-;;;   safePatchNetlistIC(scsPath fcPath perturbListJson vCmHint)
+;;;   safePatchNetlistIC(scsPath fcPath perturbListJson vCmHint excludeList)
 ;;;
 ;;;     scsPath         : POSIX path to Maestro's input.scs
 ;;;     fcPath          : POSIX path to spectre.fc (usually next to input.scs)
 ;;;     perturbListJson : SKILL list (from PC) of lists, each
 ;;;                       (name offset_mV) — offset_mV is a number.
 ;;;     vCmHint         : Numeric V_cm fallback when fc has no Vout pair.
+;;;     excludeList     : Optional list of node names to omit from bias ICs.
 ;;;
 ;;;   Returns JSON:
 ;;;     {"ok":true,"numBiasNodes":N,"numPerturb":M,"vcmMeasured":v}
@@ -24,7 +25,7 @@
 ;;;
 ;;; Security:
 ;;;   - Both paths validated: non-empty strings, no shell metachars.
-;;;   - Perturb node names validated through safeOcean_validSigName.
+;;;   - IC node names validated through safePatchNetlist_validNodeName.
 ;;;   - fc lines with "#unit A" (branch currents) or ":" in the name
 ;;;     (internal model nodes) are dropped — only top-level net
 ;;;     voltages reach the patched ic statement.
@@ -43,6 +44,15 @@ procedure(safePatchNetlist_validPath(p)
                 when(index(p ch) bad = t)
             )
             and(not(bad) (strlen(p) > 0) (strlen(p) <= 1024))
+        )
+    )
+)
+
+procedure(safePatchNetlist_validNodeName(n)
+    when(stringp(n)
+        if(strlen(n) > 128
+            nil
+            pcreMatchp("^[A-Za-z_][A-Za-z0-9_]{0,31}(\\.[A-Za-z_][A-Za-z0-9_]{0,31}){0,3}\\z" n)
         )
     )
 )
@@ -180,13 +190,21 @@ procedure(safePatchNetlist_num(s)
 ;;;   3. V_cm is the mean of the two first perturb_nodes' fc
 ;;;      values when both are present; otherwise vCmHint.
 ;;; ----------------------------------------------------------------
-procedure(safePatchNetlist_buildIcLine(fcPairs perturbNodes vCmHint)
-    prog((perturbNames biasTokens perturbTokens vcm v1 v2 n1 n2
+procedure(safePatchNetlist_buildIcLine(fcPairs perturbNodes vCmHint
+                                       @optional (excludeNodes nil))
+    prog((perturbNames excludeNames skipNames biasTokens perturbTokens vcm v1 v2 n1 n2
           valStr floatVal fmtStr out)
         perturbNames = nil
         foreach(pn perturbNodes
             perturbNames = cons(car(pn) perturbNames)
         )
+        excludeNames = nil
+        foreach(ex excludeNodes
+            when(stringp(ex)
+                excludeNames = cons(ex excludeNames)
+            )
+        )
+        skipNames = append(perturbNames excludeNames)
 
         ;; Compute V_cm: mean of first two perturb nodes' fc values
         ;; when present. Otherwise fall back to the hint.
@@ -203,7 +221,7 @@ procedure(safePatchNetlist_buildIcLine(fcPairs perturbNodes vCmHint)
 
         biasTokens = nil
         foreach(pair fcPairs
-            unless(member(car(pair) perturbNames)
+            unless(member(car(pair) skipNames)
                 valStr = cadr(pair)
                 floatVal = safePatchNetlist_num(valStr)
                 when(floatVal
@@ -292,9 +310,10 @@ procedure(safePatchNetlist_rewriteScs(scsPath newIcLine)
 ;;; Validates inputs, runs the three-stage pipeline (parse fc →
 ;;; build ic line → rewrite scs), returns JSON status.
 ;;; ----------------------------------------------------------------
-procedure(safePatchNetlistIC(scsPath fcPath perturbList vCmHint)
-    prog((fcPairs icResult newLine vcm nbias rewrote pnClean
-          perturbOne name off)
+procedure(safePatchNetlistIC(scsPath fcPath perturbList vCmHint
+                             @optional (excludeList nil))
+    prog((fcPairs icResult newLine vcm nbias rewrote pnClean exClean
+          perturbOne name off ex)
         unless(safePatchNetlist_validPath(scsPath)
             return("{\"ok\":false,\"error\":\"invalid scsPath\"}")
         )
@@ -307,6 +326,9 @@ procedure(safePatchNetlistIC(scsPath fcPath perturbList vCmHint)
         unless(numberp(vCmHint)
             return("{\"ok\":false,\"error\":\"vCmHint must be numeric\"}")
         )
+        unless(or(null(excludeList) listp(excludeList))
+            return("{\"ok\":false,\"error\":\"excludeList must be a list\"}")
+        )
 
         ;; Validate every perturb entry before touching files.
         pnClean = nil
@@ -317,19 +339,29 @@ procedure(safePatchNetlistIC(scsPath fcPath perturbList vCmHint)
             name = car(pn)
             off  = cadr(pn)
             unless(and(stringp(name) numberp(off)
-                       safeOcean_validSigName(name))
+                       safePatchNetlist_validNodeName(name))
                 return("{\"ok\":false,\"error\":\"perturb name/offset invalid\"}")
             )
             pnClean = cons(list(name off) pnClean)
         )
         pnClean = reverse(pnClean)
 
+        ;; Validate every excluded IC node before touching files.
+        exClean = nil
+        foreach(ex excludeList
+            unless(and(stringp(ex) safePatchNetlist_validNodeName(ex))
+                return("{\"ok\":false,\"error\":\"exclude node invalid\"}")
+            )
+            exClean = cons(ex exClean)
+        )
+        exClean = reverse(exClean)
+
         fcPairs = safePatchNetlist_parseFc(fcPath)
         unless(fcPairs
             return("{\"ok\":false,\"error\":\"spectre.fc unreadable or empty\"}")
         )
 
-        icResult = safePatchNetlist_buildIcLine(fcPairs pnClean vCmHint)
+        icResult = safePatchNetlist_buildIcLine(fcPairs pnClean vCmHint exClean)
         newLine = car(icResult)
         vcm     = cadr(icResult)
         nbias   = caddr(icResult)

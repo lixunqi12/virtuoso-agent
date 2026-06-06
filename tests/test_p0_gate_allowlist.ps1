@@ -350,6 +350,48 @@ path_prefixes: []
     Assert-True ($r.StdOut -match 'src/leak_elsewhere.py') "expected normal phase-1 leak listing; out=$($r.StdOut)"
 }
 
+Test-Case 'protected-tracked-paths: force-added private scrub config fails closed' {
+    $tmp = New-TempRepo -AllowlistContent @"
+paths:
+  - scripts/check_p0_gate.ps1
+path_prefixes: []
+"@
+    & git -C $tmp init --quiet 2>$null | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "git init failed in temp repo $tmp"
+    & git -C $tmp config core.autocrlf false 2>$null | Out-Null
+    & git -C $tmp config core.safecrlf false 2>$null | Out-Null
+    Add-LeakFile -RepoRoot $tmp `
+        -RelPath 'config/hspice_scrub_patterns.private.yaml' `
+        -Token 'nch_lvt'
+    & git -C $tmp add -f -- 'config/hspice_scrub_patterns.private.yaml' 2>$null | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "git add -f failed for private config fixture"
+    $r = Invoke-GateScript -RepoRoot $tmp
+    Assert-True ($r.ExitCode -eq 1) "expected exit 1, got $($r.ExitCode); out=$($r.StdOut)"
+    Assert-True ($r.StdOut -match 'protected local/private path') "expected protected-path wording; out=$($r.StdOut)"
+    Assert-True ($r.StdOut -match 'hspice_scrub_patterns.private.yaml') "expected offending private config listed; out=$($r.StdOut)"
+}
+
+Test-Case 'protected-tracked-paths: force-added paper repro artifact fails closed' {
+    $tmp = New-TempRepo -AllowlistContent @"
+paths:
+  - scripts/check_p0_gate.ps1
+path_prefixes: []
+"@
+    & git -C $tmp init --quiet 2>$null | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "git init failed in temp repo $tmp"
+    & git -C $tmp config core.autocrlf false 2>$null | Out-Null
+    & git -C $tmp config core.safecrlf false 2>$null | Out-Null
+    Add-LeakFile -RepoRoot $tmp `
+        -RelPath 'paper/repro/local_package/runs.jsonl' `
+        -Token 'tsmc'
+    & git -C $tmp add -f -- 'paper/repro/local_package/runs.jsonl' 2>$null | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "git add -f failed for paper repro fixture"
+    $r = Invoke-GateScript -RepoRoot $tmp
+    Assert-True ($r.ExitCode -eq 1) "expected exit 1, got $($r.ExitCode); out=$($r.StdOut)"
+    Assert-True ($r.StdOut -match 'paper/repro/') "expected paper/repro path listed; out=$($r.StdOut)"
+    Assert-True ($r.StdOut -match 'force-add bypass detected') "expected force-add wording; out=$($r.StdOut)"
+}
+
 
 Write-Host ''
 Write-Host ('---- {0} pass, {1} fail ----' -f $pass, $fail)

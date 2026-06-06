@@ -134,11 +134,35 @@ class TestRunOceanSim:
         )
         assert 'list("r" "3k")' in first_expr
         assert 'list("tran")' in first_expr
+        assert first_expr.endswith('"schematic" "schematic" "/I0")')
         assert second_expr.startswith('safeOceanMeasure("/I0")')
         # Measurements are merged into the returned dict so the agent
         # does not have to re-fetch them.
         assert out["measurements"]["f_osc_GHz"] == 19.8
         assert out["measurements"]["amp_hold_ratio"] == 0.97
+
+    def test_dc_analysis_forces_op_rawfile_detail_all(self, bridge, mock_client):
+        mock_client.execute_skill.side_effect = [
+            _FakeResult({
+                "ok": True,
+                "resultsDir": "<results>",
+                "varsApplied": 0,
+                "analyses": ["dc"],
+            }),
+            _FakeResult({"ok": True, "metrics": {}}),
+        ]
+
+        bridge.run_ocean_sim(
+            "pllLib", "opamp", "opamp_test",
+            design_vars={},
+            analyses=[("dc", {"maxiters": "150"})],
+        )
+
+        first_expr = mock_client.execute_skill.call_args_list[0][0][0]
+        assert 'list("dc" list(' in first_expr
+        assert 'list("maxiters" "150")' in first_expr
+        assert 'list("oppoint" "rawfile")' in first_expr
+        assert 'list("detail" "all")' in first_expr
 
     def test_measure_failure_non_fatal(self, bridge, mock_client):
         """safeOceanRun succeeded but safeOceanMeasure returned ok:false.
@@ -377,6 +401,44 @@ class TestWriteAndSaveMaestro:
         })
         with pytest.raises(RuntimeError, match="saved=False"):
             bridge.write_and_save_maestro({"r": "3k"})
+
+
+# ---------------------------------------------------------------- #
+#  read_maestro_setup_summary (readback verification)
+# ---------------------------------------------------------------- #
+
+class TestReadMaestroSetupSummary:
+    def test_builds_expected_skill_call(self, bridge, mock_client):
+        bridge.set_scope("pllLib", "LC_VCO", tb_cell="LC_VCO_tb")
+        mock_client.execute_skill.return_value = _FakeResult({
+            "ok": True,
+            "session": "fnxSession1",
+            "tests": {
+                "LC_VCO_tb": {
+                    "analyses": {"ac": {"enabled": True, "raw": ""}},
+                    "outputs": [{"name": "gain", "signal": "", "expr": "1"}],
+                    "variables": {"C": "1f"},
+                },
+            },
+            "specsRaw": "<specs/>",
+        })
+        out = bridge.read_maestro_setup_summary(test="LC_VCO_tb")
+        expr = mock_client.execute_skill.call_args_list[0][0][0]
+        assert expr == 'safeMaeSetupSummary("pllLib" "LC_VCO_tb" "LC_VCO_tb")'
+        assert out["tests"]["LC_VCO_tb"]["analyses"]["ac"]["enabled"] is True
+
+    def test_requires_scope(self, bridge):
+        with pytest.raises(RuntimeError, match="set_scope"):
+            bridge.read_maestro_setup_summary()
+
+    def test_ok_false_raises(self, bridge, mock_client):
+        bridge.set_scope("pllLib", "LC_VCO", tb_cell="LC_VCO_tb")
+        mock_client.execute_skill.return_value = _FakeResult({
+            "ok": False,
+            "error": "No open Maestro session for scope",
+        })
+        with pytest.raises(RuntimeError, match="No open Maestro session"):
+            bridge.read_maestro_setup_summary()
 
 
 # ---------------------------------------------------------------- #

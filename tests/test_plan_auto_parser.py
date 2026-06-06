@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -111,6 +112,52 @@ class TestFlowStylePerturbNodes:
 # ---------------------------------------------------------------- #
 #  Block-style perturb_nodes — regression guard
 # ---------------------------------------------------------------- #
+
+class TestExcludeNodes:
+    def test_exclude_nodes_parse_and_describe(self):
+        block = (
+            "startup:\n"
+            "  warm_start: auto\n"
+            "  perturb_nodes:\n"
+            "    - {name: Vout_n, offset_mV: +5}\n"
+            "    - {name: Vout_p, offset_mV: -5}\n"
+            "  exclude_nodes:\n"
+            "    - I0.Ctrl\n"
+            "  v_cm_hint_V: 0.75\n"
+        )
+        cfg = _parse_startup_block(block)
+        assert cfg is not None
+        assert cfg.exclude_nodes == ["I0.Ctrl"]
+
+        pa = PlanAuto(cfg, scs_path="/tmp/input.scs", enabled_flag=True)
+        assert "exclude=I0.Ctrl" in pa.describe()
+
+    def test_patch_after_run_forwards_exclude_nodes(self):
+        cfg = StartupConfig(
+            warm_start="auto",
+            perturb_nodes=[
+                PerturbNode("Vout_n", 5.0),
+                PerturbNode("Vout_p", -5.0),
+            ],
+            exclude_nodes=["I0.Ctrl"],
+            v_cm_hint_V=0.75,
+        )
+        bridge = MagicMock()
+        bridge.patch_netlist_ic.return_value = {
+            "ok": True,
+            "numBiasNodes": 4,
+            "vcmMeasured": 0.4,
+        }
+
+        pa = PlanAuto(cfg, scs_path="/tmp/input.scs", enabled_flag=True)
+        result = pa.patch_after_run(bridge, iteration=1)
+
+        assert result["patched"] is True
+        bridge.patch_netlist_ic.assert_called_once()
+        assert bridge.patch_netlist_ic.call_args.kwargs["exclude_nodes"] == [
+            "I0.Ctrl"
+        ]
+
 
 class TestBlockStyleStillWorks:
     """The flow-style fix must not break the legacy block-style path."""

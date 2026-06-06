@@ -483,8 +483,8 @@ def test_validate_rejects_bool_in_sweep_points():
 def test_lc_vco_range_target_is_compatible_with_kvco_cap():
     """Keep the LC_VCO example physically consistent.
 
-    With a 0.8 V control sweep and a hard 2000 MHz/V segment-slope cap,
-    the required total frequency coverage cannot exceed 1.6 GHz.
+    With a 0.6 V control sweep and a hard 2000 MHz/V segment-slope cap,
+    the required total frequency coverage cannot exceed 1.2 GHz.
     """
     text = (
         REPO / "projects" / "lc_vco_base" / "constraints" / "spec.md"
@@ -506,12 +506,13 @@ def test_lc_vco_range_target_is_compatible_with_kvco_cap():
 
 def test_spec_md_baseline_matches_documented_verdict():
     """The §6.3 baseline table claims:
-        tuning_range_GHz=3.76 PASS
+        tuning_range_GHz=3.28 PASS
         Kvco_MHz_per_V    FAIL (8000 exceeds configured upper)
-        Kvco_linearity    FAIL (table reports 30.3)
+        Kvco_linearity    FAIL (table reports about 3.5)
         monotonic         PASS (strictly up)
     Spec values are rounded to 2 dp so our exact float won't match
-    30.3 — verify the qualitative verdict and that the worst slope
+    the documented ratio exactly — verify the qualitative verdict and
+    that the worst slope
     exceeds the documented pass band.
     """
     text = (
@@ -522,8 +523,8 @@ def test_spec_md_baseline_matches_documented_verdict():
     assert block.get("sweep") is not None
     assert len(block.get("tuning_metrics") or []) == 4
 
-    vctrl = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-    fghz = [20.38, 20.83, 21.33, 21.89, 22.51, 23.09, 23.89, 24.11, 24.14]
+    vctrl = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+    fghz = [20.83, 21.33, 21.89, 22.51, 23.09, 23.89, 24.11]
     base = [{"f_osc_GHz": f} for f in fghz]
     meas, pf = spec_evaluator.evaluate_swept(block, base, vctrl)
 
@@ -536,6 +537,6 @@ def test_spec_md_baseline_matches_documented_verdict():
     # UNMEASURABLE (suspect: above sanity hi) — both are NOT PASS.
     assert not pf["Kvco_MHz_per_V"].startswith("PASS")
     assert pf["Kvco_linearity"].startswith("FAIL")
-    # Linearity is the ratio max/min of |Kvco|; documented ~30 reflects
-    # the 8000/264 ratio, so any computed value must be well above 3.0.
+    # Linearity is the ratio max/min of |Kvco|; rounded table values
+    # still leave it above the 3.0 pass threshold.
     assert meas["Kvco_linearity"] > 3.0

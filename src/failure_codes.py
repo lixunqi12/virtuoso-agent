@@ -23,6 +23,7 @@ class DumpStatus:
     NON_OSCILLATING = "non_oscillating"    # probe_ptp detected flat waveform
     NO_SAVED_OUTPUTS = "no_saved_outputs"  # OCN-6034 / VT() returns nil
     SELECT_RESULT_FAILED = "select_result_failed"
+    SIM_FAILED = "sim_failed"              # Spectre/OCEAN run ended early
     UNKNOWN = "unknown"
 
     @classmethod
@@ -35,6 +36,12 @@ class DumpStatus:
             return cls.TIMEOUT
         if "unavailable" in low or "no saved outputs" in low:
             return cls.NO_SAVED_OUTPUTS
+        if (
+            "spectre produced no requested analysis results" in low
+            or "dc did not converge" in low
+            or ("analysis results" in low and "spectre" in low)
+        ):
+            return cls.SIM_FAILED
         if "selectresult" in low.replace(" ", ""):
             return cls.SELECT_RESULT_FAILED
         return cls.UNKNOWN

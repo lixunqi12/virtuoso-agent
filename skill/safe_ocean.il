@@ -107,8 +107,59 @@ procedure(safeOcean_isEnumKwarg(name val)
             (and(equal(lowerCase(name) "skipdc")
                  or(equal(val "yes") equal(val "no")))
                 t)
+            (and(equal(lowerCase(name) "oppoint")
+                 equal(lowerCase(val) "rawfile"))
+                t)
+            (and(equal(lowerCase(name) "detail")
+                 member(lowerCase(val) '("node" "oppoint" "device" "all")))
+                t)
             (t nil)
         )
+    )
+)
+
+
+;;; ----------------------------------------------------------------
+;;; Request instance operating-point scalar saves for DUT instances.
+;;;
+;;; DC/ac result containers can otherwise expose only node voltages and a
+;;; sparse per-instance `region` scalar. The LLM-facing readback is still
+;;; request-scoped and key-scoped in safe_read_op_point.il; this helper
+;;; only asks Spectre/OCEAN to make the numeric OP scalars available in
+;;; the current PSF.
+;;; ----------------------------------------------------------------
+procedure(safeOcean_saveDutOpPoints(libName cellName viewName dutPath)
+    prog((cv inst instName instPath nSaved)
+        nSaved = 0
+        unless(and(stringp(dutPath) safeOcean_validInstPath(dutPath))
+            return(0)
+        )
+        unless(isCallable('saveOpPoint)
+            return(0)
+        )
+        cv = dbOpenCellViewByType(libName cellName viewName nil "r")
+        unless(cv
+            return(0)
+        )
+        foreach(inst cv~>instances
+            instName = inst~>name
+            when(and(stringp(instName)
+                     safeHelpers_validateParamName(instName))
+                instPath = strcat(dutPath "/" instName)
+                when(safeOcean_validInstPath(instPath)
+                    when(errset(
+                        saveOpPoint(
+                            instPath
+                            ?operatingPoints
+                            "vgs vds ids id gm gds vth vdsat region cgs cgd"
+                        ) t)
+                        nSaved = nSaved + 1
+                    )
+                )
+            )
+        )
+        dbClose(cv)
+        return(nSaved)
     )
 )
 
@@ -136,12 +187,102 @@ procedure(safeOcean_invokeAnalysisSpec(analysisName kwargs)
 
 
 ;;; ----------------------------------------------------------------
+;;; Result-kind helpers. Spectre/OCEAN can report nested result lists,
+;;; e.g. ac(dc model instance ...). Treat nested dc as available so
+;;; AC/DC operating-point readback can use the just-finished PSF.
+;;; ----------------------------------------------------------------
+procedure(safeOcean_resultAvailable(resultList resultName)
+    let((found item itemStr wantStr)
+        found = nil
+        wantStr = symbolToString(resultName)
+        when(listp(resultList)
+            foreach(item resultList
+                unless(found
+                    cond(
+                        (listp(item)
+                            when(safeOcean_resultAvailable(item resultName)
+                                found = t
+                            )
+                        )
+                        (t
+                            itemStr = cond(
+                                (symbolp(item) symbolToString(item))
+                                (stringp(item) item)
+                                (t sprintf(nil "%L" item))
+                            )
+                            when(equal(itemStr wantStr)
+                                found = t
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        found
+    )
+)
+
+
+procedure(safeOcean_requestedAnalysisName(analysisEntry)
+    let((nm)
+        nm = nil
+        cond(
+            (stringp(analysisEntry)
+                nm = lowerCase(analysisEntry))
+            (and(listp(analysisEntry)
+                 (length(analysisEntry) >= 1)
+                 stringp(car(analysisEntry)))
+                nm = lowerCase(car(analysisEntry)))
+        )
+        nm
+    )
+)
+
+
+procedure(safeOcean_resultsHaveRequestedAnalysis(resultList analysisList)
+    let((found nm)
+        found = nil
+        foreach(a analysisList
+            unless(found
+                nm = safeOcean_requestedAnalysisName(a)
+                when(and(nm
+                         safeOcean_resultAvailable(resultList
+                                                   stringToSymbol(nm)))
+                    found = t
+                )
+            )
+        )
+        found
+    )
+)
+
+
+procedure(safeOcean_openResultKinds(pathName)
+    let((openRv kindsRv kinds)
+        kinds = nil
+        when(and(stringp(pathName) (length(pathName) > 0))
+            openRv = errset(openResults(pathName) t)
+            when(and(openRv car(openRv))
+                kindsRv = errset(results() t)
+                when(and(kindsRv listp(car(kindsRv)))
+                    kinds = car(kindsRv)
+                )
+            )
+        )
+        kinds
+    )
+)
+
+
+;;; ----------------------------------------------------------------
 ;;; Main entry point.
 ;;; ----------------------------------------------------------------
 procedure(safeOceanRun(libName cellName tbCellName varList analysisList
-                      @optional (viewName "schematic") (tbViewName "schematic"))
+                      @optional (viewName "schematic") (tbViewName "schematic")
+                                (dutPath "/I0"))
     prog((errors appliedCount analysesJson varsJson resultsDir a aLower
-          varName varVal varNameLower sessionName)
+          varName varVal varNameLower sessionName runResult runPath
+          psfPath resultKinds opPointsRequested)
 
         ;; ---- Validate lib/cell/tbCell names ----
         unless(safeSetParam_validateName(libName "lib")
@@ -152,6 +293,9 @@ procedure(safeOceanRun(libName cellName tbCellName varList analysisList
         )
         unless(safeSetParam_validateName(tbCellName "tbCell")
             return("{\"ok\":false,\"error\":\"Invalid testbench cell name\"}")
+        )
+        unless(safeOcean_validInstPath(dutPath)
+            return("{\"ok\":false,\"error\":\"Invalid dutPath\"}")
         )
 
         ;; ---- Validate every analysis entry ----
@@ -255,6 +399,15 @@ procedure(safeOceanRun(libName cellName tbCellName varList analysisList
                     error("safeOceanRun: analysisList entry is neither a string nor (name kwargs) list"))
             )
         )
+        ;; Device operating-point scalar table. This is an internal,
+        ;; fixed OCEAN request, not a caller-controlled analysis type.
+        ;; It makes gm/id/vth/vdsat-style scalars available in PSF for
+        ;; request-scoped safeReadDcOpPointFromResults() when Spectre
+        ;; supports the standard info-oppoint result. Failure is
+        ;; non-fatal: older environments may only expose node voltages
+        ;; and sparse instance region.
+        errset(info("oppoint" ?where "rawfile") t)
+        errset(analysis('info ?what "oppoint" ?where "rawfile") t)
 
         ;; ---- NOTE (rev 6 2026-04-18): prior rev 5 tried
         ;; `errset(save('allpub))` here; that OCEAN call is illegal —
@@ -278,20 +431,71 @@ procedure(safeOceanRun(libName cellName tbCellName varList analysisList
         ;; the current session — no Maestro state mutation. Errset-
         ;; wrapped because a future OCEAN version that rejects 'alli
         ;; must not abort the run.
+        ;; AC/DC small-signal runs need saved voltages for VF()/v()
+        ;; readback in the fresh OCEAN session.
+        errset(save('allv))
         errset(save('alli))
+        opPointsRequested = safeOcean_saveDutOpPoints(
+            libName cellName viewName dutPath
+        )
 
         ;; ---- Run. run() returns the history name on success, nil on
         ;; failure (e.g. if the schematic did not save cleanly). The
         ;; prior VCO debug session traced a silent "flat waveform" to
         ;; run() returning nil; surface that instead of ok:true. ----
-        let((runResult)
-            runResult = nil
-            unless(errset(runResult = run())
-                return("{\"ok\":false,\"error\":\"OCEAN run() raised\"}")
+        runResult = nil
+        unless(errset(runResult = run())
+            return("{\"ok\":false,\"error\":\"OCEAN run() raised\"}")
+        )
+        unless(runResult
+            return("{\"ok\":false,\"error\":\"OCEAN run() returned nil (no history). Verify analyses are configured and schematic saved.\"}")
+        )
+
+        ;; Capture the actual openable PSF directory and verify Spectre
+        ;; generated at least one requested result. A failed netlist/run
+        ;; can otherwise leave only a variables result, which used to
+        ;; bubble up as ok:true and confuse the AC/DC feedback loop.
+        resultsDir = "<results>"
+        resultKinds = nil
+        runPath = nil
+        when(stringp(runResult)
+            runPath = runResult
+        )
+        when(runPath
+            psfPath = strcat(runPath "/psf")
+            resultKinds = safeOcean_openResultKinds(psfPath)
+            when(and(resultKinds
+                     safeOcean_resultsHaveRequestedAnalysis(resultKinds
+                                                            analysisList))
+                resultsDir = psfPath
             )
-            unless(runResult
-                return("{\"ok\":false,\"error\":\"OCEAN run() returned nil (no history). Verify analyses are configured and schematic saved.\"}")
+            unless(and(resultKinds
+                       safeOcean_resultsHaveRequestedAnalysis(resultKinds
+                                                              analysisList))
+                resultKinds = safeOcean_openResultKinds(runPath)
+                when(and(resultKinds
+                         safeOcean_resultsHaveRequestedAnalysis(resultKinds
+                                                                analysisList))
+                    resultsDir = runPath
+                )
             )
+        )
+        when(equal(resultsDir "<results>")
+            let((adeDir)
+                adeDir = nil
+                errset(adeDir = asiGetResultsDir(asiGetCurrentSession()))
+                when(stringp(adeDir)
+                    resultKinds = safeOcean_openResultKinds(adeDir)
+                    when(and(resultKinds
+                             safeOcean_resultsHaveRequestedAnalysis(
+                                 resultKinds analysisList))
+                        resultsDir = adeDir
+                    )
+                )
+            )
+        )
+        when(equal(resultsDir "<results>")
+            return("{\"ok\":false,\"error\":\"Spectre produced no requested analysis results; check design variables, analyses, and spectre.out\"}")
         )
 
         ;; ---- Stage 1 rev 5/6 (2026-04-18): pop up waveform viewer on
@@ -308,26 +512,26 @@ procedure(safeOceanRun(libName cellName tbCellName varList analysisList
         ;; nothing. safe_ocean's own rev 5 version skipped this step
         ;; and the waveform never appeared under agent control.
         let((outs w wlist resDir)
-            resDir = nil
-            errset(resDir = asiGetResultsDir(asiGetCurrentSession()))
-            when(stringp(resDir)
+            resDir = resultsDir
+            when(and(stringp(resDir)
+                     safeOcean_resultAvailable(resultKinds 'tran))
                 errset(openResults(resDir))
-            )
-            errset(selectResult('tran))
-            outs = nil
-            errset(outs = outputs())
-            wlist = nil
-            when(outs
-                foreach(oname outs
-                    w = nil
-                    errset(w = VT(oname))
-                    when(w
-                        wlist = cons(w wlist)
+                errset(selectResult('tran))
+                outs = nil
+                errset(outs = outputs())
+                wlist = nil
+                when(outs
+                    foreach(oname outs
+                        w = nil
+                        errset(w = VT(oname))
+                        when(w
+                            wlist = cons(w wlist)
+                        )
                     )
                 )
-            )
-            when(wlist
-                errset(apply('plot reverse(wlist)))
+                when(wlist
+                    errset(apply('plot reverse(wlist)))
+                )
             )
         )
 
@@ -336,11 +540,6 @@ procedure(safeOceanRun(libName cellName tbCellName varList analysisList
         ;; virtuoso_bridge open_maestro_gui_with_history() uses. Drops
         ;; the earlier getResultsDir() guess (not a documented API).
         ;; PC-side _scrub() still runs on this field as second defense.
-        resultsDir = "<results>"
-        errset(resultsDir = asiGetResultsDir(asiGetCurrentSession()))
-        unless(stringp(resultsDir)
-            resultsDir = "<results>"
-        )
 
         ;; ---- Build JSON response ----
         analysesJson = safeHelpers_listToJsonArray(analysisList)
@@ -349,6 +548,7 @@ procedure(safeOceanRun(libName cellName tbCellName varList analysisList
             "{\"ok\":true,"
             "\"resultsDir\":\"" safeHelpers_jsonEscape(resultsDir) "\","
             "\"varsApplied\":" varsJson ","
+            "\"opPointsRequested\":" sprintf(nil "%d" opPointsRequested) ","
             "\"analyses\":" analysesJson
             "}"
         ))
@@ -431,12 +631,63 @@ procedure(safeOcean_safeNum(w)
     )
 )
 
+procedure(safeOceanMeasureAcDiff()
+    ;; AC-only differential metric fallback for small-signal amplifiers.
+    ;; It reads only public testbench output nets and returns scalar JSON.
+    prog((vp vn vdiff gainWave a0 ugb jsonMetrics)
+        errset(selectResult('ac))
+        errset(vp = VF("/Vout_p"))
+        errset(vn = VF("/Vout_n"))
+        when(and(vp vn)
+            errset(vdiff = vp - vn)
+        )
+        unless(vdiff
+            return("{\"ok\":false,\"error\":\"VT/VF(/Vout_p)-(/Vout_n) unavailable; check analysis saved outputs\"}")
+        )
+
+        a0 = nil
+        errset(gainWave = db20(mag(vdiff)))
+        when(gainWave
+            errset(a0 = value(gainWave 1.0))
+        )
+        unless(numberp(a0)
+            a0 = nil
+        )
+
+        ugb = nil
+        errset(ugb = gainBwProd(vdiff))
+        unless(numberp(ugb)
+            ugb = nil
+        )
+
+        jsonMetrics = strcat(
+            "{"
+            "\"A0_diff_db\":" safeHelpers_numToJson(a0) ","
+            "\"UGB_Hz\":"     safeHelpers_numToJson(ugb)
+            "}"
+        )
+        return(strcat("{\"ok\":true,\"metrics\":" jsonMetrics "}"))
+    )
+)
+
 procedure(safeOceanMeasure(@optional (dutPath "/I0"))
     prog((vp vn vdiff vabs vpp vcm fOsc duty ampHold ibias tStartup
-          wEarly wLate wFull jsonMetrics)
+          wEarly wLate wFull jsonMetrics availResults)
         unless(safeOcean_validInstPath(dutPath)
             return("{\"ok\":false,\"error\":\"Invalid dutPath\"}")
         )
+
+        availResults = nil
+        let((rv)
+            rv = errset(results() t)
+            when(and(rv listp(car(rv)))
+                availResults = car(rv)
+            )
+        )
+        unless(safeOcean_resultAvailable(availResults 'tran)
+            return(safeOceanMeasureAcDiff())
+        )
+        errset(selectResult('tran))
 
         ;; ---- Full differential waveform ----
         ;; 2026-04-18 empirical fix: pll/LC_VCO_tb labels the two
@@ -454,7 +705,7 @@ procedure(safeOceanMeasure(@optional (dutPath "/I0"))
         ;; will see ok:false and surface it — better than returning
         ;; a JSON of nulls that looks like a legitimate failed run.
         unless(vdiff
-            return("{\"ok\":false,\"error\":\"VT(/Vout_p)-VT(/Vout_n) unavailable; check analysis saved outputs\"}")
+            return(safeOceanMeasureAcDiff())
         )
 
         ;; ---- Windows ----
@@ -987,7 +1238,12 @@ procedure(safeOcean_statsJson(w tStart tEnd)
 ;;; (see run_20260420_033152 log iters 2/4/6/9/10).
 ;;; ----------------------------------------------------------------
 procedure(safeOcean_unselectIfHeld()
-    errset(unselectResult())
+    ;; Some IC23.1/OCEAN builds do not define unselectResult at all.
+    ;; Calling it inside errset still prints a CIW undefined-function
+    ;; error, so guard the symbol before invoking it.
+    when(isCallable('unselectResult)
+        errset(unselectResult() t)
+    )
     t
 )
 

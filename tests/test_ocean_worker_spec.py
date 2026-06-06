@@ -5,7 +5,9 @@ No SSH / Cadence needed — these exercise pure-Python helpers.
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -13,8 +15,11 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from src.ocean_worker import (  # noqa: E402
+    OceanWorker,
+    OceanWorkerConfig,
     _render_spec_il,
     _validate_osc_signals,
+    worker_from_env,
 )
 from src import spec_evaluator  # noqa: E402
 
@@ -128,3 +133,52 @@ def test_render_spec_signal_and_window_lines_present():
     assert '"Vdiff" "Vdiff" (list "/Vout_p" "/Vout_n")' in body
     # Floats preserved with repr (trailing e-07 not stripped).
     assert "2e-07" in body
+
+
+# ---------------------------------------------------------------- #
+#  OCEAN remote init command
+# ---------------------------------------------------------------- #
+
+def test_worker_from_env_reads_ocean_init_cmd(monkeypatch):
+    monkeypatch.setenv("VB_REMOTE_HOST", "cobi.example.edu")
+    monkeypatch.setenv("VB_REMOTE_USER", "alice")
+    monkeypatch.setenv("VB_REMOTE_SKILL_DIR", "/remote/skill")
+    monkeypatch.setenv("VB_OCEAN_INIT_CMD", "module load cadence/ic_23.1")
+
+    worker = worker_from_env()
+
+    assert worker.cfg.remote_init_cmd == "module load cadence/ic_23.1"
+
+
+def test_spawn_wrapper_runs_init_before_exports():
+    cfg = OceanWorkerConfig(
+        remote_host="remotehost",
+        remote_user="alice",
+        remote_skill_dir="/remote/skill",
+        virtuoso_bin="/cad/virtuoso",
+        remote_init_cmd='eval "$(/apps/modulecmd sh load cadence/ic_23.1)"',
+    )
+    worker = OceanWorker(cfg)
+
+    completed = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout='{"status":"ok"}\n', stderr=""
+    )
+    with mock.patch(
+        "src.ocean_worker.subprocess.run", return_value=completed,
+    ) as run_mock:
+        worker._spawn_and_wait(
+            psf_dir="/tmp/psf",
+            remote_spec="/tmp/spec.il",
+            remote_result="/tmp/result.json",
+            remote_pidfile="/tmp/pid",
+            budget_s=10.0,
+            run_id="unit",
+        )
+
+    remote_cmd = run_mock.call_args.args[0][-1]
+    assert "modulecmd sh load cadence/ic_23.1" in remote_cmd
+    assert "export VB_PSF_DIR=/tmp/psf;" in remote_cmd
+    assert (
+        remote_cmd.index("modulecmd sh load cadence/ic_23.1")
+        < remote_cmd.index("export VB_PSF_DIR=/tmp/psf;")
+    )

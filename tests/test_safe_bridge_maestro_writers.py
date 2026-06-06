@@ -354,6 +354,14 @@ class TestSetMaestroAnalysis:
         assert '("skipdc" "yes")' in kwargs["options"]
         assert '("stop" "1u")' in kwargs["options"]
 
+    def test_dc_op_numeric_readback_options(self, bridge, writer_mocks):
+        bridge.set_maestro_analysis(
+            analysis="dc", options={"oppoint": "rawfile", "detail": "all"},
+        )
+        kwargs = writer_mocks["set_analysis"].call_args.kwargs
+        assert '("oppoint" "rawfile")' in kwargs["options"]
+        assert '("detail" "all")' in kwargs["options"]
+
     def test_rejects_bad_analysis(self, bridge, writer_mocks):
         with pytest.raises(ValueError, match="Analysis must be"):
             bridge.set_maestro_analysis(analysis="bogus")
@@ -381,6 +389,10 @@ class TestSetMaestroAnalysis:
         with pytest.raises(ValueError, match="allowed:"):
             bridge.set_maestro_analysis(
                 analysis="tran", options={"skipdc": "maybe"}
+            )
+        with pytest.raises(ValueError, match="allowed:"):
+            bridge.set_maestro_analysis(
+                analysis="dc", options={"detail": "model"}
             )
 
     def test_rejects_non_bool_enable(self, bridge, writer_mocks):
@@ -552,6 +564,17 @@ class TestExprAllowList:
     def test_accepts_ocean_expression(self, bridge, writer_mocks, expr):
         bridge.add_maestro_output(name="x", expr=expr)
         assert writer_mocks["add_output"].called
+
+    def test_accepts_ac_vf_quoted_netrefs(self, bridge, writer_mocks):
+        bridge.add_maestro_output(
+            name="ugb",
+            expr='gainBwProd(VF("/Vout_p") - VF("/Vout_n"))',
+        )
+        kwargs = writer_mocks["add_output"].call_args.kwargs
+        assert kwargs["expr"] == (
+            r'gainBwProd(VF(\"/Vout_p\") - VF(\"/Vout_n\"))'
+        )
+        assert kwargs["signal_name"] == ""
 
     def test_rejects_mixed_allowed_and_forbidden_calls(
         self, bridge, writer_mocks
@@ -1161,6 +1184,61 @@ class TestDryRunRunsValidators:
         ]):
             with pytest.raises(ValueError, match="YAML boolean"):
                 cli_module.main()
+
+    def test_dry_run_accepts_design_vars_presets_and_verify(
+        self, cli_module, tmp_path
+    ):
+        recipe = tmp_path / "setup.yaml"
+        recipe.write_text(
+            "test: MYTB\n"
+            "verify: true\n"
+            "design_vars:\n"
+            "  w: '1u'\n"
+            "analyses:\n"
+            "  - preset: dc_op\n"
+            "  - preset: ac_log\n"
+            "    start: '1'\n"
+            "    stop: '100G'\n"
+            "    points_per_dec: '100'\n"
+            "outputs:\n"
+            "  - name: vout\n"
+            "    signal_name: '/Vout'\n"
+            "    spec:\n"
+            "      gt: '0.5'\n",
+            encoding="utf-8",
+        )
+        pdk = self._write_pdk_map(tmp_path)
+        with patch.object(sys, "argv", [
+            "configure_maestro_outputs",
+            "--lib", "mylib", "--cell", "MYCELL", "--tb-cell", "MYTB",
+            "--yaml", str(recipe), "--pdk-map", str(pdk),
+            "--dry-run", "--verify",
+        ]):
+            assert cli_module.main() == 0
+
+    def test_analysis_preset_expands_to_ac_dec(self, cli_module):
+        name, enable, options = cli_module._analysis_from_entry({
+            "preset": "ac_log",
+            "start": "1",
+            "stop": "100G",
+            "points_per_dec": "100",
+        })
+        assert name == "ac"
+        assert enable is True
+        assert options == {"start": "1", "stop": "100G", "dec": "100"}
+
+    def test_dc_op_preset_requests_device_op_scalars(self, cli_module):
+        name, enable, options = cli_module._analysis_from_entry({
+            "preset": "dc_op",
+        })
+        assert name == "dc"
+        assert enable is True
+        assert options == {
+            "oppoint": "rawfile",
+            "detail": "all",
+            "maxiters": "150",
+            "maxsteps": "10000",
+        }
 
 
 class TestMaestroExprQuotedNetRefs:

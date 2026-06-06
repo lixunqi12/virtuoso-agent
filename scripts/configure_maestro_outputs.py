@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""CLI: drive Maestro Outputs Setup from a YAML recipe via SafeBridge.
+"""CLI: drive Maestro Setup from a YAML recipe via SafeBridge.
 
-Reads a YAML config describing one analysis block, zero or more output
-rows (waveform or expression), per-output pass/fail specs, and zero or
-more corner-netlist exports, and applies them in order to the Maestro
-testbench scoped by ``--lib`` / ``--cell`` / ``--tb-cell``.
+Reads a YAML config describing analyses, outputs, design variables,
+per-output pass/fail specs, and zero or more corner-netlist exports, and
+applies them in order to the Maestro testbench scoped by ``--lib`` /
+``--cell`` / ``--tb-cell``. With ``verify: true`` or ``--verify`` it reads
+back a bounded safe summary from Maestro and checks that requested setup
+landed.
 
 The PDK-safe wrappers
 (:meth:`SafeBridge.set_maestro_analysis`,
@@ -17,12 +19,20 @@ YAML schema::
 
     test: "<optional Maestro test name; defaults to tb_cell>"
     session: "<optional Maestro session id; default empty>"
+    design_vars:
+      Ibias: "1"
+      nfin_n: "1"
+
     analyses:
       - name: tran            # tran / ac / dc / noise / xf / stb / pss / pnoise
         enable: true
         options:
           start: "0"
           stop: "200n"
+      - preset: ac_log        # dc_op / ac_log / tran / pss_oscillator / pnoise_phase_noise
+        start: "1"
+        stop: "100G"
+        points_per_dec: "100"
     outputs:
       - name: f_osc
         signal_name: "/Vout"  # OR expr (mutually exclusive)
@@ -33,6 +43,9 @@ YAML schema::
     corner_netlists:
       - corner: typ_25
         output_dir: "~/simulation/corner_typ"
+
+    idempotent_outputs: true  # default true: delete same (test, output) before add
+    verify: true
 
 Usage::
 
@@ -45,6 +58,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -145,7 +159,15 @@ class _DryRunClient:
     ssh_runner = None  # writer.run_and_wait() inspects this attr
 
     def execute_skill(self, expr: str, **kwargs: Any) -> _DryRunSkillResult:
-        return _DryRunSkillResult()
+        result = _DryRunSkillResult()
+        if "safeMaeWriteAndSave" in expr:
+            result.output = (
+                '{"ok":true,"varsWritten":1,"setupDbWritten":1,'
+                '"testScopedWritten":1,"saved":true,"setupDbVars":[]}'
+            )
+        elif "safeMaeSetupSummary" in expr:
+            result.output = '{"ok":true,"session":"dry-run","tests":{},"specsRaw":""}'
+        return result
 
 
 def _coerce_bool(value: Any, *, field: str) -> bool:
@@ -227,6 +249,94 @@ def _check_yaml_tree(node: Any, *, depth: int = 0, path: str = "<root>") -> None
             )
 
 
+def _coerce_options_mapping(value: Any, *, field: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field!r} must be a mapping if present")
+    return dict(value)
+
+
+def _analysis_from_entry(entry: dict[str, Any]) -> tuple[str, bool, dict[str, Any]]:
+    """Normalize raw analysis entry or preset into SafeBridge arguments."""
+    enable = (
+        _coerce_bool(entry["enable"], field="analyses[].enable")
+        if "enable" in entry else True
+    )
+    options = _coerce_options_mapping(
+        entry.get("options"), field="analyses[].options"
+    )
+    preset = entry.get("preset")
+    if preset is None:
+        name = _coerce_optional_str(entry.get("name"), field="analyses[].name")
+        if not name:
+            raise ValueError("'analyses[].name' is required without preset")
+        return name, enable, options
+    if not isinstance(preset, str) or not preset:
+        raise ValueError("'analyses[].preset' must be a non-empty string")
+
+    # Direct scalar keys on the entry are accepted for ergonomic presets:
+    # - preset: ac_log
+    #   start: "1"
+    #   stop: "100G"
+    #   points_per_dec: "100"
+    direct = {
+        k: v for k, v in entry.items()
+        if k not in {"name", "preset", "enable", "options"}
+    }
+    merged = {**options, **direct}
+
+    if preset == "dc_op":
+        return "dc", enable, {
+            "oppoint": merged.get("oppoint", "rawfile"),
+            "detail": merged.get("detail", "all"),
+            "maxiters": merged.get("maxiters", "150"),
+            "maxsteps": merged.get("maxsteps", "10000"),
+        }
+    if preset == "ac_log":
+        start = merged.get("start")
+        stop = merged.get("stop")
+        dec = merged.get("points_per_dec", merged.get("dec", 100))
+        if start is None or stop is None:
+            raise ValueError("preset 'ac_log' requires start and stop")
+        return "ac", enable, {"start": start, "stop": stop, "dec": dec}
+    if preset == "tran":
+        stop = merged.get("stop")
+        if stop is None:
+            raise ValueError("preset 'tran' requires stop")
+        opts: dict[str, Any] = {"stop": stop}
+        if "maxstep" in merged:
+            opts["maxstep"] = merged["maxstep"]
+        return "tran", enable, opts
+    if preset == "pss_oscillator":
+        if "fund" not in merged:
+            raise ValueError("preset 'pss_oscillator' requires fund")
+        opts = {
+            "fund": merged["fund"],
+            "oscillator": merged.get("oscillator", "yes"),
+            "autonomous": merged.get("autonomous", "yes"),
+        }
+        for key in ("harms", "tstab", "errpreset", "fundname", "skipdc", "maxstep"):
+            if key in merged:
+                opts[key] = merged[key]
+        return "pss", enable, opts
+    if preset == "pnoise_phase_noise":
+        opts = {"noisetype": merged.get("noisetype", "sources")}
+        for key in (
+            "start", "stop", "dec", "lin", "maxsideband", "relativeharmonic",
+            "refsideband", "sweeptype", "output", "input", "oprobe",
+            "iprobe", "p", "n",
+        ):
+            if key in merged:
+                opts[key] = merged[key]
+        return "pnoise", enable, opts
+    raise ValueError(
+        "Unknown analysis preset "
+        f"{preset!r}; expected dc_op/ac_log/tran/pss_oscillator/"
+        "pnoise_phase_noise"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -257,6 +367,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate the YAML and run every SafeBridge validator without "
              "contacting any remote host (writers receive a no-RPC client).",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="After applying a live recipe, read back Maestro setup and verify "
+             "requested analyses, outputs, specs, and design variables.",
+    )
+    parser.add_argument(
+        "--report-json",
+        default="",
+        help="Optional local path for a JSON apply/verify report.",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose logging"
@@ -304,6 +425,17 @@ def _load_recipe(path: Path) -> dict[str, Any]:
     for key in ("analyses", "outputs", "corner_netlists"):
         if key in recipe and not isinstance(recipe[key], list):
             raise ValueError(f"YAML key {key!r} must be a list if present")
+    if "design_vars" in recipe and not isinstance(recipe["design_vars"], dict):
+        raise ValueError("YAML key 'design_vars' must be a mapping if present")
+    if "verify" in recipe and not isinstance(recipe["verify"], bool):
+        raise ValueError("YAML key 'verify' must be a boolean if present")
+    if (
+        "idempotent_outputs" in recipe
+        and not isinstance(recipe["idempotent_outputs"], bool)
+    ):
+        raise ValueError(
+            "YAML key 'idempotent_outputs' must be a boolean if present"
+        )
     _check_yaml_tree(recipe)
     return recipe
 
@@ -319,18 +451,7 @@ def _apply_analyses(
     for entry in items:
         if not isinstance(entry, dict):
             raise ValueError("Each 'analyses' entry must be a mapping")
-        name = _coerce_optional_str(entry.get("name"), field="analyses[].name")
-        if not name:
-            raise ValueError("'analyses[].name' is required")
-        enable = (
-            _coerce_bool(entry["enable"], field="analyses[].enable")
-            if "enable" in entry else True
-        )
-        options = entry.get("options") or {}
-        if not isinstance(options, dict):
-            raise ValueError(
-                f"'analyses[].options' for {name!r} must be a mapping if present"
-            )
+        name, enable, options = _analysis_from_entry(entry)
         bridge.set_maestro_analysis(
             analysis=name,
             enable=enable,
@@ -344,12 +465,48 @@ def _apply_analyses(
     return n
 
 
+def _apply_design_vars(
+    bridge: SafeBridge,
+    design_vars: dict[str, Any],
+    logger: logging.Logger,
+) -> dict[str, Any] | None:
+    if not design_vars:
+        return None
+    result = bridge.write_and_save_maestro(design_vars)
+    logger.info(
+        "  design_vars written=%s testScopedWritten=%s saved=%s",
+        result.get("varsWritten"),
+        result.get("testScopedWritten"),
+        result.get("saved"),
+    )
+    return result
+
+
+def _apply_one_spec_bound(
+    bridge: SafeBridge,
+    name: str,
+    *,
+    key: str,
+    value: Any,
+    test: str | None,
+    session: str,
+) -> None:
+    if key == "lt":
+        bridge.set_maestro_spec(name=name, lt=value, test=test, session=session)
+    elif key == "gt":
+        bridge.set_maestro_spec(name=name, gt=value, test=test, session=session)
+    else:
+        raise ValueError(f"Unsupported spec bound key {key!r}; use lt/gt")
+
+
 def _apply_outputs(
     bridge: SafeBridge,
     items: list[dict[str, Any]],
     test: str | None,
     session: str,
     logger: logging.Logger,
+    *,
+    idempotent: bool,
 ) -> tuple[int, int]:
     n_out = 0
     n_spec = 0
@@ -359,6 +516,14 @@ def _apply_outputs(
         name = _coerce_optional_str(entry.get("name"), field="outputs[].name")
         if not name:
             raise ValueError("'outputs[].name' is required")
+        if idempotent:
+            try:
+                bridge._delete_maestro_output_remote(name, test=test, session=session)
+            except Exception as exc:  # noqa: BLE001 - delete is best-effort
+                logger.warning(
+                    "  output %s pre-delete skipped (%s: %s)",
+                    name, type(exc).__name__, exc,
+                )
         bridge.add_maestro_output(
             name=name,
             output_type=_coerce_optional_str(
@@ -377,16 +542,27 @@ def _apply_outputs(
         if spec:
             if not isinstance(spec, dict):
                 raise ValueError(f"'spec' for output {name!r} must be a mapping")
-            bridge.set_maestro_spec(
-                name=name,
-                lt=spec.get("lt"),
-                gt=spec.get("gt"),
-                test=test,
-                session=session,
+            unknown = set(spec) - {"lt", "gt"}
+            if unknown:
+                raise ValueError(
+                    f"'spec' for output {name!r} has unknown keys: "
+                    f"{sorted(unknown)}"
+                )
+            for bound_key in ("gt", "lt"):
+                if bound_key in spec and spec[bound_key] is not None:
+                    _apply_one_spec_bound(
+                        bridge,
+                        name,
+                        key=bound_key,
+                        value=spec[bound_key],
+                        test=test,
+                        session=session,
+                    )
+                    n_spec += 1
+            logger.info(
+                "    spec applied (lt=%r gt=%r)",
+                spec.get("lt"), spec.get("gt"),
             )
-            logger.info("    spec applied (lt=%r gt=%r)",
-                        spec.get("lt"), spec.get("gt"))
-            n_spec += 1
     return n_out, n_spec
 
 
@@ -418,6 +594,110 @@ def _apply_corner_netlists(
         logger.info("  corner netlist exported for %s", corner)
         n += 1
     return n
+
+
+def _expected_analysis_names(items: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        name, enable, _options = _analysis_from_entry(entry)
+        if enable:
+            names.append(name)
+    return names
+
+
+def _verify_readback(
+    bridge: SafeBridge,
+    *,
+    test: str | None,
+    analyses: list[dict[str, Any]],
+    outputs: list[dict[str, Any]],
+    design_vars: dict[str, Any],
+    writeback: dict[str, Any] | None,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    summary = bridge.read_maestro_setup_summary(test=test)
+    expected_test = test or bridge._scope_tb_cell
+    tests = summary.get("tests") if isinstance(summary, dict) else {}
+    problems: list[str] = []
+    if not isinstance(tests, dict) or expected_test not in tests:
+        problems.append(f"test {expected_test!r} not found in readback summary")
+        test_summary: dict[str, Any] = {}
+    else:
+        raw_test_summary = tests[expected_test]
+        test_summary = (
+            raw_test_summary if isinstance(raw_test_summary, dict) else {}
+        )
+
+    if writeback is not None:
+        if not writeback.get("saved", False):
+            problems.append("writeback.saved is not true")
+        if int(writeback.get("testScopedWritten") or 0) <= 0:
+            problems.append("writeback.testScopedWritten is not > 0")
+
+    got_analyses = test_summary.get("analyses")
+    if not isinstance(got_analyses, dict):
+        got_analyses = {}
+    for name in _expected_analysis_names(analyses):
+        item = got_analyses.get(name)
+        if not (isinstance(item, dict) and item.get("enabled") is True):
+            problems.append(f"analysis {name!r} is missing or disabled")
+
+    got_output_names: set[str] = set()
+    raw_outputs = test_summary.get("outputs")
+    if isinstance(raw_outputs, list):
+        for item in raw_outputs:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                got_output_names.add(item["name"])
+    for entry in outputs:
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            if isinstance(name, str) and name not in got_output_names:
+                problems.append(f"output {name!r} missing from readback")
+
+    got_vars = test_summary.get("variables")
+    if not isinstance(got_vars, dict):
+        got_vars = {}
+    for name in design_vars:
+        if name not in got_vars:
+            problems.append(f"design var {name!r} missing from test scope")
+
+    specs_raw = str(summary.get("specsRaw", ""))
+    for entry in outputs:
+        if not isinstance(entry, dict):
+            continue
+        spec = entry.get("spec")
+        name = entry.get("name")
+        if not spec:
+            continue
+        if not isinstance(name, str):
+            continue
+        if name not in specs_raw:
+            problems.append(f"spec for output {name!r} missing from readback")
+
+    report = {
+        "ok": not problems,
+        "problems": problems,
+        "summary": summary,
+    }
+    if problems:
+        for problem in problems:
+            logger.error("VERIFY: %s", problem)
+        raise RuntimeError(
+            "Maestro readback verification failed: "
+            + "; ".join(problems)
+        )
+    logger.info("Maestro readback verification passed for test %s", expected_test)
+    return report
+
+
+def _write_report(path: str, report: dict[str, Any], logger: logging.Logger) -> None:
+    if not path:
+        return
+    out = Path(path)
+    out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    logger.info("Wrote JSON report: %s", out)
 
 
 def _build_bridge(
@@ -475,11 +755,15 @@ def main() -> int:
     session = _coerce_optional_str(recipe.get("session"), field="session")
     analyses = recipe.get("analyses") or []
     outputs = recipe.get("outputs") or []
+    design_vars = recipe.get("design_vars") or {}
     corner_netlists = recipe.get("corner_netlists") or []
+    idempotent_outputs = recipe.get("idempotent_outputs", True)
+    verify = bool(args.verify or recipe.get("verify", False))
 
     logger.info(
-        "Recipe: %d analyses, %d outputs, %d corner-netlist exports",
-        len(analyses), len(outputs), len(corner_netlists),
+        "Recipe: %d analyses, %d outputs, %d design vars, "
+        "%d corner-netlist exports",
+        len(analyses), len(outputs), len(design_vars), len(corner_netlists),
     )
 
     bridge = _build_bridge(
@@ -494,9 +778,43 @@ def main() -> int:
         args.lib, args.cell, args.tb_cell,
     )
 
+    writeback = _apply_design_vars(bridge, design_vars, logger)
     n_an = _apply_analyses(bridge, analyses, test_name, session, logger)
-    n_out, n_spec = _apply_outputs(bridge, outputs, test_name, session, logger)
+    n_out, n_spec = _apply_outputs(
+        bridge,
+        outputs,
+        test_name,
+        session,
+        logger,
+        idempotent=idempotent_outputs,
+    )
     n_corner = _apply_corner_netlists(bridge, corner_netlists, test_name, logger)
+
+    report: dict[str, Any] = {
+        "ok": True,
+        "dry_run": bool(args.dry_run),
+        "applied": {
+            "design_vars": len(design_vars),
+            "analyses": n_an,
+            "outputs": n_out,
+            "specs": n_spec,
+            "corner_netlists": n_corner,
+        },
+        "writeback": writeback,
+    }
+    if verify and not args.dry_run:
+        report["verify"] = _verify_readback(
+            bridge,
+            test=test_name,
+            analyses=analyses,
+            outputs=outputs,
+            design_vars=design_vars,
+            writeback=writeback,
+            logger=logger,
+        )
+    elif verify and args.dry_run:
+        logger.info("[DRY-RUN] verify requested; live readback skipped.")
+        report["verify"] = {"ok": None, "skipped": "dry-run"}
 
     logger.info(
         "%sMaestro Outputs Setup applied: analyses=%d, outputs=%d, "
@@ -504,6 +822,7 @@ def main() -> int:
         "[DRY-RUN] " if args.dry_run else "",
         n_an, n_out, n_spec, n_corner,
     )
+    _write_report(args.report_json, report, logger)
     return 0
 
 

@@ -79,7 +79,7 @@ virtuoso-bridge start
 #### PC 端
 
 ```bash
-git clone https://github.com/lixunqi12/virtuoso-agent.git
+git clone https://github.com/<owner>/virtuoso-agent.git
 cd virtuoso-agent
 python -m venv .venv
 .venv\Scripts\activate            # Linux/macOS: source .venv/bin/activate
@@ -189,8 +189,8 @@ HSpice 后端要求每份 spec 多带：
 
 ### PDK 数据隔离
 
-公开仓库，真实 PDK token（`tsmc*`, `nch_*`, `pch_*`, `cfmom`,
-`rppoly`, `tcbn` 等）绝不能出现在 PC 端源码或日志。双层防线：
+公开仓库，真实 PDK / model / device-library token 绝不能出现在
+PC 端源码或日志。双层防线：
 
 1. **远端**：`skill/helpers.il` 读 `~/.virtuoso/pdk_map_private.il`
    （永不入库）把真实 cell 名替换为 generic 别名后才返回。HSpice
@@ -289,7 +289,7 @@ its ssh invocations with that automatically.
 #### PC side
 
 ```bash
-git clone https://github.com/lixunqi12/virtuoso-agent.git
+git clone https://github.com/<owner>/virtuoso-agent.git
 cd virtuoso-agent
 python -m venv .venv
 .venv\Scripts\activate            # Linux/macOS: source .venv/bin/activate
@@ -404,9 +404,8 @@ Full grammar: `docs/spec_authoring_rules.md`,
 
 ### PDK data isolation
 
-The repo is public; real PDK tokens (`tsmc*`, `nch_*`, `pch_*`,
-`cfmom`, `rppoly`, `tcbn`, …) must never appear in PC-side source
-or logs. Two layers of defense:
+The repo is public; real PDK / model / device-library tokens must never
+appear in PC-side source or logs. Two layers of defense:
 
 1. **Remote**: `skill/helpers.il` consults
    `~/.virtuoso/pdk_map_private.il` (never committed) to translate

@@ -34,7 +34,7 @@ valid_aliases:
   # Passive devices
   - MIM_CAP
   - IDEAL_CAP      # analogLib/cap — ideal capacitor symbol (concept schematics)
-  - RESISTOR       # umbrella alias for rppoly / rppolywo / rnwell / etc.
+  - RESISTOR       # umbrella alias for process resistor variants
   - POLY_RES
   - POLY_RES_L
   - IND            # inductor (spiralind and similar)

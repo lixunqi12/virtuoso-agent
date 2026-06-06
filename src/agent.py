@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import yaml
+
 from . import curve_searcher, spec_evaluator
 from .failure_codes import DumpStatus
 from .llm_client import LLMClient
@@ -38,7 +40,12 @@ from .ocean_worker import (
     OceanWorkerTimeout,
 )
 from .plan_auto import PlanAuto
-from .safe_bridge import SafeBridge
+from .safe_bridge import (
+    SafeBridge,
+    assess_op_point_save_effectiveness,
+    assert_llm_feedback_safe,
+    scrub,
+)
 from .remote_patch import RemotePatchError, RemotePatcher
 from .sp_rewrite import ParamRewriteError
 
@@ -65,6 +72,19 @@ _SANITY_VIOLATION_PREFIX = "UNMEASURABLE (suspect:"
 # Sized so a typical 20-iter cap still leaves headroom for the
 # single-point pass that precedes the tuning gate.
 TUNING_RETRY_BUDGET = 7
+
+
+@dataclass(frozen=True)
+class _NumericHardPassBound:
+    metric: str
+    op: str
+    value: float
+    unit: str = ""
+
+    @property
+    def target_text(self) -> str:
+        suffix = f" {self.unit}" if self.unit else ""
+        return f"{self.op} {self.value:g}{suffix}"
 
 
 def _has_sanity_violation(pass_fail: dict | None) -> bool:
@@ -128,6 +148,14 @@ _RESPONSE_KEY_TYPES: dict[str, type | tuple[type, ...]] = {
 # iter with ``contract_violation``.
 _CONTRACT_REPAIR_MAX = 3
 
+_NUMERIC_BOUND_RE = re.compile(
+    r"(?:(?P<metric>[A-Za-z_][A-Za-z0-9_]*)\s*)?"
+    r"(?P<op>>=|<=|>|<)\s*"
+    r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+    r"\s*(?P<unit>[A-Za-zµμ]+)?"
+)
+_CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+
 
 _DESIGN_VAR_SECTION_RE = re.compile(
     r"^##\s+(?:§\s*)?\d+\.?\s*Design\s+variables?\b",
@@ -172,6 +200,24 @@ def _load_allowed_design_vars(spec_path: Path) -> tuple[str, ...]:
             var_names.append(name)
 
     if not var_names:
+        for match in re.finditer(
+            r"```(?:yaml|yml)\s*\n(.*?)\n```",
+            section_text,
+            re.DOTALL | re.IGNORECASE,
+        ):
+            block = match.group(1)
+            try:
+                data = yaml.safe_load(block)
+            except yaml.YAMLError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            design_vars = data.get("design_vars")
+            if isinstance(design_vars, dict):
+                var_names.extend(str(name) for name in design_vars.keys())
+                break
+
+    if not var_names:
         raise RuntimeError(
             f"Design variables table in {spec_path.name} contains no "
             f"design variables — expected rows like '| `<name>` | ...'"
@@ -194,6 +240,104 @@ _FORBIDDEN_UNIT_RE = re.compile(
     r"(?:mA|uA|nA|pA|pF|nF|uF|fF|nH|uH|mH|[kM]?Hz|GHz|ohm|Ohm|[Ω]|dB|"
     r"[AVWF]$)",
 )
+
+_BARE_NUMBER_RE = re.compile(
+    r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$"
+)
+_BARE_INTEGER_RE = re.compile(r"^[+-]?\d+$")
+
+
+def _design_var_kind(name: str) -> str:
+    lower = str(name).strip().lower()
+    if "ibias" in lower or lower in {"i", "idc"}:
+        return "current"
+    if (
+        lower.startswith("nfin")
+        or lower in {"nf", "fingers", "cmfb_bias", "cmfb_current"}
+        or lower.startswith("cmfb_n")
+        or lower.startswith("cmfb_p")
+    ):
+        return "integer sizing"
+    if lower in {"r", "rcm"} or lower.endswith("_r") or "res" in lower:
+        return "resistance"
+    if lower in {"c"} or lower.endswith("_c") or "cap" in lower:
+        return "capacitance"
+    if lower.startswith("v") or lower in {"vicm", "vctrl", "vcm"}:
+        return "voltage"
+    if lower.endswith("phase"):
+        return "phase"
+    if "magnitude" in lower:
+        return "magnitude"
+    return "scalar"
+
+
+def _design_var_value_contract(valid_names: Iterable[str]) -> str:
+    groups: dict[str, list[str]] = {}
+    for name in sorted(valid_names):
+        groups.setdefault(_design_var_kind(name), []).append(name)
+
+    def _fmt(kind: str, rule: str) -> str:
+        names = groups.get(kind, [])
+        if not names:
+            return ""
+        return f"- {kind}: {', '.join(names)} -> {rule}\n"
+
+    return (
+        "- **Value format by `design_vars` type**:\n"
+        + _fmt(
+            "current",
+            "use engineering-suffix current values such as `10u`; "
+            "do not use bare `1`/`2`.",
+        )
+        + _fmt(
+            "integer sizing",
+            "use bare integers only, e.g. `1`, `4`, `20`.",
+        )
+        + _fmt(
+            "resistance",
+            "use engineering suffixes or bare numeric values, e.g. `5k`, `10000`.",
+        )
+        + _fmt("capacitance", "use engineering suffixes, e.g. `50f`.")
+        + _fmt("voltage", "use bare volts without the `V` suffix, e.g. `0.4`.")
+        + _fmt("phase", "use bare degrees without the `deg` suffix, e.g. `0`, `180`.")
+        + _fmt("magnitude", "use bare scalar values, e.g. `1`.")
+        + _fmt("scalar", "use bare numbers or engineering suffixes.")
+        + "- Do NOT use physical units like mA, pF, nH, V, GHz.\n"
+    )
+
+
+def _design_var_value_problem(name: str, value: Any) -> str | None:
+    value_text = str(value).strip()
+    if isinstance(value, str) and _FORBIDDEN_UNIT_RE.search(value):
+        return (
+            f"design_vars['{name}'] = '{value}' contains a physical unit; "
+            "use engineering suffixes (u/n/p/f/k/M/G) or bare numbers by type"
+        )
+
+    kind = _design_var_kind(name)
+    if kind == "current":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return (
+                f"design_vars['{name}'] = '{value}' is a bare current; "
+                "use an engineering suffix such as `10u`"
+            )
+        if isinstance(value, str) and _BARE_NUMBER_RE.fullmatch(value_text):
+            return (
+                f"design_vars['{name}'] = '{value}' is a bare current; "
+                "use an engineering suffix such as `10u`"
+            )
+    if kind == "integer sizing":
+        if isinstance(value, bool):
+            return f"design_vars['{name}'] must be a bare integer"
+        if isinstance(value, int):
+            return None
+        if isinstance(value, float):
+            if value.is_integer():
+                return None
+            return f"design_vars['{name}'] must be a bare integer"
+        if isinstance(value, str) and not _BARE_INTEGER_RE.fullmatch(value_text):
+            return f"design_vars['{name}'] must be a bare integer"
+    return None
 
 
 @dataclass
@@ -253,6 +397,9 @@ class CircuitAgent:
         spec: dict | str,
         analysis_type: str = "tran",
         ocean_worker: OceanWorker | None = None,
+        valid_design_vars: Iterable[str] | None = None,
+        fixed_design_vars: Iterable[str] | None = None,
+        allow_llm_maestro_setup: bool = True,
     ):
         """Construct the agent.
 
@@ -270,6 +417,12 @@ class CircuitAgent:
         self.llm = llm
         self.spec = spec
         self.analysis_type = analysis_type
+        self.fixed_design_var_names = frozenset(fixed_design_vars or ())
+        self.valid_design_var_names = (
+            frozenset(valid_design_vars or _VALID_DESIGN_VAR_NAMES)
+            - self.fixed_design_var_names
+        )
+        self.allow_llm_maestro_setup = bool(allow_llm_maestro_setup)
         # Stage 1 rev 12 (2026-04-20): PSF dumping now runs in a
         # throwaway virtuoso subprocess so a pathological PSF cannot
         # wedge the main RAMIC SKILL daemon. Required — no fallback
@@ -302,6 +455,9 @@ class CircuitAgent:
         # re-reading the manifest or rerunning the sweep. None when no
         # sweep has yet completed this run.
         self._last_sweep_curve_state: dict | None = None
+        self._legacy_hard_pass_bounds: dict[str, _NumericHardPassBound] = (
+            _extract_legacy_hard_pass_bounds(spec)
+        )
         # Path-2.5 R2 P3 NIT 3 (2026-05-19): tracks whether the
         # spec-derived Maestro Outputs Setup write has successfully
         # landed on the remote testbench. The derived payload is
@@ -329,6 +485,14 @@ class CircuitAgent:
                 len(self.eval_block["windows"]),
                 len(self.eval_block["metrics"]),
             )
+        elif self._legacy_hard_pass_bounds:
+            logger.info(
+                "Legacy numeric hard-pass bounds loaded: %s",
+                {
+                    name: bound.target_text
+                    for name, bound in self._legacy_hard_pass_bounds.items()
+                },
+            )
 
     # ------------------------------------------------------------------ #
     #  Public entrypoint
@@ -347,6 +511,7 @@ class CircuitAgent:
         maestro_test: str | None = None,
         curve_searcher_enabled: bool = False,
         curve_searcher_max_candidates: int = curve_searcher.DEFAULT_MAX_CANDIDATES,
+        writeback_enabled: bool = True,
     ) -> dict:
         """Run the closed-loop optimization against a Maestro testbench cell.
 
@@ -507,14 +672,27 @@ class CircuitAgent:
             )
         else:
             contract_note = ""
+        fixed_vars_note = ""
+        if self.fixed_design_var_names:
+            fixed_vars_note = (
+                "- **Fixed `design_vars` seeded from Maestro/spec**: "
+                f"{', '.join(sorted(self.fixed_design_var_names))}. "
+                "Do NOT emit or change these variables.\n"
+            )
         # Path-2.5 (2026-05-19): only tell the LLM to drop the four
         # structural Maestro blocks when the spec-derived path is
         # active (eval_block present). Dict-spec / legacy JSON projects
         # still rely on the LLM emit path — issuing this instruction
         # unconditionally would regress those flows.
-        if self.eval_block is not None:
+        if self.eval_block is not None or not self.allow_llm_maestro_setup:
+            setup_reason = (
+                "spec-derived path is authoritative"
+                if self.eval_block is not None
+                else "Maestro setup is already configured"
+            )
             derived_setup_note = (
-                "- **Maestro setup is derived from the spec automatically.** "
+                f"- **Maestro setup policy**: {setup_reason}. "
+                f"{'Maestro setup is derived from the spec automatically. ' if self.eval_block is not None else ''}"
                 "Do NOT emit `tests`, `analyses`, `outputs`, or `corners` "
                 "blocks — the agent translates spec §2 "
                 "(`signals`/`windows`/`metrics`) into Maestro Outputs "
@@ -524,6 +702,39 @@ class CircuitAgent:
             )
         else:
             derived_setup_note = ""
+
+        # Read sanitized schematic before the first LLM prompt so the initial
+        # proposal sees real device connectivity, not only the spec prose.
+        schematic_instances: list[dict] = []
+        try:
+            _circuit = self.bridge.read_circuit(lib, cell)
+            _insts = _circuit.get("instances") or []
+            if isinstance(_insts, list):
+                schematic_instances = _insts
+            logger.info(
+                "Schematic cached: %d instances (top-level keys=%s)",
+                len(schematic_instances),
+                sorted(_circuit.keys()) if isinstance(_circuit, dict) else [],
+            )
+        except Exception as exc:  # noqa: BLE001 - topology is optional
+            # A schematic read failure degrades the LLM prompt but must not
+            # stop the optimization loop; spec topology narrative remains a
+            # fallback.
+            logger.warning(
+                "Schematic read failed (%s: %s); prompt will omit the "
+                "live topology section this run.",
+                type(exc).__name__, exc,
+            )
+
+        first_topology_section = _guard_llm_feedback(
+            _format_topology_with_live_vars(schematic_instances, {}),
+            context="first-turn topology",
+        )
+        first_topology_block = (
+            "## Topology (instances x design-var references)\n"
+            f"{first_topology_section}\n\n"
+            if first_topology_section else ""
+        )
         messages = [{
             "role": "user",
             "content": (
@@ -537,35 +748,56 @@ class CircuitAgent:
                 "- **Valid top-level JSON keys**: "
                 f"{', '.join(sorted(_VALID_RESPONSE_KEYS))}\n"
                 "- **Valid `design_vars` variable names**: "
-                f"{', '.join(sorted(_VALID_DESIGN_VAR_NAMES))}\n"
-                "- **Value format**: engineering suffixes ONLY "
-                "(e.g. `500u`, `1.5f`, `10n`, `3k`). "
-                "Do NOT use physical units like mA, pF, nH, V, GHz.\n"
+                f"{', '.join(sorted(self.valid_design_var_names))}\n"
+                f"{_design_var_value_contract(self.valid_design_var_names)}"
                 "- Do NOT invent variable names — use only the names in "
                 "the whitelist above.\n"
+                f"{fixed_vars_note}"
                 f"{derived_setup_note}\n"
                 "## Region enum (per-device op-point table)\n"
                 "Each next-turn prompt carries a ``tranOp`` DC operating-"
                 "point table. The ``region`` integer maps as:\n"
                 "- 0 cutoff — off; `id ≈ 0`; `gm ≈ 0`.\n"
-                "- 1 triode — `vds < vdsat`; linear region; `gds >> gm`.\n"
-                "- 2 saturation — `vds > vdsat`, `vgs > vth`; normal "
-                "amplifier. Current sources and amplifying transistors "
-                "belong here.\n"
+                "- 1 triode: linear region; usually high `gds` and weak "
+                "`gm/gds` intrinsic gain.\n"
+                "- 2 saturation: normal amplifier/current-source region; "
+                "cross-check with finite `id`, useful `gm`, reasonable "
+                "`gm/gds`, and `vds` versus derived `vov = vgs - vth`. "
+                "Current sources and amplifying transistors belong here.\n"
                 "- 3 subthreshold — `vgs < vth`, weak inversion.\n"
                 "- 4 breakdown — `vds > Vdsbreak`; never expected.\n"
                 "Capacitor-like devices (e.g. MOS varactors with "
                 "gate-bulk tied) may legitimately sit in cutoff/triode "
                 "with `id ≈ 0`; consult the spec's topology section "
                 "for per-device intent.\n\n"
+                f"{first_topology_block}"
                 f"## Target Specifications\n{spec_block}\n\n"
-                "Emit the first JSON block now — pick a reasonable "
-                "starting point inside the ranges in the spec's "
-                "design-variable table."
+                "If the spec declares a model-comparison starting "
+                "`design_vars` table, treat it as the Maestro/pre-run "
+                "baseline for fairness. When you emit optimization "
+                "`design_vars`, still obey the typed value contract above; "
+                "bare `1` entries for current-source variables in a stress "
+                "table are not legal current proposals. Emit the first JSON "
+                "block now — pick a reasonable starting point inside the "
+                "ranges in the spec's design-variable table."
             ),
         }]
         _append_transcript(0, "user", messages[0]["content"])
-        response = self.llm.chat(messages)
+        try:
+            response = self.llm.chat(messages)
+        except Exception as exc:  # noqa: BLE001 - provider outages are runtime data
+            safe_exc = scrub(f"{type(exc).__name__}: {exc}")
+            logger.error("LLM chat failed before first iteration: %s", safe_exc)
+            return {
+                "measurements": {},
+                "pass_fail": {},
+                "design_vars": {},
+                "converged": False,
+                "abort_reason": "llm_error",
+                "writeback_status": "skipped: llm_error",
+                "tuning_measurements": {},
+                "tuning_pass_fail": {},
+            }
         messages.append({"role": "assistant", "content": response})
         _append_transcript(
             0, "assistant", response,
@@ -590,18 +822,25 @@ class CircuitAgent:
                 # variable would otherwise pass discovery and then
                 # crash ``run_ocean_sim`` on the first iteration.
                 filtered_out: list[str] = []
+                active_seed_names = (
+                    self.valid_design_var_names | self.fixed_design_var_names
+                )
                 for entry in discovered:
                     name = entry["name"]
-                    if self.bridge._is_allowed_param_name(name):
+                    if (
+                        self.bridge._is_allowed_param_name(name)
+                        and name in active_seed_names
+                    ):
                         baseline_vars[name] = entry["default"]
                     else:
                         filtered_out.append(name)
                 if filtered_out:
                     logger.warning(
-                        "Filtered %d discovered variable(s) not on "
-                        "allowed_params whitelist: %s (won't be sent to "
-                        "OCEAN; their Maestro defaults still apply via "
-                        "the testbench netlist).",
+                        "Filtered %d discovered variable(s) not on the "
+                        "active spec/fixed whitelist or SafeBridge param "
+                        "allow-list: %s (won't be sent to OCEAN; their "
+                        "Maestro defaults still apply via the testbench "
+                        "netlist).",
                         len(filtered_out), sorted(filtered_out),
                     )
                 logger.info(
@@ -659,9 +898,9 @@ class CircuitAgent:
         # LLM's next_prompt. Sanitization audit (2026-04-19 rev 8 probe
         # run_20260419_133135.log) confirmed no foundry cell/lib names
         # and no BSIM coefficients reach this layer.
-        schematic_instances: list[dict] = []
+        # Schematic topology was already cached before the first prompt.
         try:
-            _circuit = self.bridge.read_circuit(lib, cell)
+            _circuit = {"instances": schematic_instances}
             _insts = _circuit.get("instances") or []
             if isinstance(_insts, list):
                 schematic_instances = _insts
@@ -790,7 +1029,9 @@ class CircuitAgent:
             # ``IterationRecord`` (claude P3 NIT) so the audit log
             # reflects how many corrective prompts a given iter
             # consumed. Currently only the final pass/fail surfaces.
-            repair_reason = self._check_contract_violation(parsed)
+            repair_reason = self._check_contract_violation(
+                parsed, self.valid_design_var_names
+            )
             repair_attempts = 0
             while repair_reason and repair_attempts < _CONTRACT_REPAIR_MAX:
                 repair_attempts += 1
@@ -809,11 +1050,26 @@ class CircuitAgent:
                     f"keys and variable names from HARD CONSTRAINTS."
                 )
                 messages.append({"role": "user", "content": repair_msg})
-                response = self.llm.chat(messages)
+                try:
+                    response = self.llm.chat(messages)
+                except Exception as exc:  # noqa: BLE001 - fail gracefully
+                    safe_exc = scrub(f"{type(exc).__name__}: {exc}")
+                    logger.error(
+                        "LLM chat failed during contract repair "
+                        "(iter %d, attempt %d/%d): %s",
+                        i + 1, repair_attempts,
+                        _CONTRACT_REPAIR_MAX, safe_exc,
+                    )
+                    abort_reason = "llm_error"
+                    break
                 messages.append({"role": "assistant", "content": response})
                 parsed = self._parse_llm_response(response)
                 self._strip_llm_setup_blocks_if_derived(parsed, iter_idx=i)
-                repair_reason = self._check_contract_violation(parsed)
+                repair_reason = self._check_contract_violation(
+                    parsed, self.valid_design_var_names
+                )
+            if abort_reason == "llm_error":
+                break
             if repair_reason:
                 logger.warning(
                     "Contract violation persists after %d repair "
@@ -862,7 +1118,7 @@ class CircuitAgent:
                     setup_payload = self._derive_maestro_setup_from_spec(
                         maestro_setup_test,
                     )
-            else:
+            elif self.allow_llm_maestro_setup:
                 setup_payload = self._slice_maestro_setup_payload(
                     parsed, iter_idx=i, log=logger,
                 )
@@ -978,13 +1234,36 @@ class CircuitAgent:
                 baseline_analyses if baseline_analyses
                 else [self.analysis_type]
             )
-            sim_result = self.bridge.run_ocean_sim(
-                lib=lib,
-                cell=cell,
-                tb_cell=tb_cell,
-                design_vars=accumulated_vars,
-                analyses=analyses_for_run,
-            )
+            diagnostic = IterationDiagnostic()
+            try:
+                sim_result = self.bridge.run_ocean_sim(
+                    lib=lib,
+                    cell=cell,
+                    tb_cell=tb_cell,
+                    design_vars=accumulated_vars,
+                    analyses=analyses_for_run,
+                )
+            except RuntimeError as exc:
+                msg = str(exc)
+                diagnostic.dump_status = DumpStatus.classify_runtime_error(msg)
+                if diagnostic.dump_status == DumpStatus.UNKNOWN:
+                    diagnostic.dump_status = DumpStatus.SIM_FAILED
+                diagnostic.dump_raw_error = msg[:200]
+                diagnostic.notes.append("run_ocean_sim failed")
+                logger.warning(
+                    "run_ocean_sim failed (%s); surfacing as %s so "
+                    "the LLM can adjust design_vars next iter.",
+                    msg[:160],
+                    diagnostic.dump_status,
+                )
+                if hasattr(self.bridge, "_last_results_dir"):
+                    self.bridge._last_results_dir = None
+                sim_result = {
+                    "ok": False,
+                    "measurements": {},
+                    "measure_error": msg,
+                    "run_error": msg,
+                }
 
             # Stage 1 rev 13 (2026-04-20): Drop any lingering
             # selectResult('tran) handle left over from the PREVIOUS
@@ -1000,21 +1279,19 @@ class CircuitAgent:
             # swallow any error so a SKILL-side glitch does not abort the
             # optimization. Dual-reviewer approved (Claude + Codex, see
             # docs/phase3_selectResult_leak_fix.md).
-            # `errset(... t)` silences the CIW *Error* print when
-            # `unselectResult` is not defined in this IC23.1 build
-            # (some SKILL cores only expose it after a results session
-            # opens). The Python try/except was catching the thrown
-            # exception but SKILL still logged the error to CIW first.
+            # Guard unselectResult: some IC23.1/OCEAN builds do not
+            # define it, and calling an undefined SKILL function inside
+            # errset still prints a CIW error before Python can catch it.
             try:
-                self.bridge.client.execute_skill("errset(unselectResult() t)")
+                self.bridge.client.execute_skill(
+                    "when(isCallable('unselectResult) "
+                    "errset(unselectResult() t))"
+                )
             except Exception as exc:  # noqa: BLE001 — best-effort
                 logger.debug(
                     "unselectResult() cleanup failed (%s); continuing.",
                     type(exc).__name__,
                 )
-
-            # Per-iter diagnostic surface (Bug 0/2/4, rev 11 2026-04-20).
-            diagnostic = IterationDiagnostic()
 
             # Stage 1 rev 10 (2026-04-19): Plan Auto — patch input.scs's
             # ic line from this iter's spectre.fc so the next iter's
@@ -1053,12 +1330,22 @@ class CircuitAgent:
             # A failure here must NEVER abort the loop — surface as an
             # empty dict so the feedback section says "(unavailable)".
             op_point: dict = {}
+            op_reader = "read_op_point_after_tran"
             try:
-                op_point = self.bridge.read_op_point_after_tran()
+                if _analyses_use_dc_op(analyses_for_run):
+                    nets, insts = _op_point_probe_paths(schematic_instances)
+                    op_reader = "read_dc_op_point_from_results"
+                    op_point = self.bridge.read_dc_op_point_from_results(
+                        nets=nets,
+                        instances=insts,
+                    )
+                else:
+                    op_point = self.bridge.read_op_point_after_tran()
             except Exception as exc:  # noqa: BLE001 — see docstring
                 logger.warning(
-                    "read_op_point_after_tran failed (%s: %s); LLM will "
-                    "not see per-device op-point this iter.",
+                    "%s failed (%s: %s); LLM will not see per-device "
+                    "op-point this iter.",
+                    op_reader,
                     type(exc).__name__,
                     exc,
                 )
@@ -1066,14 +1353,57 @@ class CircuitAgent:
             else:
                 diagnostic.op_point_available = bool(op_point)
             if op_point:
-                logger.info(
-                    "Op-point (%d devs): %s",
-                    len(op_point),
-                    ", ".join(
-                        f"{inst.rsplit('/', 1)[-1]}={params.get('region_label', '?')}"
-                        for inst, params in op_point.items()
-                    ),
+                _enrich_op_point_terminal_biases(
+                    op_point,
+                    schematic_instances,
+                    accumulated_vars,
                 )
+                op_instances = _op_point_instances(op_point)
+                op_nodes = op_point.get("nodes") if isinstance(
+                    op_point.get("nodes"), dict,
+                ) else {}
+                region_items = [
+                    f"{inst.rsplit('/', 1)[-1]}="
+                    f"{params.get('region_label', '?')}"
+                    for inst, params in op_instances.items()
+                    if isinstance(params, dict)
+                ]
+                logger.info(
+                    "Op-point via %s (%d devs, %d nodes): %s",
+                    op_reader,
+                    len(op_instances),
+                    len(op_nodes),
+                    ", ".join(region_items) if region_items else "no regions",
+                )
+                if op_reader == "read_dc_op_point_from_results":
+                    save_check = assess_op_point_save_effectiveness(
+                        sim_result,
+                        op_point,
+                    )
+                    msg = (
+                        "saveOpPoint check: requested=%s, devices=%s/%s, "
+                        "keys=%s"
+                    ) % (
+                        save_check.get("opPointsRequested"),
+                        save_check.get("devicesWithSavedScalars"),
+                        save_check.get("instancesReturned"),
+                        ",".join(save_check.get("savedScalarKeys") or []),
+                    )
+                    if save_check.get("ok"):
+                        logger.info("%s", msg)
+                    else:
+                        logger.warning(
+                            "%s; issues=%s",
+                            msg,
+                            "; ".join(save_check.get("issues") or []),
+                        )
+                    if save_check.get("issues"):
+                        op_point.setdefault("issues", [])
+                        if isinstance(op_point["issues"], list):
+                            for issue in save_check["issues"]:
+                                op_point["issues"].append(
+                                    f"saveOpPoint check: {issue}"
+                                )
 
             # Stage 1 rev 4 (2026-04-18): measurements + pass_fail are
             # now PC-computed from a generic safeOceanDumpAll + spec
@@ -1203,6 +1533,24 @@ class CircuitAgent:
                     )
                     measurements = llm_measurements
                 pass_fail = llm_pass_fail
+                if self._legacy_hard_pass_bounds:
+                    enforced_pass_fail = _enforce_legacy_hard_pass_bounds(
+                        measurements,
+                        pass_fail,
+                        self._legacy_hard_pass_bounds,
+                    )
+                    changed = {
+                        key: enforced_pass_fail[key]
+                        for key in enforced_pass_fail
+                        if pass_fail.get(key) != enforced_pass_fail[key]
+                    }
+                    if changed:
+                        logger.warning(
+                            "Overrode LLM pass_fail with numeric hard-pass "
+                            "verdicts from measurements: %s",
+                            changed,
+                        )
+                    pass_fail = enforced_pass_fail
 
             # Best-effort waveform display — never let a display failure
             # abort the optimization. Runs AFTER dumpAll (see note above
@@ -1330,8 +1678,14 @@ class CircuitAgent:
             # dump so it can reason about non-oscillating states (DC
             # operating point of every node is visible even when f_osc
             # is null), and (c) the running history.
-            sim_summary = _format_sim_summary(sim_result)
-            op_point_summary = _format_op_point_summary(op_point)
+            sim_summary = _guard_llm_feedback(
+                _format_sim_summary(sim_result),
+                context="OCEAN run meta",
+            )
+            op_point_summary = _guard_llm_feedback(
+                _format_op_point_summary(op_point),
+                context="op-point feedback",
+            )
             history_brief = self._format_history_brief()
             # Plan ★ (2026-04-19): merge cached topology with current
             # accumulated_vars so Kimi sees which physical instance each
@@ -1347,8 +1701,12 @@ class CircuitAgent:
                 if topology_section else ""
             )
             if self.eval_block is not None:
-                eval_summary = _format_eval_summary(
-                    measurements, pass_fail, dumps, diagnostic=diagnostic,
+                eval_summary = _guard_llm_feedback(
+                    _format_eval_summary(
+                        measurements, pass_fail, dumps,
+                        diagnostic=diagnostic,
+                    ),
+                    context="evaluation feedback",
                 )
                 tuning_section = _format_tuning_summary(
                     last_tuning_measurements, last_tuning_pass_fail,
@@ -1359,7 +1717,7 @@ class CircuitAgent:
                     f"{eval_summary}\n\n"
                     f"{tuning_section}"
                     f"{last_curve_summary_md}"
-                    f"## Per-device DC op-point (tranOp @ t=0)\n"
+                    f"## Per-device DC operating point\n"
                     f"{op_point_summary}\n\n"
                     f"## OCEAN run meta\n{sim_summary}\n\n"
                     f"## History\n{history_brief}\n\n"
@@ -1381,16 +1739,44 @@ class CircuitAgent:
                 next_prompt = (
                     f"{topology_block}"
                     f"## Iteration {i + 1} OCEAN result\n{sim_summary}\n\n"
-                    f"## Per-device DC op-point (tranOp @ t=0)\n"
+                    f"## Per-device DC operating point\n"
                     f"{op_point_summary}\n\n"
                     f"## History\n{history_brief}\n\n"
                     "Emit the next JSON block. If every pass_fail entry was "
                     "PASS, repeat the same design_vars and mark all PASS — "
                     "the agent will stop on its own."
                 )
+            try:
+                assert_llm_feedback_safe(
+                    next_prompt,
+                    context=f"iteration {i + 1} feedback",
+                )
+            except ValueError as exc:
+                logger.error(
+                    "Withholding full iteration feedback from LLM: %s",
+                    exc,
+                )
+                next_prompt = (
+                    "## Iteration feedback\n"
+                    "(withheld: iteration feedback failed sensitive-token "
+                    "scan)\n\n"
+                    "Emit the next JSON block. Use the prior safe context, "
+                    "avoid PDK/model-card data, and propose a conservative "
+                    "design_vars update."
+                )
             messages.append({"role": "user", "content": next_prompt})
             _append_transcript(i + 1, "user", next_prompt)
-            response = self.llm.chat(messages)
+            try:
+                response = self.llm.chat(messages)
+            except Exception as exc:  # noqa: BLE001 - provider outage
+                safe_exc = scrub(f"{type(exc).__name__}: {exc}")
+                logger.error(
+                    "LLM chat failed after iteration %d; stopping with "
+                    "partial results: %s",
+                    i + 1, safe_exc,
+                )
+                abort_reason = "llm_error"
+                break
             messages.append({"role": "assistant", "content": response})
             _append_transcript(
                 i + 1, "assistant", response,
@@ -1428,7 +1814,13 @@ class CircuitAgent:
                         tuning_retries,
                     )
 
-        writeback_status = self._run_writeback(accumulated_vars)
+        if abort_reason == "llm_error":
+            writeback_status = "skipped: llm_error"
+        else:
+            writeback_status = (
+                self._run_writeback(accumulated_vars)
+                if writeback_enabled else "skipped: disabled"
+            )
 
         return {
             "measurements": last_measurements,
@@ -1479,7 +1871,10 @@ class CircuitAgent:
         return {}
 
     @staticmethod
-    def _check_contract_violation(parsed: dict) -> str | None:
+    def _check_contract_violation(
+        parsed: dict,
+        valid_design_vars: Iterable[str] | None = None,
+    ) -> str | None:
         """Validate the parsed LLM response against the JSON schema.
 
         Schema contract (see ``docs/llm_protocol.md``):
@@ -1527,13 +1922,20 @@ class CircuitAgent:
         # 4 + 5. design_vars whitelist and value-format checks.
         new_vars = parsed.get("design_vars")
         if new_vars and isinstance(new_vars, dict):
-            bad_names = set(new_vars.keys()) - _VALID_DESIGN_VAR_NAMES
+            valid_names = frozenset(
+                valid_design_vars or _VALID_DESIGN_VAR_NAMES
+            )
+            bad_names = set(new_vars.keys()) - valid_names
             if bad_names:
                 problems.append(
                     f"invalid design_vars key(s): {sorted(bad_names)}. "
-                    f"Valid names: {sorted(_VALID_DESIGN_VAR_NAMES)}"
+                    f"Valid names: {sorted(valid_names)}"
                 )
             for k, v in new_vars.items():
+                value_problem = _design_var_value_problem(k, v)
+                if value_problem:
+                    problems.append(value_problem)
+                    continue
                 if isinstance(v, str) and _FORBIDDEN_UNIT_RE.search(v):
                     problems.append(
                         f"design_vars['{k}'] = '{v}' contains a physical "
@@ -1566,17 +1968,18 @@ class CircuitAgent:
         purpose of the derived path. Strip them at the call site
         instead, with one WARN per iter so the divergence is visible.
 
-        No-op when there's no eval_block (legacy LLM-emit path remains
-        authoritative) or when ``parsed`` carries none of the four keys.
+        No-op when there's no eval_block and LLM setup is allowed
+        (legacy LLM-emit path remains authoritative), or when ``parsed``
+        carries none of the four keys.
         """
-        if self.eval_block is None:
+        if self.eval_block is None and self.allow_llm_maestro_setup:
             return
         present = [k for k in MAESTRO_SETUP_KEYS if k in parsed]
         if not present:
             return
         logger.warning(
             "iter %d: LLM emitted Maestro setup keys %s; ignoring "
-            "(spec-derived path is authoritative). Stripped before "
+            "(current Maestro setup policy is authoritative). Stripped before "
             "contract check.",
             iter_idx + 1, sorted(present),
         )
@@ -1888,6 +2291,39 @@ class CircuitAgent:
                 return False
         return True
 
+    @staticmethod
+    def _manifest_subset_for_spec(
+        existing: dict[int, float], derived: list[dict],
+    ) -> dict[int, float] | None:
+        """Return a spec-grid subset when an existing manifest is a superset.
+
+        Older ADE runs may contain a wider sweep, e.g. a 9-point
+        ``0.0..0.8`` V sweep while the current spec asks for the inner
+        7-point ``0.1..0.7`` V curve. In that case we can reuse the
+        manifest without overwriting the hand-authored file: select one
+        manifest point per spec Vctrl value and ignore extra endpoints.
+        Return ``None`` when any spec point is missing.
+        """
+        selected: dict[int, float] = {}
+        used_points: set[int] = set()
+        existing_items = sorted(existing.items())
+        for entry in sorted(derived, key=lambda e: float(e["vctrl"])):
+            want = float(entry["vctrl"])
+            match: tuple[int, float] | None = None
+            for point, got_raw in existing_items:
+                if point in used_points:
+                    continue
+                got = float(got_raw)
+                if math.isclose(got, want, rel_tol=1e-9, abs_tol=1e-12):
+                    match = (point, got)
+                    break
+            if match is None:
+                return None
+            point, got = match
+            selected[point] = got
+            used_points.add(point)
+        return dict(sorted(selected.items()))
+
     def _resolve_maestro_setup_test(
         self,
         *,
@@ -1977,7 +2413,18 @@ class CircuitAgent:
                     "Sweep manifest already present at %s (matches spec).",
                     sweep_root,
                 )
+                self._sweep_manifest_cache[sweep_root] = existing
                 return None
+            if len(existing) > len(entries):
+                subset = self._manifest_subset_for_spec(existing, entries)
+                if subset is not None:
+                    logger.info(
+                        "Sweep manifest at %s is a superset of the spec "
+                        "grid; using %d/%d matching point(s).",
+                        sweep_root, len(subset), len(existing),
+                    )
+                    self._sweep_manifest_cache[sweep_root] = subset
+                    return None
             logger.warning(
                 "Sweep manifest at %s does not match spec sweep block; "
                 "refusing to overwrite hand-written manifest.",
@@ -2387,6 +2834,154 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
+def _coerce_numeric_scalar(value: Any) -> float | None:
+    """Best-effort scalar extraction for measurement pass/fail gates.
+
+    Unlike ``_coerce_float`` this accepts strings with a trailing unit such as
+    ``"51.3 dB"``. It still refuses non-scalar containers so waveform arrays
+    cannot accidentally be reduced by stringification.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        val = float(value)
+        return val if math.isfinite(val) else None
+    if isinstance(value, (list, tuple, dict)):
+        return None
+    text = str(value).strip()
+    match = re.match(
+        r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", text,
+    )
+    if not match:
+        return None
+    try:
+        val = float(match.group(0))
+    except ValueError:
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _normalize_bound_unit(unit: str | None) -> str:
+    if not unit:
+        return ""
+    unit = unit.strip()
+    return unit.replace("μ", "u").replace("µ", "u")
+
+
+def _scaled_bound_value(value: float, unit: str) -> float:
+    """Scale frequency units to base Hz; leave other units in-place."""
+    scale = {
+        "hz": 1.0,
+        "khz": 1e3,
+        "mhz": 1e6,
+        "ghz": 1e9,
+    }.get(unit.lower(), 1.0)
+    return value * scale
+
+
+def _parse_numeric_bound(
+    text: str,
+    *,
+    metric_hint: str | None = None,
+) -> _NumericHardPassBound | None:
+    match = _NUMERIC_BOUND_RE.search(text or "")
+    if not match:
+        return None
+    metric = metric_hint or match.group("metric")
+    if not metric:
+        return None
+    unit = _normalize_bound_unit(match.group("unit"))
+    try:
+        value = float(match.group("value"))
+    except (TypeError, ValueError):
+        return None
+    return _NumericHardPassBound(
+        metric=metric,
+        op=match.group("op"),
+        value=_scaled_bound_value(value, unit),
+        unit=unit,
+    )
+
+
+def _strip_md_cell(text: str) -> str:
+    text = (text or "").strip()
+    if text.startswith("`") and text.endswith("`") and len(text) >= 2:
+        text = text[1:-1]
+    return text.strip()
+
+
+def _extract_legacy_hard_pass_bounds(
+    spec: dict | str,
+) -> dict[str, _NumericHardPassBound]:
+    """Extract explicitly marked numeric hard-pass bounds from Markdown.
+
+    This is a legacy-path guard for specs that do not yet carry the YAML
+    ``signals/windows/metrics`` eval block. It intentionally ignores ordinary
+    target rows unless the row/sentence marks them as hard pass, so secondary
+    diagnostics do not become convergence gates by accident.
+    """
+    if not isinstance(spec, str):
+        return {}
+
+    bounds: dict[str, _NumericHardPassBound] = {}
+    for raw_line in spec.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        if "hard pass" not in lower and "hard-pass" not in lower:
+            continue
+
+        if line.startswith("|") and "|" in line[1:]:
+            cells = [_strip_md_cell(c) for c in line.strip("|").split("|")]
+            if len(cells) >= 3:
+                metric = cells[0]
+                target = cells[2]
+                bound = _parse_numeric_bound(target, metric_hint=metric)
+                if bound:
+                    bounds[bound.metric] = bound
+
+        for code_text in _CODE_SPAN_RE.findall(line):
+            bound = _parse_numeric_bound(code_text)
+            if bound:
+                bounds[bound.metric] = bound
+
+    return bounds
+
+
+def _bound_passes(value: float, bound: _NumericHardPassBound) -> bool:
+    if bound.op == ">=":
+        return value >= bound.value
+    if bound.op == ">":
+        return value > bound.value
+    if bound.op == "<=":
+        return value <= bound.value
+    if bound.op == "<":
+        return value < bound.value
+    return False
+
+
+def _format_numeric_bound_verdict(
+    value: float | None,
+    bound: _NumericHardPassBound,
+) -> str:
+    if value is None:
+        return f"UNMEASURABLE (no numeric value; target {bound.target_text})"
+    if _bound_passes(value, bound):
+        return f"PASS (value {value:g}, target {bound.target_text})"
+    return f"FAIL (value {value:g}, target {bound.target_text})"
+
+
+def _enforce_legacy_hard_pass_bounds(
+    measurements: dict,
+    pass_fail: dict,
+    bounds: dict[str, _NumericHardPassBound],
+) -> dict:
+    enforced = dict(pass_fail or {})
+    for metric, bound in bounds.items():
+        value = _coerce_numeric_scalar((measurements or {}).get(metric))
+        enforced[metric] = _format_numeric_bound_verdict(value, bound)
+    return enforced
+
+
 def _format_tuning_summary(
     tuning_measurements: dict, tuning_pass_fail: dict,
 ) -> str:
@@ -2441,6 +3036,15 @@ def _format_eval_summary(
                 "- op_point: UNAVAILABLE (safeReadOpPointAfterTran "
                 "returned no devices — tranOp sub-result likely missing)"
             )
+        if (
+            not diagnostic.op_point_available
+            and lines
+            and lines[-1].startswith("- op_point: UNAVAILABLE")
+        ):
+            lines[-1] = (
+                "- op_point: UNAVAILABLE (DC operating-point readback "
+                "failed or returned no safe rows)"
+            )
         if not diagnostic.ic_patch_applied:
             lines.append(
                 f"- ic_patch_applied: NO — next iter starts from the "
@@ -2464,6 +3068,14 @@ def _format_eval_summary(
                 "- interpretation: OCEAN ran but VT()/IT() on the "
                 "probed paths returned nil. The testbench may have "
                 "dropped saved outputs, or the tran stopped early."
+            )
+        elif diagnostic.dump_status == DumpStatus.SIM_FAILED:
+            lines.append(
+                "- interpretation: Spectre/OCEAN did not produce the "
+                "requested analysis results, usually because the DC "
+                "operating point failed or the analysis terminated early. "
+                "Back off to a more conservative bias/sizing point before "
+                "trying aggressive gain or bandwidth moves."
             )
         lines.append(
             "- action: propose a NEW design_vars delta. If you repeat "
@@ -2519,6 +3131,304 @@ def _fmt_si(value: Any, unit: str = "") -> str:
     return f"{value:.3g}{unit}"
 
 
+_ENG_FLOAT_RE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*"
+    r"([A-Za-z]*)\s*$"
+)
+_ENG_SUFFIX_SCALE = {
+    "": 1.0,
+    "f": 1e-15,
+    "p": 1e-12,
+    "n": 1e-9,
+    "u": 1e-6,
+    "m": 1e-3,
+    "k": 1e3,
+    "meg": 1e6,
+    "g": 1e9,
+    "t": 1e12,
+}
+
+
+def _parse_engineering_float(raw: Any) -> float | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+        return value if math.isfinite(value) else None
+    if not isinstance(raw, str):
+        return None
+    match = _ENG_FLOAT_RE.fullmatch(raw)
+    if not match:
+        return None
+    suffix = match.group(2)
+    suffix_key = suffix if suffix == "M" else suffix.lower()
+    if suffix_key == "M":
+        suffix_key = "meg"
+    scale = _ENG_SUFFIX_SCALE.get(suffix_key)
+    if scale is None:
+        return None
+    value = float(match.group(1)) * scale
+    return value if math.isfinite(value) else None
+
+
+def _guard_llm_feedback(text: str, *, context: str) -> str:
+    """Return LLM feedback text only if the final sensitive-token gate passes."""
+    try:
+        return assert_llm_feedback_safe(text, context=context)
+    except ValueError as exc:
+        logger.error("Withholding LLM feedback block: %s", exc)
+        return f"(withheld: {context} failed sensitive-token scan)"
+
+
+_OP_POINT_INST_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_OP_POINT_MOS_INST_RE = re.compile(r"^[Mm][A-Za-z0-9_]*$")
+_OP_POINT_NET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_!]*$")
+_OP_POINT_NET_PATH_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_!]*/)*[A-Za-z_][A-Za-z0-9_!]*$"
+)
+_DEFAULT_OP_POINT_NETS = (
+    "Vout_p", "Vout_n", "Vin_p", "Vin_n",
+    "net1", "net2", "net3", "net5", "net6", "net9",
+    "p_bias", "cmfb_out",
+)
+_COMMON_OPAMP_DEVICE_ROLES = {
+    "M0": "input pair",
+    "M1": "input pair",
+    "M2": "first-stage PMOS load",
+    "M3": "first-stage PMOS load",
+    "M4": "NMOS bias diode",
+    "M5": "tail current source",
+    "M6": "second-stage PMOS pull-up",
+    "M8": "second-stage PMOS pull-up",
+    "M7": "CMFB-controlled NMOS pull-down",
+    "M9": "CMFB-controlled NMOS pull-down",
+    "M10": "PMOS bias diode",
+}
+
+
+def _analysis_names(analyses: Iterable[Any] | None) -> set[str]:
+    """Return normalized OCEAN analysis names from run_ocean_sim specs."""
+    names: set[str] = set()
+    for raw in analyses or []:
+        if isinstance(raw, str):
+            names.add(raw.lower())
+            continue
+        if isinstance(raw, dict):
+            name = raw.get("name")
+            if isinstance(name, str):
+                names.add(name.lower())
+            continue
+        if isinstance(raw, (tuple, list)) and raw:
+            names.add(str(raw[0]).lower())
+    return names
+
+
+def _analyses_use_dc_op(analyses: Iterable[Any] | None) -> bool:
+    """True when current results should expose a plain dc operating point."""
+    names = _analysis_names(analyses)
+    return "dc" in names and "tran" not in names
+
+
+def _op_point_probe_paths(
+    schematic_instances: Iterable[dict] | None,
+) -> tuple[list[str], list[str]]:
+    """Build bounded, explicit current-run DC OP readback paths.
+
+    ``read_circuit(lib, cell)`` reads the DUT cell, while Maestro/OCEAN
+    results expose DUT devices under the testbench instance path ``/I0``.
+    This mirrors the existing safeOceanMeasure default ``dut_path="/I0"``.
+    """
+    nets: list[str] = []
+    seen_nets: set[str] = set()
+
+    def add_net_path(name: str) -> None:
+        if not _OP_POINT_NET_PATH_RE.fullmatch(name):
+            return
+        path = f"/{name}"
+        if path in seen_nets:
+            return
+        if len(nets) >= 64:
+            return
+        nets.append(path)
+        seen_nets.add(path)
+
+    def add_net(raw: Any, *, include_dut_alias: bool = True) -> None:
+        if not isinstance(raw, str):
+            return
+        name = raw.strip()
+        if name.startswith("/"):
+            name = name[1:]
+        if not _OP_POINT_NET_PATH_RE.fullmatch(name):
+            return
+        add_net_path(name)
+        # DUT-cell topology is read from the schematic cell, but PSF node
+        # names may be either flattened (/net3) or kept under the testbench
+        # DUT instance (/I0/net3). Probe both bounded aliases so the LLM can
+        # see internal stage nodes without requiring PDK/netlist knowledge.
+        if include_dut_alias and "/" not in name and name not in {"0"}:
+            add_net_path(f"I0/{name}")
+
+    def is_mos_instance(inst: dict, name: str) -> bool:
+        cell = inst.get("cell")
+        if isinstance(cell, str):
+            cell_u = cell.upper()
+            if cell_u.startswith(("NMOS", "PMOS")):
+                return True
+        return bool(_OP_POINT_MOS_INST_RE.fullmatch(name))
+
+    for name in _DEFAULT_OP_POINT_NETS:
+        add_net(name)
+
+    instances: list[str] = []
+    seen: set[str] = set()
+    for inst in schematic_instances or []:
+        if not isinstance(inst, dict):
+            continue
+        inst_nets = inst.get("nets")
+        if isinstance(inst_nets, dict):
+            for net_name in inst_nets.values():
+                add_net(net_name)
+        name = inst.get("instName") or inst.get("name")
+        if not isinstance(name, str):
+            continue
+        if not _OP_POINT_INST_NAME_RE.fullmatch(name):
+            continue
+        if not is_mos_instance(inst, name):
+            continue
+        path = f"/I0/{name}"
+        if path in seen:
+            continue
+        instances.append(path)
+        seen.add(path)
+        if len(instances) >= 128:
+            break
+    return nets, instances
+
+
+def _op_point_instances(op_point: dict) -> dict:
+    """Return the instance sub-dict from either wrapper or flat OP payload."""
+    if not isinstance(op_point, dict):
+        return {}
+    instances = op_point.get("instances")
+    if isinstance(instances, dict):
+        return instances
+    return op_point
+
+
+def _enrich_op_point_terminal_biases(
+    op_point: dict,
+    schematic_instances: Iterable[dict] | None,
+    live_vars: dict[str, Any] | None = None,
+) -> None:
+    """Derive vgs/vds/vbs from sanitized topology and DC node voltages.
+
+    AC/DC PSF ``instance`` data can be sparse. Node voltages and net
+    connectivity are already PDK-free, so terminal biases can be derived
+    without touching model parameters. Mutates ``op_point`` in place.
+    """
+    if not isinstance(op_point, dict):
+        return
+    nodes = op_point.get("nodes") if isinstance(
+        op_point.get("nodes"), dict
+    ) else {}
+    instances = op_point.get("instances") if isinstance(
+        op_point.get("instances"), dict
+    ) else op_point
+    if not isinstance(nodes, dict) or not isinstance(instances, dict):
+        return
+
+    by_leaf: dict[str, float] = {}
+    for path, raw in nodes.items():
+        if not isinstance(path, str):
+            continue
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            continue
+        value = float(raw)
+        if math.isfinite(value):
+            by_leaf.setdefault(path.rsplit("/", 1)[-1], value)
+
+    vicm = _parse_engineering_float((live_vars or {}).get("Vicm"))
+
+    def net_value(raw_net: Any) -> float | None:
+        if not isinstance(raw_net, str):
+            return None
+        net = raw_net.strip()
+        if not net:
+            return None
+        if net in {"0", "gnd", "gnd!", "vss", "vss!"}:
+            return 0.0
+        if net in {"Vin_p", "Vin_n"} and vicm is not None:
+            return vicm
+        candidates: list[str] = []
+        if net.startswith("/"):
+            candidates.append(net)
+        else:
+            candidates.extend((f"/{net}", f"/I0/{net}"))
+        for candidate in candidates:
+            raw = nodes.get(candidate)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                value = float(raw)
+                if math.isfinite(value):
+                    return value
+        return by_leaf.get(net)
+
+    inst_by_name: dict[str, dict] = {}
+    for inst in schematic_instances or []:
+        if not isinstance(inst, dict):
+            continue
+        name = inst.get("instName") or inst.get("name")
+        if isinstance(name, str):
+            inst_by_name[name] = inst
+
+    for path, params in instances.items():
+        if not isinstance(path, str) or not isinstance(params, dict):
+            continue
+        inst = inst_by_name.get(path.rsplit("/", 1)[-1])
+        if not isinstance(inst, dict):
+            continue
+        nets = inst.get("nets")
+        if not isinstance(nets, dict):
+            continue
+        vg = net_value(nets.get("G"))
+        vd = net_value(nets.get("D"))
+        vs = net_value(nets.get("S"))
+        vb = net_value(nets.get("B"))
+        if vg is not None and vs is not None:
+            params.setdefault("vgs", vg - vs)
+        if vd is not None and vs is not None:
+            params.setdefault("vds", vd - vs)
+        if vb is not None and vs is not None:
+            params.setdefault("vbs", vb - vs)
+
+    issues = op_point.get("issues")
+    if not isinstance(issues, list):
+        return
+    refreshed: list[Any] = []
+    missing_re = re.compile(r"^(/[^ ]+) missing OP fields: ([A-Za-z0-9_,]+)$")
+    for issue in issues:
+        if not isinstance(issue, str):
+            refreshed.append(issue)
+            continue
+        match = missing_re.fullmatch(issue)
+        if not match:
+            refreshed.append(issue)
+            continue
+        path = match.group(1)
+        params = instances.get(path)
+        if not isinstance(params, dict):
+            refreshed.append(issue)
+            continue
+        missing = [
+            key for key in match.group(2).split(",")
+            if key and key not in params
+        ]
+        if missing:
+            refreshed.append(
+                f"{path} missing OP fields: {','.join(missing)}"
+            )
+    op_point["issues"] = refreshed
+
+
 def _format_topology_with_live_vars(
     instances: list[dict], live_vars: dict,
 ) -> str:
@@ -2544,6 +3454,8 @@ def _format_topology_with_live_vars(
         cell = inst.get("cell", "?")
         nets = inst.get("nets") or {}
         params = inst.get("params") or {}
+        role = _COMMON_OPAMP_DEVICE_ROLES.get(str(name), "")
+        role_part = f" role={role}" if role else ""
         net_parts = [
             f"{pin}={net}" for pin, net in nets.items()
         ] if isinstance(nets, dict) else []
@@ -2559,8 +3471,57 @@ def _format_topology_with_live_vars(
                     param_parts.append(f"{k}={v_str}")
         net_str = " ".join(net_parts) if net_parts else "(no nets)"
         param_str = " ".join(param_parts) if param_parts else "(no params)"
-        lines.append(f"- {name} {cell} | {net_str} | {param_str}")
+        lines.append(f"- {name} {cell}{role_part} | {net_str} | {param_str}")
     return "\n".join(lines)
+
+
+def _format_dc_node_diagnostics(nodes: dict[str, Any]) -> str:
+    def val(*paths: str) -> float | None:
+        for path in paths:
+            raw = nodes.get(path)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                if math.isfinite(float(raw)):
+                    return float(raw)
+        return None
+
+    diagnostics: list[tuple[str, float, str]] = []
+
+    def add(name: str, value: float | None, unit: str = "V") -> None:
+        if value is not None and math.isfinite(value):
+            diagnostics.append((name, value, unit))
+
+    vp = val("/Vout_p", "/I0/Vout_p")
+    vn = val("/Vout_n", "/I0/Vout_n")
+    if vp is not None and vn is not None:
+        add("Vout_cm", 0.5 * (vp + vn))
+        add("Vout_diff_dc", vp - vn)
+
+    vnp = val("/Vin_p", "/I0/Vin_p")
+    vnn = val("/Vin_n", "/I0/Vin_n")
+    if vnp is not None and vnn is not None:
+        add("Vin_cm", 0.5 * (vnp + vnn))
+        add("Vin_diff_dc", vnp - vnn)
+
+    n3 = val("/net3", "/I0/net3")
+    n6 = val("/net6", "/I0/net6")
+    if n3 is not None and n6 is not None:
+        add("first_stage_output_cm", 0.5 * (n3 + n6))
+        add("first_stage_output_diff_dc", n3 - n6)
+
+    sense = val("/net5", "/I0/net5")
+    ref = val("/net1", "/I0/net1")
+    if sense is not None and ref is not None:
+        add("cmfb_error", sense - ref)
+
+    if not diagnostics:
+        return ""
+    lines = [
+        "| Diagnostic | Value |",
+        "|---|---|",
+    ]
+    for name, value, unit in diagnostics:
+        lines.append(f"| {name} | {_fmt_si(value, unit)} |")
+    return "### Derived DC diagnostics\n" + "\n".join(lines)
 
 
 def _format_op_point_summary(op_point: dict) -> str:
@@ -2573,16 +3534,45 @@ def _format_op_point_summary(op_point: dict) -> str:
     """
     if not isinstance(op_point, dict) or not op_point:
         return "(unavailable — op-point read returned empty or failed)"
-    cols = ["vgs", "vds", "vov", "id", "gm", "gds", "vth", "vdsat"]
+    nodes = op_point.get("nodes") if isinstance(
+        op_point.get("nodes"), dict,
+    ) else {}
+    instances = op_point.get("instances") if isinstance(
+        op_point.get("instances"), dict,
+    ) else op_point
+    issues = op_point.get("issues") if isinstance(
+        op_point.get("issues"), list,
+    ) else []
+
+    blocks: list[str] = []
+    if nodes:
+        node_lines = [
+            "| Node | DC voltage |",
+            "|---|---|",
+        ]
+        for node, value in nodes.items():
+            node_lines.append(f"| {node} | {_fmt_si(value, 'V')} |")
+        blocks.append("### DC node voltages\n" + "\n".join(node_lines))
+        diag_block = _format_dc_node_diagnostics(nodes)
+        if diag_block:
+            blocks.append(diag_block)
+
+    cols = [
+        "vgs", "vds", "vov", "id", "gm", "gds",
+        "vth", "vdsat", "cgs", "cgd",
+    ]
     col_units = {"vgs": "V", "vds": "V", "vov": "V", "id": "A",
-                 "gm": "S", "gds": "S", "vth": "V", "vdsat": "V"}
+                 "gm": "S", "gds": "S", "vth": "V", "vdsat": "V",
+                 "cgs": "F", "cgd": "F"}
     lines = [
         "| Inst | Region | " + " | ".join(cols) + " |",
         "|" + "|".join(["---"] * (2 + len(cols))) + "|",
     ]
-    for inst_name, params in op_point.items():
+    any_instance = False
+    for inst_name, params in instances.items():
         if not isinstance(params, dict):
             continue
+        any_instance = True
         region_int = params.get("region")
         region_lbl = params.get("region_label", "")
         if isinstance(region_int, (int, float)) and not isinstance(
@@ -2596,7 +3586,18 @@ def _format_op_point_summary(op_point: dict) -> str:
         lines.append(
             f"| {inst_name} | {region_cell} | " + " | ".join(vals) + " |"
         )
-    return "\n".join(lines)
+    if any_instance:
+        blocks.append("### Device operating point\n" + "\n".join(lines))
+
+    issue_lines = [
+        f"- {issue}" for issue in issues if isinstance(issue, str)
+    ]
+    if issue_lines:
+        blocks.append("### Readback issues\n" + "\n".join(issue_lines))
+
+    if not blocks:
+        return "(unavailable: op-point read returned no safe numeric data)"
+    return "\n\n".join(blocks)
 
 
 def _format_sim_summary(sim_result: dict) -> str:
@@ -2631,9 +3632,6 @@ def _format_sim_summary(sim_result: dict) -> str:
 #  ``CircuitAgent``: the two share the LLM transcript style and the
 #  JSON envelope but nothing else, and forcing common machinery would
 #  drag SafeBridge into HSpice runs that should not need it.
-
-import yaml                        # noqa: E402  -- spec block extraction
-
 from .hspice_resolver import (     # noqa: E402
     EvaluationResult,
     HspiceMetricNotFoundError,

@@ -199,7 +199,9 @@ let((psfDir specFile resultJson skillDir
             when(doSkip
                 fprintf(stderr "[psf_dump_worker] T=%s osc_gate: non_oscillating — skipping dumpAll (Vpp=%L < %L)\n"
                         getCurrentTime() vpp oscThresh)
-                errset(unselectResult())
+                when(isCallable('unselectResult)
+                    errset(unselectResult() t)
+                )
                 ;; Emit ok=true so _fetch_result accepts it; the
                 ;; "degenerate" flag tells the Python side this iter
                 ;; produced no measurements (circuit not oscillating).
@@ -221,18 +223,24 @@ let((psfDir specFile resultJson skillDir
     fprintf(stderr "[psf_dump_worker] T=%s step6_dumpAll_end errMsg=%L type=%L\n"
             getCurrentTime() errMsg if(jsonStr then "string" else "nil"))
     when(null(errMsg)
-        errset(unselectResult())
+        when(isCallable('unselectResult)
+            errset(unselectResult() t)
+        )
         vbWorker_writeStatus("error" "safeOceanDumpAll raised")
         exit(1)
     )
     unless(stringp(jsonStr)
-        errset(unselectResult())
+        when(isCallable('unselectResult)
+            errset(unselectResult() t)
+        )
         vbWorker_writeStatus("error" "safeOceanDumpAll returned non-string")
         exit(1)
     )
 
     ;; 7) write result file + one-line stdout status
-    errset(unselectResult())
+    when(isCallable('unselectResult)
+        errset(unselectResult() t)
+    )
     vbWorker_writeFile(resultJson jsonStr)
     vbWorker_writeStatus("ok" nil)
 

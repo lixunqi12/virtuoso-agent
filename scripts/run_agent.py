@@ -37,7 +37,7 @@ for _stream in (sys.stdout, sys.stderr):
 from dotenv import load_dotenv
 from virtuoso_bridge import VirtuosoClient
 
-from src.agent import CircuitAgent
+from src.agent import CircuitAgent, _load_allowed_design_vars
 from src.llm_client import create_llm_client
 from src.ocean_worker import worker_from_env
 from src.plan_auto import PlanAuto, parse_startup_from_spec
@@ -247,6 +247,35 @@ def parse_args() -> argparse.Namespace:
             "emitted by --enable-curve-searcher. <= 0 disables candidate "
             "generation (curve/sensitivity summary still shown). "
             "Default 6."
+        ),
+    )
+    parser.add_argument(
+        "--no-writeback",
+        action="store_true",
+        help=(
+            "Run optimization and report final metrics without writing final "
+            "design variables back to Maestro. Default is to write and save "
+            "Maestro on completion."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-design-var",
+        action="append",
+        default=[],
+        help=(
+            "Design variable to seed from Maestro but keep fixed during the "
+            "LLM loop. Repeat for multiple variables, or pass a comma-"
+            "separated list. Useful for stimulus variables such as input "
+            "common-mode, AC magnitude, and phase."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-llm-maestro-setup",
+        action="store_true",
+        help=(
+            "Ignore LLM-emitted tests/analyses/outputs/corners blocks. Use "
+            "when the target Maestro setup is already configured and the LLM "
+            "should only propose design_vars."
         ),
     )
     parser.add_argument(
@@ -727,6 +756,47 @@ def main() -> int:
             "Loaded Markdown spec: %s (%d chars)", spec_path, len(spec_text)
         )
 
+    fixed_design_vars = tuple(
+        item.strip()
+        for raw in (args.fixed_design_var or [])
+        for item in str(raw).split(",")
+        if item.strip()
+    )
+    optimizable_design_vars: tuple[str, ...] = ()
+    if args.sim_backend == "spectre":
+        try:
+            allowed_design_vars = _load_allowed_design_vars(spec_path)
+        except RuntimeError as exc:
+            logger.error("Design-var whitelist parse error: %s", exc)
+            return 1
+        unknown_fixed = sorted(set(fixed_design_vars) - set(allowed_design_vars))
+        if unknown_fixed:
+            logger.error(
+                "--fixed-design-var contains name(s) not declared in %s: %s",
+                spec_path, ", ".join(unknown_fixed),
+            )
+            return 1
+        optimizable_design_vars = tuple(
+            name for name in allowed_design_vars if name not in fixed_design_vars
+        )
+        if fixed_design_vars and not optimizable_design_vars:
+            logger.error(
+                "--fixed-design-var removed every declared design variable; "
+                "nothing remains for the LLM to optimize."
+            )
+            return 1
+        logger.info(
+            "Loaded %d allowed design vars from %s: %s",
+            len(optimizable_design_vars),
+            spec_path,
+            ", ".join(optimizable_design_vars),
+        )
+        if fixed_design_vars:
+            logger.info(
+                "Fixed design vars seeded but not LLM-editable: %s",
+                ", ".join(fixed_design_vars),
+            )
+
     # Stage 1 rev 5 (2026-04-19): static feasibility check on the spec
     # *before* any Virtuoso connection or OCEAN round-trip. Catches the
     # ptp-vs-amplitude / unreachable-threshold class of bugs that used
@@ -771,6 +841,11 @@ def main() -> int:
             print(f"  lib/cell/tb_cell : {args.lib}/{args.cell}/{args.tb_cell}")
             print(f"  maestro_test     : {args.maestro_test or '<auto>'}")
             print(f"  analysis         : {args.analysis}")
+            print(
+                f"  optimizable vars : {', '.join(optimizable_design_vars)}"
+            )
+            if fixed_design_vars:
+                print(f"  fixed vars       : {', '.join(fixed_design_vars)}")
             print(f"  remote_skill_dir : {args.remote_skill_dir or '<unset>'}")
         else:
             print(f"  testbench        : {args.netlist}")
@@ -873,6 +948,9 @@ def main() -> int:
         spec=spec,
         analysis_type=args.analysis,
         ocean_worker=ocean_worker,
+        valid_design_vars=optimizable_design_vars,
+        fixed_design_vars=fixed_design_vars,
+        allow_llm_maestro_setup=not args.ignore_llm_maestro_setup,
     )
 
     # Stage 1 rev 10 (2026-04-19): Plan Auto construction. Both the
@@ -907,6 +985,7 @@ def main() -> int:
         maestro_test=args.maestro_test,
         curve_searcher_enabled=args.enable_curve_searcher,
         curve_searcher_max_candidates=args.curve_searcher_max_candidates,
+        writeback_enabled=not args.no_writeback,
     )
 
     print("\n" + "=" * 60)

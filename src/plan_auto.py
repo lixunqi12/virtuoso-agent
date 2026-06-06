@@ -53,6 +53,7 @@ class StartupConfig:
     """Parsed `startup:` section from the spec markdown."""
     warm_start: str = "none"              # "auto" | "none"
     perturb_nodes: list[PerturbNode] = field(default_factory=list)
+    exclude_nodes: list[str] = field(default_factory=list)
     v_cm_hint_V: float = 0.4
     netlist_path: str | None = None       # None = use --scs-path
 
@@ -101,6 +102,8 @@ def _parse_startup_block(yaml_text: str) -> StartupConfig | None:
           perturb_nodes:
             - name: Vout_n
               offset_mV: +5
+          exclude_nodes:
+            - I0.Ctrl
           v_cm_hint_V: 0.4
           netlist_path: null
 
@@ -114,7 +117,9 @@ def _parse_startup_block(yaml_text: str) -> StartupConfig | None:
     v_cm_hint_V = 0.4
     netlist_path: str | None = None
     perturb_nodes: list[PerturbNode] = []
+    exclude_nodes: list[str] = []
     current_node: dict[str, Any] | None = None
+    current_list: str | None = None
 
     for raw_line in lines:
         # Strip trailing comment
@@ -149,6 +154,11 @@ def _parse_startup_block(yaml_text: str) -> StartupConfig | None:
         # current_node={"{name": "..."} — Plan Auto then silently
         # disabled because no PerturbNode finalized.
         if stripped.startswith("- "):
+            if current_list == "exclude_nodes":
+                node_name = stripped[2:].strip().strip("'\"")
+                if node_name:
+                    exclude_nodes.append(node_name)
+                continue
             if current_node is not None:
                 pn = _finalize_perturb(current_node)
                 if pn:
@@ -197,6 +207,7 @@ def _parse_startup_block(yaml_text: str) -> StartupConfig | None:
         val = val.strip()
 
         if key == "warm_start":
+            current_list = None
             if val.lower() in {"auto", "none"}:
                 warm_start = val.lower()
             else:
@@ -204,6 +215,7 @@ def _parse_startup_block(yaml_text: str) -> StartupConfig | None:
                     "Plan Auto: unknown warm_start=%r; treating as 'none'", val
                 )
         elif key == "v_cm_hint_V":
+            current_list = None
             try:
                 v_cm_hint_V = float(val)
             except ValueError:
@@ -211,9 +223,15 @@ def _parse_startup_block(yaml_text: str) -> StartupConfig | None:
                     "Plan Auto: bad v_cm_hint_V=%r; using default 0.4", val
                 )
         elif key == "netlist_path":
+            current_list = None
             if val and val.lower() not in {"null", "none", "~", ""}:
                 netlist_path = val.strip("'\"")
         elif key == "perturb_nodes":
+            current_list = "perturb_nodes"
+            # handled by list items below
+            pass
+        elif key == "exclude_nodes":
+            current_list = "exclude_nodes"
             # handled by list items below
             pass
 
@@ -232,6 +250,7 @@ def _parse_startup_block(yaml_text: str) -> StartupConfig | None:
     return StartupConfig(
         warm_start=warm_start,
         perturb_nodes=perturb_nodes,
+        exclude_nodes=exclude_nodes,
         v_cm_hint_V=v_cm_hint_V,
         netlist_path=netlist_path,
     )
@@ -299,7 +318,13 @@ class PlanAuto:
         nodes = ", ".join(
             f"{p.name}{p.offset_mV:+g}mV" for p in self.config.perturb_nodes
         )
-        return f"Plan Auto: ACTIVE (perturb={nodes}, scs={self.scs_path})"
+        excludes = ""
+        if self.config.exclude_nodes:
+            excludes = f", exclude={','.join(self.config.exclude_nodes)}"
+        return (
+            f"Plan Auto: ACTIVE (perturb={nodes}{excludes}, "
+            f"scs={self.scs_path})"
+        )
 
     def patch_after_run(
         self,
@@ -330,6 +355,7 @@ class PlanAuto:
                 fc_path=fc_path,
                 perturb_nodes=perturb_spec,
                 v_cm_hint_V=self.config.v_cm_hint_V,
+                exclude_nodes=self.config.exclude_nodes,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(

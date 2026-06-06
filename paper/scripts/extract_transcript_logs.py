@@ -31,7 +31,10 @@ import os
 import re
 from pathlib import Path
 
-ROOT = Path(r"F:/AI_tool/virtuoso-agent")
+ROOT = Path(os.environ.get(
+    "VA_REPO_ROOT",
+    Path(__file__).resolve().parents[2],
+)).resolve()
 PROJECTS = ["lc_vco_base", "cobi_delay", "cobi_matching"]
 OUT_CSV = ROOT / "paper" / "data" / "extracted_logs.csv"
 

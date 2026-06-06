@@ -87,6 +87,91 @@ def _normalize_usage(
 # own backoff is exhausted.
 _LLM_MAX_RATE_LIMIT_RETRIES = 2          # on top of SDK's own retries
 _LLM_RATE_LIMIT_BACKOFF_S = (30, 90)     # seconds before attempt 1, 2
+_OPENAI_COMPAT_TIMEOUT_S = 300.0
+
+
+def _positive_float_env(
+    *names: str,
+    default: float = _OPENAI_COMPAT_TIMEOUT_S,
+) -> float:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid %s=%r; using %.0fs timeout",
+                name, raw, default,
+            )
+            return default
+        if value > 0:
+            return value
+        logger.warning(
+            "Ignoring non-positive %s=%r; using %.0fs timeout",
+            name, raw, default,
+        )
+        return default
+    return default
+
+
+def _openai_compat_timeout(
+    provider_env_prefix: str,
+    *,
+    default: float = _OPENAI_COMPAT_TIMEOUT_S,
+) -> float:
+    """Timeout for OpenAI-compatible SDK clients.
+
+    ``<PROVIDER>_HTTP_TIMEOUT`` lets one flaky provider be tuned without
+    changing the rest of the benchmark grid; ``LLM_HTTP_TIMEOUT`` is the
+    shared fallback for all OpenAI-compatible clients.
+    """
+    return _positive_float_env(
+        f"{provider_env_prefix}_HTTP_TIMEOUT",
+        "LLM_HTTP_TIMEOUT",
+        default=default,
+    )
+
+
+def _nonnegative_int_env(*names: str, default: int) -> int:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid %s=%r; using SDK max_retries=%d",
+                name, raw, default,
+            )
+            return default
+        if value >= 0:
+            return value
+        logger.warning(
+            "Ignoring negative %s=%r; using SDK max_retries=%d",
+            name, raw, default,
+        )
+        return default
+    return default
+
+
+def _openai_compat_max_retries(
+    provider_env_prefix: str,
+    *,
+    default: int,
+) -> int:
+    """SDK retry count for OpenAI-compatible clients.
+
+    Keep the historical default unless a flaky provider is explicitly tuned.
+    The outer retry loop remains reserved for rate-limit errors only.
+    """
+    return _nonnegative_int_env(
+        f"{provider_env_prefix}_SDK_MAX_RETRIES",
+        "LLM_SDK_MAX_RETRIES",
+        default=default,
+    )
 
 SYSTEM_PROMPT = """\
 You are an expert analog circuit designer. You analyze circuit topologies, \
@@ -264,16 +349,22 @@ class KimiClient(LLMClient):
         api_key: str | None = None,
         model: str = "kimi-k2.5",
         base_url: str | None = None,
-        max_retries: int = 5,
+        max_retries: int = 0,
     ):
         from openai import OpenAI
 
+        self.timeout = _openai_compat_timeout("KIMI")
+        self.max_retries = _openai_compat_max_retries(
+            "KIMI",
+            default=max_retries,
+        )
         self.client = OpenAI(
             api_key=api_key or os.environ.get("KIMI_API_KEY", ""),
             base_url=base_url or os.environ.get(
                 "KIMI_BASE_URL", "https://api.kimi.com/coding/v1"
             ),
-            max_retries=max_retries,
+            max_retries=self.max_retries,
+            timeout=self.timeout,
         )
         self.model = model
         self.last_usage: dict[str, Any] | None = None
@@ -365,12 +456,18 @@ class MinimaxClient(LLMClient):
     ):
         from openai import OpenAI
 
+        self.timeout = _openai_compat_timeout("MINIMAX")
+        self.max_retries = _openai_compat_max_retries(
+            "MINIMAX",
+            default=max_retries,
+        )
         self.client = OpenAI(
             api_key=api_key or os.environ.get("MINIMAX_API_KEY", ""),
             base_url=base_url or os.environ.get(
                 "MINIMAX_BASE_URL", "https://api.minimaxi.com/v1"
             ),
-            max_retries=max_retries,
+            max_retries=self.max_retries,
+            timeout=self.timeout,
         )
         self.model = model or os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
         self.last_usage: dict[str, Any] | None = None
@@ -463,12 +560,18 @@ class OpenAIClient(LLMClient):
     ):
         from openai import OpenAI
 
+        self.timeout = _openai_compat_timeout("OPENAI")
+        self.max_retries = _openai_compat_max_retries(
+            "OPENAI",
+            default=max_retries,
+        )
         self.client = OpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
             base_url=base_url or os.environ.get(
                 "OPENAI_BASE_URL", "https://api.openai.com/v1"
             ),
-            max_retries=max_retries,
+            max_retries=self.max_retries,
+            timeout=self.timeout,
         )
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-5.5")
         self.last_usage: dict[str, Any] | None = None
@@ -569,16 +672,22 @@ class MimoClient(LLMClient):
         api_key: str | None = None,
         model: str | None = None,
         base_url: str | None = None,
-        max_retries: int = 5,
+        max_retries: int = 0,
     ):
         from openai import OpenAI
 
+        self.timeout = _openai_compat_timeout("MIMO", default=120.0)
+        self.max_retries = _openai_compat_max_retries(
+            "MIMO",
+            default=max_retries,
+        )
         self.client = OpenAI(
             api_key=api_key or os.environ.get("MIMO_API_KEY", ""),
             base_url=base_url or os.environ.get(
                 "MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"
             ),
-            max_retries=max_retries,
+            max_retries=self.max_retries,
+            timeout=self.timeout,
         )
         self.model = model or os.environ.get("MIMO_MODEL", "mimo-v2.5-pro")
         self.last_usage: dict[str, Any] | None = None
@@ -678,12 +787,18 @@ class DeepSeekClient(LLMClient):
     ):
         from openai import OpenAI
 
+        self.timeout = _openai_compat_timeout("DEEPSEEK")
+        self.max_retries = _openai_compat_max_retries(
+            "DEEPSEEK",
+            default=max_retries,
+        )
         self.client = OpenAI(
             api_key=api_key or os.environ.get("DEEPSEEK_API_KEY", ""),
             base_url=base_url or os.environ.get(
                 "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"
             ),
-            max_retries=max_retries,
+            max_retries=self.max_retries,
+            timeout=self.timeout,
         )
         self.model = model or os.environ.get(
             "DEEPSEEK_MODEL", "deepseek-v4-pro"
