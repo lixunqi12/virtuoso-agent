@@ -612,6 +612,92 @@ Hard pass for this first MIMO run is `A0_diff_db >= 50 dB`.
         bridge.write_and_save_maestro.assert_called_once_with({"C": "1.5f"})
         assert llm.chat.call_count == 1
 
+    def test_run_writes_best_numeric_fail_when_no_hard_pass(self, tmp_path):
+        import json as _json
+
+        responses = [
+            _json.dumps({
+                "iteration": 1,
+                "design_vars": {"C": "1.5f"},
+                "measurements": {},
+                "pass_fail": {"A0_diff_db": "FAIL"},
+                "reasoning": "first candidate",
+            }),
+            _json.dumps({
+                "iteration": 2,
+                "design_vars": {"C": "2f"},
+                "measurements": {},
+                "pass_fail": {"A0_diff_db": "FAIL"},
+                "reasoning": "second candidate",
+            }),
+            _json.dumps({
+                "iteration": 3,
+                "design_vars": {"C": "2f"},
+                "measurements": {},
+                "pass_fail": {"A0_diff_db": "FAIL"},
+                "reasoning": "unused final reply",
+            }),
+        ]
+        llm = MagicMock()
+        llm.chat.side_effect = responses
+
+        bridge = MagicMock()
+        bridge._scope_lib = "pll"
+        bridge._scope_tb_cell = "opamp_test"
+        bridge.list_design_vars.return_value = [{"name": "C", "default": "1f"}]
+        bridge.list_analyses.return_value = [{"name": "ac", "kwargs": []}]
+        bridge.run_ocean_sim.side_effect = [
+            {
+                "ok": True,
+                "resultsDir": "/tmp",
+                "varsApplied": 1,
+                "analyses": ["ac"],
+                "measurements": {"A0_diff_db": 3.75, "UGB_Hz": 125e6},
+            },
+            {
+                "ok": True,
+                "resultsDir": "/tmp",
+                "varsApplied": 1,
+                "analyses": ["ac"],
+                "measurements": {"A0_diff_db": -62.3, "UGB_Hz": None},
+            },
+        ]
+        bridge._is_allowed_param_name.return_value = True
+        bridge.read_circuit.return_value = {"instances": []}
+        bridge.last_results_dir = "/sim/out"
+        bridge.read_dc_op_point_from_results.return_value = {}
+        bridge.write_and_save_maestro.return_value = {
+            "ok": True, "saved": True, "wrote": 1,
+        }
+
+        agent = CircuitAgent(
+            bridge=bridge,
+            llm=llm,
+            spec=self.OPAMP_SPEC,
+            analysis_type="ac",
+            ocean_worker=MagicMock(),
+            valid_design_vars=("C",),
+            allow_llm_maestro_setup=False,
+        )
+
+        result = agent.run(
+            "pll", "opamp", "opamp_test",
+            max_iter=2,
+            scs_path="/fake/input.scs",
+            transcript_path=str(tmp_path / "t.jsonl"),
+            writeback_enabled=True,
+        )
+
+        assert result["converged"] is False
+        assert result["abort_reason"] == "max_iter"
+        assert result["writeback_source"] == "best_iter_1"
+        assert result["best_iteration"] == 1
+        assert result["best_score"] == [0, pytest.approx(-46.25)]
+        assert result["design_vars"] == {"C": "1.5f"}
+        assert result["measurements"]["A0_diff_db"] == pytest.approx(3.75)
+        assert result["last_measurements"]["A0_diff_db"] == pytest.approx(-62.3)
+        bridge.write_and_save_maestro.assert_called_once_with({"C": "1.5f"})
+
 
 # ---------------------------------------------------------------- #
 #  Writeback preservation (Q2 directive)

@@ -960,6 +960,7 @@ class CircuitAgent:
         best_measurements: dict = {}
         best_pass_fail: dict = {}
         best_iteration: int | None = None
+        best_score: tuple[int, float] | None = None
         converged = False
         abort_reason: str | None = None
         safeguard_streak = 0
@@ -1575,11 +1576,20 @@ class CircuitAgent:
             self.history.append(record)
             last_measurements = measurements
             last_pass_fail = pass_fail
-            if hard_pass_met:
+            candidate_score = self._legacy_hard_pass_score(measurements)
+            should_update_best = hard_pass_met
+            if (
+                candidate_score is not None
+                and (best_score is None or candidate_score > best_score)
+            ):
+                should_update_best = True
+            if should_update_best:
                 best_design_vars = dict(accumulated_vars)
                 best_measurements = dict(measurements)
                 best_pass_fail = dict(pass_fail)
                 best_iteration = i + 1
+                if candidate_score is not None:
+                    best_score = candidate_score
 
             # T8.8: track sanity-range UNMEASURABLE streak. Reset on any
             # iter without a "suspect:" verdict so a transient glitch
@@ -1870,6 +1880,7 @@ class CircuitAgent:
             "last_pass_fail": last_pass_fail,
             "last_design_vars": accumulated_vars,
             "best_iteration": best_iteration,
+            "best_score": list(best_score) if best_score is not None else None,
             "best_design_vars": best_design_vars or {},
             "best_measurements": best_measurements,
             "best_pass_fail": best_pass_fail,
@@ -2217,6 +2228,34 @@ class CircuitAgent:
             if not str(verdict).strip().upper().startswith("PASS"):
                 return False
         return True
+
+    def _legacy_hard_pass_score(
+        self, measurements: dict,
+    ) -> tuple[int, float] | None:
+        """Rank legacy hard-pass progress, even before it passes.
+
+        The first tuple element prefers more hard-pass metrics already passing.
+        The second is the worst signed margin to target, so for a single
+        ``A0_diff_db >= 50`` hard-pass metric higher gain always wins even
+        when no iteration reaches 50 dB.
+        """
+        if not self._legacy_hard_pass_bounds:
+            return None
+        margins: list[float] = []
+        passed = 0
+        for metric_name, bound in sorted(self._legacy_hard_pass_bounds.items()):
+            value = _coerce_numeric_scalar((measurements or {}).get(metric_name))
+            if value is None:
+                return None
+            if _bound_passes(value, bound):
+                passed += 1
+            if bound.op in (">=", ">"):
+                margins.append(value - bound.value)
+            elif bound.op in ("<=", "<"):
+                margins.append(bound.value - value)
+        if not margins:
+            return None
+        return (passed, min(margins))
 
     # ------------------------------------------------------------------ #
     #  Waveform display (best-effort)
