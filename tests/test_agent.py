@@ -547,6 +547,71 @@ Hard pass for this first MIMO run is `A0_diff_db >= 50 dB`.
             34.3971814778
         )
 
+    def test_run_early_stops_on_legacy_hard_pass_even_if_secondary_fails(
+        self, tmp_path
+    ):
+        import json as _json
+
+        llm_resp = _json.dumps({
+            "iteration": 1,
+            "design_vars": {"C": "1.5f"},
+            "measurements": {"A0_diff_db": 0.0, "UGB_Hz": 0.0},
+            "pass_fail": {"A0_diff_db": "FAIL", "UGB_Hz": "FAIL"},
+            "reasoning": "secondary diagnostic still fails",
+        })
+        llm = MagicMock()
+        llm.chat.return_value = llm_resp
+
+        bridge = MagicMock()
+        bridge._scope_lib = "pll"
+        bridge._scope_tb_cell = "opamp_test"
+        bridge.list_design_vars.return_value = [{"name": "C", "default": "1f"}]
+        bridge.list_analyses.return_value = [{"name": "ac", "kwargs": []}]
+        bridge.run_ocean_sim.return_value = {
+            "ok": True,
+            "resultsDir": "/tmp",
+            "varsApplied": 1,
+            "analyses": ["ac"],
+            "measurements": {"A0_diff_db": 52.5448, "UGB_Hz": 10.0},
+        }
+        bridge._is_allowed_param_name.return_value = True
+        bridge.read_circuit.return_value = {"instances": []}
+        bridge.last_results_dir = "/sim/out"
+        bridge.read_dc_op_point_from_results.return_value = {}
+        bridge.write_and_save_maestro.return_value = {
+            "ok": True, "saved": True, "wrote": 1,
+        }
+
+        agent = CircuitAgent(
+            bridge=bridge,
+            llm=llm,
+            spec=self.OPAMP_SPEC,
+            analysis_type="ac",
+            ocean_worker=MagicMock(),
+            valid_design_vars=("C",),
+            allow_llm_maestro_setup=False,
+        )
+
+        result = agent.run(
+            "pll", "opamp", "opamp_test",
+            max_iter=5,
+            scs_path="/fake/input.scs",
+            transcript_path=str(tmp_path / "t.jsonl"),
+            writeback_enabled=True,
+        )
+
+        assert result["converged"] is True
+        assert result["abort_reason"] is None
+        assert len(agent.history) == 1
+        assert result["pass_fail"]["A0_diff_db"].startswith("PASS")
+        assert result["pass_fail"]["UGB_Hz"] == "FAIL"
+        assert result["best_iteration"] == 1
+        assert result["best_design_vars"] == {"C": "1.5f"}
+        assert result["writeback_source"] == "best_iter_1"
+        assert result["writeback_status"] == "ok"
+        bridge.write_and_save_maestro.assert_called_once_with({"C": "1.5f"})
+        assert llm.chat.call_count == 1
+
 
 # ---------------------------------------------------------------- #
 #  Writeback preservation (Q2 directive)

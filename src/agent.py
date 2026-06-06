@@ -956,6 +956,10 @@ class CircuitAgent:
         accumulated_vars: dict[str, Any] = dict(baseline_vars)
         last_measurements: dict = {}
         last_pass_fail: dict = {}
+        best_design_vars: dict[str, Any] | None = None
+        best_measurements: dict = {}
+        best_pass_fail: dict = {}
+        best_iteration: int | None = None
         converged = False
         abort_reason: str | None = None
         safeguard_streak = 0
@@ -1558,18 +1562,24 @@ class CircuitAgent:
             self._display_waveform(sim_result)
 
             met = self._all_pass(pass_fail)
+            hard_pass_met = self._hard_pass_met(pass_fail)
             record = IterationRecord(
                 iteration=i + 1,
                 design_vars=dict(accumulated_vars),
                 measurements=measurements,
                 pass_fail=pass_fail,
-                meets_spec=met,
+                meets_spec=hard_pass_met,
                 llm_reasoning=reasoning,
                 diagnostic=diagnostic,
             )
             self.history.append(record)
             last_measurements = measurements
             last_pass_fail = pass_fail
+            if hard_pass_met:
+                best_design_vars = dict(accumulated_vars)
+                best_measurements = dict(measurements)
+                best_pass_fail = dict(pass_fail)
+                best_iteration = i + 1
 
             # T8.8: track sanity-range UNMEASURABLE streak. Reset on any
             # iter without a "suspect:" verdict so a transient glitch
@@ -1579,7 +1589,7 @@ class CircuitAgent:
             else:
                 topology_streak = 0
 
-            if met:
+            if hard_pass_met:
                 # Path-2: gate single-point PASS on the tuning-curve
                 # phase when the spec declares a sweep and the CLI
                 # supplied a results root. Otherwise single-point PASS
@@ -1651,7 +1661,16 @@ class CircuitAgent:
                     # tuning verdicts and the LLM gets a chance to
                     # re-balance the LC/varactor sizing.
                 else:
-                    logger.info("Specifications met at iteration %d", i + 1)
+                    if self._legacy_hard_pass_bounds and not met:
+                        logger.info(
+                            "Hard-pass specifications met at iteration %d "
+                            "(secondary verdicts may still be non-PASS).",
+                            i + 1,
+                        )
+                    else:
+                        logger.info(
+                            "Specifications met at iteration %d", i + 1,
+                        )
                     converged = True
                     self._log_final_converged_values(accumulated_vars)
                     break
@@ -1814,21 +1833,46 @@ class CircuitAgent:
                         tuning_retries,
                     )
 
-        if abort_reason == "llm_error":
+        final_design_vars = accumulated_vars
+        final_measurements = last_measurements
+        final_pass_fail = last_pass_fail
+        writeback_source = "last"
+        if best_design_vars is not None and not converged:
+            final_design_vars = best_design_vars
+            final_measurements = best_measurements
+            final_pass_fail = best_pass_fail
+            writeback_source = f"best_iter_{best_iteration}"
+            logger.warning(
+                "Using best-so-far from iteration %s for final writeback "
+                "after abort_reason=%s.",
+                best_iteration, abort_reason,
+            )
+        elif best_design_vars is not None and converged:
+            writeback_source = f"best_iter_{best_iteration}"
+
+        if abort_reason == "llm_error" and best_design_vars is None:
             writeback_status = "skipped: llm_error"
         else:
             writeback_status = (
-                self._run_writeback(accumulated_vars)
+                self._run_writeback(final_design_vars)
                 if writeback_enabled else "skipped: disabled"
             )
 
         return {
-            "measurements": last_measurements,
-            "pass_fail": last_pass_fail,
-            "design_vars": accumulated_vars,
+            "measurements": final_measurements,
+            "pass_fail": final_pass_fail,
+            "design_vars": final_design_vars,
             "converged": converged,
             "abort_reason": abort_reason,
             "writeback_status": writeback_status,
+            "writeback_source": writeback_source,
+            "last_measurements": last_measurements,
+            "last_pass_fail": last_pass_fail,
+            "last_design_vars": accumulated_vars,
+            "best_iteration": best_iteration,
+            "best_design_vars": best_design_vars or {},
+            "best_measurements": best_measurements,
+            "best_pass_fail": best_pass_fail,
             # Path-2: present iff `sweep:` + `tuning_metrics:` were
             # declared and a sweep root was supplied. Empty dicts on
             # legacy runs so downstream code can treat them uniformly.
@@ -2154,6 +2198,23 @@ class CircuitAgent:
             return False
         for value in pass_fail.values():
             if not str(value).strip().upper().startswith("PASS"):
+                return False
+        return True
+
+    def _hard_pass_met(self, pass_fail: dict) -> bool:
+        """Return True when the run's acceptance gate has passed.
+
+        Legacy Markdown specs may mark a subset of metrics as hard-pass
+        acceptance gates while keeping other metrics as diagnostics. Specs
+        without such annotations keep the historical all-metrics predicate.
+        """
+        if not self._legacy_hard_pass_bounds:
+            return self._all_pass(pass_fail)
+        if not pass_fail:
+            return False
+        for metric_name in self._legacy_hard_pass_bounds:
+            verdict = pass_fail.get(metric_name)
+            if not str(verdict).strip().upper().startswith("PASS"):
                 return False
         return True
 
