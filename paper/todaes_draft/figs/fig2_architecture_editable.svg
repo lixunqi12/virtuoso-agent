@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="760" viewBox="0 0 1500 760">
+  <defs>
+    <style>
+      .title { font: 700 26px Arial, Helvetica, sans-serif; fill: #111827; }
+      .h { font: 700 19px Arial, Helvetica, sans-serif; fill: #111827; }
+      .body { font: 15px Arial, Helvetica, sans-serif; fill: #1f2937; }
+      .small { font: 13px Arial, Helvetica, sans-serif; fill: #374151; }
+      .box { stroke-width: 2.2; rx: 16; }
+      .llm { fill: #fff1f2; stroke: #dc2626; }
+      .safe { fill: #ecfdf3; stroke: #16a34a; }
+      .eda { fill: #eff6ff; stroke: #2563eb; }
+      .data { fill: #fff7d6; stroke: #d97706; }
+      .arrow { fill: none; stroke: #1f2937; stroke-width: 3.2; marker-end: url(#arrow); }
+      .greenArrow { fill: none; stroke: #15803d; stroke-width: 3.6; marker-end: url(#arrowGreen); }
+      .purpleArrow { fill: none; stroke: #7c3aed; stroke-width: 3.2; marker-end: url(#arrowPurple); }
+      .redArrow { fill: none; stroke: #dc2626; stroke-width: 3.0; stroke-dasharray: 9 7; marker-end: url(#arrowRed); }
+      .boundary { fill: none; stroke: #dc2626; stroke-width: 3.5; stroke-dasharray: 13 10; rx: 24; }
+      .trusted { fill: none; stroke: #15803d; stroke-width: 3.2; stroke-dasharray: 11 9; rx: 22; }
+      .labelRed { font: 700 20px Arial, Helvetica, sans-serif; fill: #dc2626; }
+      .labelGreen { font: 700 18px Arial, Helvetica, sans-serif; fill: #15803d; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f2937"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <rect width="1500" height="760" fill="#ffffff"/>
+  <text x="50" y="52" class="title">Fig. 2. Virtuoso-Agent data flow and trust boundary</text>
+
+  <!-- Trusted bridge region -->
+  <rect x="390" y="130" width="505" height="435" class="trusted"/>
+  <text x="642" y="590" text-anchor="middle" class="labelGreen">trusted bridge logic</text>
+
+  <!-- NDA/PDK region -->
+  <rect x="925" y="92" width="500" height="520" class="boundary"/>
+  <text x="1175" y="78" text-anchor="middle" class="labelRed">NDA / PDK boundary</text>
+
+  <!-- Nodes -->
+  <rect x="50" y="210" width="230" height="105" class="box llm"/>
+  <text x="165" y="250" text-anchor="middle" class="h">Cloud LLM</text>
+  <text x="165" y="278" text-anchor="middle" class="body">JSON proposal</text>
+  <text x="165" y="300" text-anchor="middle" class="small">untrusted endpoint</text>
+
+  <rect x="430" y="180" width="165" height="92" class="box safe"/>
+  <text x="512" y="216" text-anchor="middle" class="h">Python agent</text>
+  <text x="512" y="243" text-anchor="middle" class="body">contract repair</text>
+
+  <rect x="665" y="180" width="170" height="92" class="box safe"/>
+  <text x="750" y="216" text-anchor="middle" class="h">SafeBridge</text>
+  <text x="750" y="243" text-anchor="middle" class="body">whitelist + scrub</text>
+
+  <rect x="990" y="150" width="190" height="96" class="box eda"/>
+  <text x="1085" y="186" text-anchor="middle" class="h">Virtuoso / Maestro</text>
+  <text x="1085" y="214" text-anchor="middle" class="body">design vars + tests</text>
+
+  <rect x="990" y="350" width="190" height="96" class="box eda"/>
+  <text x="1085" y="386" text-anchor="middle" class="h">Spectre / OCEAN</text>
+  <text x="1085" y="414" text-anchor="middle" class="body">simulation</text>
+
+  <rect x="1245" y="150" width="145" height="96" class="box llm"/>
+  <text x="1318" y="186" text-anchor="middle" class="h">Foundry PDK</text>
+  <text x="1318" y="214" text-anchor="middle" class="body">models, cells</text>
+
+  <rect x="665" y="395" width="170" height="92" class="box data"/>
+  <text x="750" y="430" text-anchor="middle" class="h">Scrubbed readback</text>
+  <text x="750" y="457" text-anchor="middle" class="body">metrics + OP scalars</text>
+
+  <rect x="430" y="395" width="165" height="92" class="box data"/>
+  <text x="512" y="430" text-anchor="middle" class="h">Evaluator</text>
+  <text x="512" y="457" text-anchor="middle" class="body">spec score</text>
+  <text x="512" y="478" text-anchor="middle" class="small">best-so-far</text>
+
+  <!-- Arrows and labels -->
+  <path d="M280 245 L426 225" class="arrow"/>
+  <text x="350" y="220" text-anchor="middle" class="small">actions</text>
+
+  <path d="M595 226 L661 226" class="arrow"/>
+  <text x="628" y="205" text-anchor="middle" class="small">validated calls</text>
+
+  <path d="M835 226 L986 198" class="greenArrow"/>
+  <text x="910" y="190" text-anchor="middle" class="small">scoped SKILL</text>
+
+  <path d="M1085 246 L1085 346" class="arrow"/>
+  <text x="1138" y="300" text-anchor="middle" class="small">run setup</text>
+
+  <path d="M1180 198 L1241 198" class="redArrow"/>
+  <text x="1210" y="176" text-anchor="middle" class="small">internal use only</text>
+
+  <path d="M990 422 L840 441" class="purpleArrow"/>
+  <text x="910" y="462" text-anchor="middle" class="small">raw result filtered</text>
+
+  <path d="M665 441 L599 441" class="purpleArrow"/>
+  <text x="632" y="470" text-anchor="middle" class="small">score</text>
+
+  <path d="M430 455 C295 530 150 475 148 320" class="purpleArrow"/>
+  <text x="250" y="532" text-anchor="middle" class="small">sanitized feedback / next prompt</text>
+
+  <!-- Small annotations -->
+  <rect x="52" y="630" width="1390" height="70" fill="#ffffff" stroke="#d1d5db" stroke-width="1.4" rx="12"/>
+  <text x="80" y="660" class="small">Editable SVG source. Each box, arrow, label, and boundary is a normal vector/text object.</text>
+  <text x="80" y="684" class="small">Semantics match the TikZ Fig. 2 in main.tex: cloud LLM → agent → SafeBridge → Maestro/Spectre → scrubbed readback → LLM.</text>
+</svg>

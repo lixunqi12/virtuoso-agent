@@ -480,6 +480,26 @@ procedure(safeOceanRun(libName cellName tbCellName varList analysisList
                 )
             )
         )
+        ;; OCEAN's run() can return a history token while the openable
+        ;; PSF root lives at resultsDir(), e.g. a plain
+        ;; simulation/<tb>/spectre/schematic directory outside Maestro's
+        ;; runResult/psf layout. Try that generic OCEAN path before ADE.
+        when(equal(resultsDir "<results>")
+            let((oceanDir)
+                oceanDir = nil
+                when(isCallable('resultsDir)
+                    errset(oceanDir = resultsDir() t)
+                )
+                when(stringp(oceanDir)
+                    resultKinds = safeOcean_openResultKinds(oceanDir)
+                    when(and(resultKinds
+                             safeOcean_resultsHaveRequestedAnalysis(
+                                 resultKinds analysisList))
+                        resultsDir = oceanDir
+                    )
+                )
+            )
+        )
         when(equal(resultsDir "<results>")
             let((adeDir)
                 adeDir = nil

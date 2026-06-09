@@ -15,6 +15,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from .topology_intent import (
+    design_var_role_text,
+    render_topology_intent_markdown,
+)
+
 _SUPPLY_HINT_SUBSTRINGS = ("vdd", "vss", "gnd", "vcc", "vee")
 
 
@@ -58,7 +63,10 @@ def _fmt_pin_list(pins: list[dict[str, str]]) -> str:
     )
 
 
-def _render_desvar_table(design_vars: list[dict[str, str]]) -> str:
+def _render_desvar_table(
+    design_vars: list[dict[str, str]],
+    topology_intent: dict[str, Any] | None = None,
+) -> str:
     """Render the §3 design-variables table.
 
     If design_vars is empty (no scs_path supplied or scs parse failed),
@@ -78,8 +86,12 @@ def _render_desvar_table(design_vars: list[dict[str, str]]) -> str:
     for entry in design_vars:
         name = entry.get("name", "<TODO>")
         default = entry.get("default", "<TODO>")
+        role = (
+            design_var_role_text(topology_intent, name)
+            or "<TODO role/device>"
+        )
         rows.append(
-            f"| `{name}` | <TODO role/device> | "
+            f"| `{name}` | {role} | "
             f"<TODO min>–<TODO max> (default `{default}`) | P1 |"
         )
     return header + "\n".join(rows) + "\n"
@@ -101,7 +113,10 @@ def _render_analyses_block(analyses: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def render_spec_scaffold(scaffold: dict[str, Any]) -> str:
+def render_spec_scaffold(
+    scaffold: dict[str, Any],
+    topology_intent: dict[str, Any] | None = None,
+) -> str:
     """Render the scaffold dict to a Markdown string.
 
     Input must conform to ``SafeBridge.generate_spec_scaffold``'s shape:
@@ -116,12 +131,26 @@ def render_spec_scaffold(scaffold: dict[str, Any]) -> str:
     tb_pins = tb.get("pins") or []
     design_vars = scaffold.get("design_vars") or []
     analyses = scaffold.get("analyses") or []
+    topology_intent = (
+        topology_intent
+        if topology_intent is not None
+        else scaffold.get("topology_intent")
+    )
+    if not isinstance(topology_intent, dict):
+        topology_intent = None
 
     dut_probes, dut_supplies, dut_others = _classify_pins(dut_pins)
     _, tb_supplies, _ = _classify_pins(tb_pins)
 
-    desvar_table = _render_desvar_table(design_vars)
+    desvar_table = _render_desvar_table(design_vars, topology_intent)
     analyses_block = _render_analyses_block(analyses)
+    topology_markdown = render_topology_intent_markdown(topology_intent)
+    topology_section = (
+        "### Topology intent hypothesis\n\n"
+        f"{topology_markdown}\n\n"
+        if topology_markdown else
+        "- Topology: <TODO_one_paragraph_topology_description>\n"
+    )
 
     # First probe (if any) becomes the suggested Vdiff path fill-in;
     # otherwise leave the explicit <TODO>.
@@ -154,7 +183,7 @@ def render_spec_scaffold(scaffold: dict[str, Any]) -> str:
         f"- Library / Cell: `{lib} / {cell}`; "
         f"Testbench cell: `{lib} / {tb_cell}`\n"
         "- Process: <TODO_pdk_label>; VDD = <TODO_V>\n"
-        "- Topology: <TODO_one_paragraph_topology_description>\n"
+        f"{topology_section}"
         f"- DUT top-level pins: {_fmt_pin_list(dut_pins)}\n"
         f"- Suggested probes (output-direction pins): "
         f"{_fmt_pin_list(dut_probes)}\n"

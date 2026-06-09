@@ -35,11 +35,14 @@ YAML schema::
         points_per_dec: "100"
     outputs:
       - name: f_osc
+        analysis: tran        # optional intended domain: dc/ac/tran/...
         signal_name: "/Vout"  # OR expr (mutually exclusive)
         output_type: ""       # "" | "signal" | "expr"
         spec:                 # optional
           lt: "21G"
           gt: "19G"
+    delete_outputs:           # optional stale rows to remove before adding
+      - old_metric_name
     corner_netlists:
       - corner: typ_25
         output_dir: "~/simulation/corner_typ"
@@ -60,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -77,7 +81,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from virtuoso_bridge import VirtuosoClient  # noqa: E402
 
-from src.safe_bridge import SafeBridge  # noqa: E402
+from src.safe_bridge import SafeBridge, _MAESTRO_ALLOWED_ANALYSES  # noqa: E402
 
 
 # R1 R2 (2026-05-14) — YAML hardening caps. Recipe files are user-
@@ -165,6 +169,8 @@ class _DryRunClient:
                 '{"ok":true,"varsWritten":1,"setupDbWritten":1,'
                 '"testScopedWritten":1,"saved":true,"setupDbVars":[]}'
             )
+        elif "safeMaeSaveSetup" in expr:
+            result.output = '{"ok":true,"saved":true,"session":"dry-run"}'
         elif "safeMaeSetupSummary" in expr:
             result.output = '{"ok":true,"session":"dry-run","tests":{},"specsRaw":""}'
         return result
@@ -255,6 +261,51 @@ def _coerce_options_mapping(value: Any, *, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{field!r} must be a mapping if present")
     return dict(value)
+
+
+_OUTPUT_TRAN_PROBE_RE = re.compile(r"\b[VI]T\s*\(")
+_OUTPUT_AC_PROBE_RE = re.compile(r"\b[VI]F\s*\(")
+
+
+def _coerce_output_analysis(value: Any, *, field: str) -> str:
+    analysis = _coerce_optional_str(value, field=field)
+    if not analysis:
+        return ""
+    if analysis not in _MAESTRO_ALLOWED_ANALYSES:
+        raise ValueError(
+            f"{field!r} must be one of {sorted(_MAESTRO_ALLOWED_ANALYSES)}; "
+            f"got {analysis!r}"
+        )
+    return analysis
+
+
+def _validate_output_analysis_affinity(
+    *,
+    name: str,
+    analysis: str,
+    expr: str,
+) -> None:
+    """Catch AC/DC probe-family mixups before writing Maestro rows."""
+    if not analysis or not expr:
+        return
+    has_tran_probe = bool(_OUTPUT_TRAN_PROBE_RE.search(expr))
+    has_ac_probe = bool(_OUTPUT_AC_PROBE_RE.search(expr))
+    if analysis == "ac" and has_tran_probe:
+        raise ValueError(
+            f"Output {name!r} is tagged analysis='ac' but uses VT()/IT(); "
+            "use VF()/IF() or retag it as tran."
+        )
+    if analysis == "tran" and has_ac_probe:
+        raise ValueError(
+            f"Output {name!r} is tagged analysis='tran' but uses VF()/IF(); "
+            "use VT()/IT() or retag it as ac."
+        )
+    if analysis == "dc" and (has_tran_probe or has_ac_probe):
+        raise ValueError(
+            f"Output {name!r} is tagged analysis='dc' but uses waveform "
+            "probes VT()/IT()/VF()/IF(); use signal_name or a DC/OP-specific "
+            "expression instead."
+        )
 
 
 def _analysis_from_entry(entry: dict[str, Any]) -> tuple[str, bool, dict[str, Any]]:
@@ -369,6 +420,13 @@ def parse_args() -> argparse.Namespace:
              "contacting any remote host (writers receive a no-RPC client).",
     )
     parser.add_argument(
+        "--skip-design-vars",
+        action="store_true",
+        help="Ignore the YAML design_vars block. Useful when updating "
+             "analyses/outputs on a live Maestro setup without overwriting "
+             "the current optimized parameter values.",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
         help="After applying a live recipe, read back Maestro setup and verify "
@@ -422,7 +480,7 @@ def _load_recipe(path: Path) -> dict[str, Any]:
         raise ValueError(
             f"YAML root must be a mapping; got {type(recipe).__name__}"
         )
-    for key in ("analyses", "outputs", "corner_netlists"):
+    for key in ("analyses", "outputs", "delete_outputs", "corner_netlists"):
         if key in recipe and not isinstance(recipe[key], list):
             raise ValueError(f"YAML key {key!r} must be a list if present")
     if "design_vars" in recipe and not isinstance(recipe["design_vars"], dict):
@@ -516,6 +574,18 @@ def _apply_outputs(
         name = _coerce_optional_str(entry.get("name"), field="outputs[].name")
         if not name:
             raise ValueError("'outputs[].name' is required")
+        analysis = _coerce_output_analysis(
+            entry.get("analysis"), field=f"outputs[{name}].analysis"
+        )
+        signal_name = _coerce_optional_str(
+            entry.get("signal_name"), field="outputs[].signal_name"
+        )
+        expr = _coerce_optional_str(entry.get("expr"), field="outputs[].expr")
+        _validate_output_analysis_affinity(
+            name=name,
+            analysis=analysis,
+            expr=expr,
+        )
         if idempotent:
             try:
                 bridge._delete_maestro_output_remote(name, test=test, session=session)
@@ -529,14 +599,16 @@ def _apply_outputs(
             output_type=_coerce_optional_str(
                 entry.get("output_type"), field="outputs[].output_type"
             ),
-            signal_name=_coerce_optional_str(
-                entry.get("signal_name"), field="outputs[].signal_name"
-            ),
-            expr=_coerce_optional_str(entry.get("expr"), field="outputs[].expr"),
+            signal_name=signal_name,
+            expr=expr,
             test=test,
             session=session,
         )
-        logger.info("  output %s added", name)
+        logger.info(
+            "  output %s added%s",
+            name,
+            f" (analysis={analysis})" if analysis else "",
+        )
         n_out += 1
         spec = entry.get("spec")
         if spec:
@@ -564,6 +636,24 @@ def _apply_outputs(
                 spec.get("lt"), spec.get("gt"),
             )
     return n_out, n_spec
+
+
+def _apply_delete_outputs(
+    bridge: SafeBridge,
+    items: list[Any],
+    test: str | None,
+    session: str,
+    logger: logging.Logger,
+) -> int:
+    n = 0
+    for raw_name in items:
+        name = _coerce_optional_str(raw_name, field="delete_outputs[]")
+        if not name:
+            raise ValueError("'delete_outputs[]' entries must be non-empty strings")
+        bridge._delete_maestro_output_remote(name, test=test, session=session)
+        logger.info("  stale output %s deleted", name)
+        n += 1
+    return n
 
 
 def _apply_corner_netlists(
@@ -755,15 +845,17 @@ def main() -> int:
     session = _coerce_optional_str(recipe.get("session"), field="session")
     analyses = recipe.get("analyses") or []
     outputs = recipe.get("outputs") or []
-    design_vars = recipe.get("design_vars") or {}
+    delete_outputs = recipe.get("delete_outputs") or []
+    design_vars = {} if args.skip_design_vars else recipe.get("design_vars") or {}
     corner_netlists = recipe.get("corner_netlists") or []
     idempotent_outputs = recipe.get("idempotent_outputs", True)
     verify = bool(args.verify or recipe.get("verify", False))
 
     logger.info(
         "Recipe: %d analyses, %d outputs, %d design vars, "
-        "%d corner-netlist exports",
-        len(analyses), len(outputs), len(design_vars), len(corner_netlists),
+        "%d stale-output deletes, %d corner-netlist exports",
+        len(analyses), len(outputs), len(design_vars),
+        len(delete_outputs), len(corner_netlists),
     )
 
     bridge = _build_bridge(
@@ -780,6 +872,9 @@ def main() -> int:
 
     writeback = _apply_design_vars(bridge, design_vars, logger)
     n_an = _apply_analyses(bridge, analyses, test_name, session, logger)
+    n_del = _apply_delete_outputs(
+        bridge, delete_outputs, test_name, session, logger
+    )
     n_out, n_spec = _apply_outputs(
         bridge,
         outputs,
@@ -789,6 +884,12 @@ def main() -> int:
         idempotent=idempotent_outputs,
     )
     n_corner = _apply_corner_netlists(bridge, corner_netlists, test_name, logger)
+    save_result = None
+    if args.dry_run:
+        logger.info("[DRY-RUN] setup save skipped.")
+    else:
+        save_result = bridge.save_maestro_setup()
+        logger.info("  setup saved=%s", save_result.get("saved"))
 
     report: dict[str, Any] = {
         "ok": True,
@@ -796,11 +897,13 @@ def main() -> int:
         "applied": {
             "design_vars": len(design_vars),
             "analyses": n_an,
+            "delete_outputs": n_del,
             "outputs": n_out,
             "specs": n_spec,
             "corner_netlists": n_corner,
         },
         "writeback": writeback,
+        "save": save_result,
     }
     if verify and not args.dry_run:
         report["verify"] = _verify_readback(
@@ -818,9 +921,9 @@ def main() -> int:
 
     logger.info(
         "%sMaestro Outputs Setup applied: analyses=%d, outputs=%d, "
-        "specs=%d, corner_netlists=%d",
+        "deleted_outputs=%d, specs=%d, corner_netlists=%d",
         "[DRY-RUN] " if args.dry_run else "",
-        n_an, n_out, n_spec, n_corner,
+        n_an, n_out, n_del, n_spec, n_corner,
     )
     _write_report(args.report_json, report, logger)
     return 0

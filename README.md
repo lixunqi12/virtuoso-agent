@@ -104,6 +104,12 @@ MINIMAX_API_KEY=
 OLLAMA_BASE_URL=http://localhost:11434
 
 DEFAULT_LLM=claude
+
+# 通用 LLM runtime knobs；单个模型可用 <PROVIDER>_* 覆盖
+LLM_MAX_TOKENS=16384
+LLM_STREAMING=1
+LLM_HTTP_TIMEOUT=300
+LLM_SDK_MAX_RETRIES=
 ```
 
 编辑 `config/hspice_scrub_patterns.private.yaml`（**永不入库**）：填入
@@ -314,6 +320,12 @@ MINIMAX_API_KEY=
 OLLAMA_BASE_URL=http://localhost:11434
 
 DEFAULT_LLM=claude
+
+# Provider-neutral LLM runtime knobs; override per model with <PROVIDER>_*
+LLM_MAX_TOKENS=16384
+LLM_STREAMING=1
+LLM_HTTP_TIMEOUT=300
+LLM_SDK_MAX_RETRIES=
 ```
 
 Edit `config/hspice_scrub_patterns.private.yaml` (**never committed**)

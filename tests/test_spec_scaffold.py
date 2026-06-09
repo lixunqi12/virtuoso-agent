@@ -50,6 +50,36 @@ def _base_scaffold() -> dict:
     }
 
 
+def _intent() -> dict:
+    return {
+        "schema": "topology_intent.v1",
+        "circuit_class": "fully_differential_two_stage_opamp",
+        "confidence": "high",
+        "human_review_required": False,
+        "signal_path": [
+            {"role": "input_pair", "instances": ["M0", "M1"]},
+            {"role": "outputs", "nodes": ["Vout_p", "Vout_n"]},
+        ],
+        "bias_paths": [
+            {"role": "tail_bias", "current_source": "M5"},
+        ],
+        "feedback_paths": [],
+        "compensation": [],
+        "device_roles": {"M0": "input pair", "M1": "input pair"},
+        "design_var_roles": {
+            "Ibias": {
+                "role": "tail current source current",
+                "instances": ["I0"],
+            },
+            "nfin_neg": {
+                "role": "input pair size",
+                "instances": ["M0", "M1"],
+            },
+        },
+        "notes": [],
+    }
+
+
 class TestClassifyPins:
     def test_outputs_become_probes(self):
         pins = [{"name": "Vout_p", "direction": "output"}]
@@ -121,6 +151,17 @@ class TestRenderScaffold:
         assert "| `Ibias` |" in out
         assert "| `nfin_neg` |" in out
         assert "default `500u`" in out
+
+    def test_topology_intent_section_rendered_when_supplied(self):
+        out = render_spec_scaffold(_base_scaffold(), _intent())
+        assert "Topology intent hypothesis" in out
+        assert "fully_differential_two_stage_opamp" in out
+        assert "input_pair" in out
+
+    def test_design_var_roles_filled_from_topology_intent(self):
+        out = render_spec_scaffold(_base_scaffold(), _intent())
+        assert "| `Ibias` | tail current source current (I0) |" in out
+        assert "| `nfin_neg` | input pair size (M0, M1) |" in out
 
     def test_analyses_block_populated(self):
         out = render_spec_scaffold(_base_scaffold())

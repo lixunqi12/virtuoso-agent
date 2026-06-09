@@ -117,6 +117,11 @@ CHECKPOINTS: dict[str, dict[str, str]] = {
         "model": "MiniMax-M2.7",
         "env": "MINIMAX_API_KEY",
     },
+    "minimax-m3": {
+        "llm": "minimax",
+        "model": "MiniMax-M3",
+        "env": "MINIMAX_API_KEY",
+    },
 }
 
 DEFAULT_MODELS = ["mimo-v2.5-pro", "deepseek-v4-flash", "gpt-5.4-mini"]

@@ -214,6 +214,7 @@ _ALLOWED_SKILL_ENTRYPOINTS = frozenset({
     # nodes get a deliberate asymmetric kick. See src/plan_auto.py.
     "safePatchNetlistIC",
     "safeMaeWriteAndSave",
+    "safeMaeSaveSetup",
     "safeMaeSetupSummary",
     # Diagnostic-only, read-only. See skill/safe_maestro_debug.il.
     "safeMae_debugInfo",
@@ -3522,6 +3523,30 @@ class SafeBridge:
             scope_tb_cell=self._scope_tb_cell,
             session=result_json.get("session", ""),
         )
+        return _scrub(result_json)
+
+    def save_maestro_setup(self) -> dict:
+        """Save the scoped Maestro setup without changing design vars."""
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "save_maestro_setup requires the remote-side SKILL helpers. "
+                "Pass --remote-skill-dir so safe_maestro.il can be loaded."
+            )
+        self._require_scope_for_maestro("save_maestro_setup")
+        _validate_name(self._scope_lib, "lib")
+        _validate_name(self._scope_tb_cell, "tb_cell")
+        skill_expr = (
+            f'safeMaeSaveSetup("{self._scope_lib}" '
+            f'"{self._scope_tb_cell}")'
+        )
+        result_json = self._execute_skill_json(skill_expr)
+        if not result_json.get("ok", False):
+            raise RuntimeError(
+                "safeMaeSaveSetup failed: "
+                f"{_scrub(str(result_json.get('error', 'unknown')))}"
+            )
+        if not result_json.get("saved", False):
+            raise RuntimeError("safeMaeSaveSetup returned saved=False.")
         return _scrub(result_json)
 
     def read_maestro_setup_summary(

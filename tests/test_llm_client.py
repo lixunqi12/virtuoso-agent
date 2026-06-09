@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.llm_client import (  # noqa: E402
     DeepSeekClient,
+    LlmCallTelemetry,
     MimoClient,
     OllamaClient,
     OpenAIClient,
@@ -451,6 +452,139 @@ class TestOpenAIReasoningScrub:
         assert "<redacted>" in out or "<path>" in out, (
             f"scrub markers missing — scrub() may not have been called: {out!r}"
         )
+
+
+class TestOpenAITelemetry:
+    def test_blocking_response_object_records_telemetry(self, openai_client):
+        openai_client._mock_create.return_value = _make_openai_response(
+            content="parameters look good",
+            finish_reason="stop",
+        )
+        out = openai_client.chat([{"role": "user", "content": "go"}])
+
+        assert out == "parameters look good"
+        telemetry = openai_client.last_telemetry
+        assert telemetry is not None
+        data = telemetry.to_dict()
+        assert data["provider"] == "openai"
+        assert data["model"] == "gpt-5.5"
+        assert data["transport_mode"] == "streaming"
+        assert data["status"] == "ok"
+        assert data["event_count"] == 1
+        assert data["visible_chars"] == len("parameters look good")
+        assert data["finish_reason"] == "stop"
+        assert data["max_tokens"] == 16384
+        assert data["first_event_latency_s"] is not None
+
+    def test_provider_max_tokens_overrides_global(self, openai_client):
+        openai_client._mock_create.return_value = _make_openai_response(
+            content="ok"
+        )
+        with patch.dict(
+            "os.environ",
+            {"LLM_MAX_TOKENS": "2048", "OPENAI_MAX_TOKENS": "1024"},
+            clear=False,
+        ):
+            openai_client.chat([{"role": "user", "content": "go"}])
+
+        _, kwargs = openai_client._mock_create.call_args
+        assert kwargs["max_completion_tokens"] == 1024
+        assert openai_client.last_telemetry.to_dict()["max_tokens"] == 1024
+
+    def test_global_streaming_off_uses_blocking_mode(self, openai_client):
+        openai_client._mock_create.return_value = _make_openai_response(
+            content="ok"
+        )
+        with patch.dict("os.environ", {"LLM_STREAMING": "0"}, clear=False):
+            openai_client.chat([{"role": "user", "content": "go"}])
+
+        _, kwargs = openai_client._mock_create.call_args
+        assert "stream" not in kwargs
+        assert openai_client.last_telemetry.transport_mode == "blocking"
+
+    def test_stream_chunks_record_event_counts(self, openai_client):
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="para", reasoning_content=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="meters", reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=3,
+                    completion_tokens=4,
+                    total_tokens=7,
+                    completion_tokens_details=None,
+                ),
+            ),
+        ]
+        openai_client._mock_create.return_value = iter(chunks)
+
+        out = openai_client.chat([{"role": "user", "content": "go"}])
+
+        assert out == "parameters"
+        telemetry = openai_client.last_telemetry.to_dict()
+        assert telemetry["transport_mode"] == "streaming"
+        assert telemetry["event_count"] == 2
+        assert telemetry["visible_chars"] == len("parameters")
+        assert telemetry["finish_reason"] == "stop"
+        assert openai_client.last_usage["total_tokens"] == 7
+
+    def test_streaming_timeout_tries_blocking_fallback(self, openai_client):
+        openai_client._mock_create.side_effect = [
+            TimeoutError("Request timed out."),
+            _make_openai_response(content="ok"),
+        ]
+
+        out = openai_client.chat([{"role": "user", "content": "go"}])
+
+        assert out == "ok"
+        first_kwargs = openai_client._mock_create.call_args_list[0].kwargs
+        second_kwargs = openai_client._mock_create.call_args_list[1].kwargs
+        assert first_kwargs["stream"] is True
+        assert "stream" not in second_kwargs
+        telemetry = openai_client.last_telemetry.to_dict()
+        assert telemetry["transport_mode"] == "blocking_fallback"
+        assert telemetry["status"] == "ok"
+
+    def test_blocking_timeout_retries_outer_attempts(self, openai_client):
+        openai_client._mock_create.side_effect = [
+            TimeoutError("Request timed out."),
+            TimeoutError("Request timed out."),
+            _make_openai_response(content="ok"),
+        ]
+
+        with patch.dict("os.environ", {"LLM_STREAMING": "0"}, clear=False):
+            out = openai_client.chat([{"role": "user", "content": "go"}])
+
+        assert out == "ok"
+        assert openai_client._mock_create.call_count == 3
+        telemetry = openai_client.last_telemetry.to_dict()
+        assert telemetry["transport_mode"] == "blocking"
+        assert telemetry["retry_attempts"] == 2
+        assert telemetry["status"] == "ok"
+
+    def test_telemetry_scrubs_error_message(self):
+        telemetry = LlmCallTelemetry(
+            provider="test",
+            model="mock",
+            transport_mode="blocking",
+        )
+        telemetry.mark_error(RuntimeError("failed under C:\\PDK\\private"))
+        data = telemetry.to_dict()
+        assert data["status"] == "error"
+        assert data["error_type"] == "RuntimeError"
+        assert "C:\\PDK" not in data["error_message"]
 
 
 class TestOpenAIRateLimit:

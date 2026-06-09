@@ -65,6 +65,8 @@ reviews/
 paper/data/*.bak
 paper/data/lc_vco_evidence_*.jsonl
 paper/data/lc_vco_evidence_*.csv
+paper/data/model_benchmark*.jsonl
+paper/data/model_benchmark*.log
 paper/repro/
 paper/opamp_schematic/
 paper/opamp_topology_papers/
@@ -80,6 +82,15 @@ paper/v4/main.blg
 paper/v4/main.log
 paper/v4/main.out
 paper/v4/main.pdf
+paper/todaes_draft/*.aux
+paper/todaes_draft/*.bbl
+paper/todaes_draft/*.blg
+paper/todaes_draft/*.log
+paper/todaes_draft/*.out
+paper/todaes_draft/*.pdf
+paper/todaes_draft/figs/*.aux
+paper/todaes_draft/figs/*.log
+paper/todaes_draft/figs/*.pdf
 
 # Debug / probe SKILL scripts (hardcoded personal paths in comments)
 skill/rev*.il

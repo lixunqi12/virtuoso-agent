@@ -48,6 +48,11 @@ from .safe_bridge import (
 )
 from .remote_patch import RemotePatchError, RemotePatcher
 from .sp_rewrite import ParamRewriteError
+from .topology_intent import (
+    format_stage_diagnostics,
+    infer_topology_intent,
+    render_topology_intent_markdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +77,18 @@ _SANITY_VIOLATION_PREFIX = "UNMEASURABLE (suspect:"
 # Sized so a typical 20-iter cap still leaves headroom for the
 # single-point pass that precedes the tuning gate.
 TUNING_RETRY_BUDGET = 7
+
+
+def _llm_telemetry_dict(llm: Any) -> dict[str, Any] | None:
+    telemetry = getattr(llm, "last_telemetry", None)
+    if isinstance(telemetry, dict):
+        return telemetry
+    to_dict = getattr(telemetry, "to_dict", None)
+    if callable(to_dict):
+        data = to_dict()
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 @dataclass(frozen=True)
@@ -147,6 +164,7 @@ _RESPONSE_KEY_TYPES: dict[str, type | tuple[type, ...]] = {
 # burn an iter on the first try. After 3 failed attempts, abort the
 # iter with ``contract_violation``.
 _CONTRACT_REPAIR_MAX = 3
+_INVALID_ASSISTANT_CONTEXT_MAX_CHARS = 1200
 
 _NUMERIC_BOUND_RE = re.compile(
     r"(?:(?P<metric>[A-Za-z_][A-Za-z0-9_]*)\s*)?"
@@ -155,6 +173,167 @@ _NUMERIC_BOUND_RE = re.compile(
     r"\s*(?P<unit>[A-Za-zµμ]+)?"
 )
 _CODE_SPAN_RE = re.compile(r"`([^`]+)`")
+
+
+def _iter_balanced_json_objects(text: str) -> Iterable[str]:
+    """Yield balanced top-level JSON object substrings from arbitrary text."""
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                yield text[start:idx + 1]
+                start = None
+
+
+def _iter_llm_json_candidates(response: str) -> Iterable[str]:
+    """Yield likely JSON payloads in parse priority order."""
+    for match in re.finditer(
+        r"```(?:json)?\s*(.*?)\s*```",
+        response,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        yield match.group(1)
+
+    yield from _iter_balanced_json_objects(response)
+
+
+def _loads_first_json_dict(response: str) -> tuple[dict, bool]:
+    """Return (first dict payload, whether any dict payload parsed)."""
+    for candidate in _iter_llm_json_candidates(response):
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data, True
+    return {}, False
+
+
+def _one_line_excerpt(text: str, max_chars: int) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3] + "..."
+
+
+def _format_allowed_design_vars_for_repair(
+    valid_design_vars: Iterable[str] | None,
+) -> str:
+    if valid_design_vars is None:
+        return ""
+    names = sorted(str(name) for name in valid_design_vars)
+    if not names:
+        return ""
+    joined = ", ".join(names)
+    if len(joined) > 900:
+        joined = joined[:897] + "..."
+    return f"\nAllowed design_vars exactly: {joined}."
+
+
+def _make_contract_repair_prompt(
+    reason: str,
+    valid_design_vars: Iterable[str] | None = None,
+) -> str:
+    required = ", ".join(sorted(_REQUIRED_RESPONSE_KEYS))
+    allowed_vars = _format_allowed_design_vars_for_repair(valid_design_vars)
+    return (
+        "Your previous response violated HARD CONSTRAINTS: "
+        f"{reason}.\n\n"
+        "Return ONLY one fenced JSON block. The first non-whitespace "
+        "characters must be ```json and the final non-whitespace "
+        "characters must be ```. Do not include prose, derivations, "
+        "tables, markdown headings, or comments outside the JSON fence. "
+        f"Required top-level keys: {required}. Keep reasoning to at most "
+        f"two short sentences.{allowed_vars}"
+    )
+
+
+def _compact_invalid_assistant_response(response: str, reason: str) -> str:
+    """Replace invalid assistant context with a short local-context marker."""
+    excerpt = _one_line_excerpt(response, _INVALID_ASSISTANT_CONTEXT_MAX_CHARS)
+    reason_excerpt = _one_line_excerpt(reason, 500)
+    return (
+        "[Previous assistant response omitted from chat context because it "
+        "violated the JSON protocol. Full text is preserved in the local "
+        "transcript/log. "
+        f"bad_response_chars={len(response or '')}; "
+        f"violation={reason_excerpt}; "
+        f"excerpt={excerpt}]"
+    )
+
+
+def _json_excerpt(data: Any, max_chars: int = 1600) -> str:
+    text = json.dumps(data or {}, ensure_ascii=False, sort_keys=True, default=str)
+    return _one_line_excerpt(text, max_chars)
+
+
+def _llm_last_response_token_exhausted(llm: Any) -> bool:
+    """True when provider telemetry says the model spent output budget
+    without producing visible assistant content.
+
+    Reasoning-class OpenAI-compatible models can stream tens of thousands
+    of ``reasoning_content`` characters and hit ``finish_reason=length``
+    before emitting the requested JSON. Treat that as a transport/protocol
+    failure mode, not as an ordinary schema typo.
+    """
+    telemetry = _llm_telemetry_dict(llm) or {}
+    finish = str(telemetry.get("finish_reason") or "").lower()
+    try:
+        visible = int(telemetry.get("visible_chars") or 0)
+    except (TypeError, ValueError):
+        visible = 0
+    try:
+        reasoning = int(telemetry.get("reasoning_chars") or 0)
+    except (TypeError, ValueError):
+        reasoning = 0
+    return finish == "length" and visible == 0 and reasoning > 0
+
+
+def _make_compact_json_rescue_prompt(
+    reason: str,
+    valid_design_vars: Iterable[str] | None,
+    current_design_vars: dict[str, Any] | None,
+    last_measurements: dict | None,
+    last_pass_fail: dict | None,
+) -> str:
+    """Build an isolated JSON-only repair prompt for token exhaustion."""
+    required = ", ".join(sorted(_REQUIRED_RESPONSE_KEYS))
+    allowed_vars = _format_allowed_design_vars_for_repair(valid_design_vars)
+    return (
+        "Protocol rescue: the previous model call exhausted its output "
+        "budget before producing visible JSON. Do not reason step by step.\n\n"
+        f"Violation: {_one_line_excerpt(reason, 400)}.\n"
+        f"Required top-level keys: {required}.{allowed_vars}\n\n"
+        "Current design_vars baseline:\n"
+        f"{_json_excerpt(current_design_vars)}\n\n"
+        "Latest platform measurements:\n"
+        f"{_json_excerpt(last_measurements)}\n\n"
+        "Latest platform pass_fail:\n"
+        f"{_json_excerpt(last_pass_fail)}\n\n"
+        "Return ONLY one fenced JSON block. Keep `reasoning` to one short "
+        "sentence. If uncertain, keep most current design_vars unchanged "
+        "and adjust only one to three variables from the allowed list."
+    )
 
 
 _DESIGN_VAR_SECTION_RE = re.compile(
@@ -591,6 +770,7 @@ class CircuitAgent:
             role: str,
             content: str,
             usage: dict[str, Any] | None = None,
+            telemetry: dict[str, Any] | None = None,
         ) -> None:
             if transcript_file is None:
                 return
@@ -606,6 +786,8 @@ class CircuitAgent:
                 # and break json.dumps.
                 if isinstance(usage, dict):
                     entry["usage"] = usage
+                if isinstance(telemetry, dict):
+                    entry["llm_telemetry"] = telemetry
                 with transcript_file.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             except OSError as exc:
@@ -615,6 +797,15 @@ class CircuitAgent:
                     "Transcript append failed (%s); continuing.",
                     type(exc).__name__,
                 )
+
+        protocol_violations: dict[str, int] = {
+            "contract_violations": 0,
+            "json_parse_failures": 0,
+            "repair_attempts": 0,
+            "context_compactions": 0,
+            "compact_json_rescues": 0,
+            "max_bad_response_chars": 0,
+        }
 
         # Render the spec for the prompt. If the caller passed MD text
         # (the user's preferred format — spec.md is the authoring target),
@@ -706,15 +897,25 @@ class CircuitAgent:
         # Read sanitized schematic before the first LLM prompt so the initial
         # proposal sees real device connectivity, not only the spec prose.
         schematic_instances: list[dict] = []
+        topology_intent: dict[str, Any] = {}
         try:
             _circuit = self.bridge.read_circuit(lib, cell)
             _insts = _circuit.get("instances") or []
             if isinstance(_insts, list):
                 schematic_instances = _insts
+            topology_intent = infer_topology_intent(
+                schematic_instances,
+                design_vars=sorted(
+                    self.valid_design_var_names | self.fixed_design_var_names
+                ),
+            )
             logger.info(
-                "Schematic cached: %d instances (top-level keys=%s)",
+                "Schematic cached: %d instances (top-level keys=%s, "
+                "intent=%s/%s)",
                 len(schematic_instances),
                 sorted(_circuit.keys()) if isinstance(_circuit, dict) else [],
+                topology_intent.get("circuit_class", "unknown"),
+                topology_intent.get("confidence", "low"),
             )
         except Exception as exc:  # noqa: BLE001 - topology is optional
             # A schematic read failure degrades the LLM prompt but must not
@@ -730,10 +931,19 @@ class CircuitAgent:
             _format_topology_with_live_vars(schematic_instances, {}),
             context="first-turn topology",
         )
+        first_intent_section = _guard_llm_feedback(
+            render_topology_intent_markdown(topology_intent),
+            context="first-turn topology intent",
+        )
         first_topology_block = (
             "## Topology (instances x design-var references)\n"
             f"{first_topology_section}\n\n"
             if first_topology_section else ""
+        )
+        first_intent_block = (
+            "## Topology Intent (PDK-safe hypothesis)\n"
+            f"{first_intent_section}\n\n"
+            if first_intent_section else ""
         )
         messages = [{
             "role": "user",
@@ -771,6 +981,7 @@ class CircuitAgent:
                 "with `id ≈ 0`; consult the spec's topology section "
                 "for per-device intent.\n\n"
                 f"{first_topology_block}"
+                f"{first_intent_block}"
                 f"## Target Specifications\n{spec_block}\n\n"
                 "If the spec declares a model-comparison starting "
                 "`design_vars` table, treat it as the Maestro/pre-run "
@@ -797,11 +1008,14 @@ class CircuitAgent:
                 "writeback_status": "skipped: llm_error",
                 "tuning_measurements": {},
                 "tuning_pass_fail": {},
+                "protocol_violations": protocol_violations,
+                "last_llm_telemetry": _llm_telemetry_dict(self.llm),
             }
         messages.append({"role": "assistant", "content": response})
         _append_transcript(
             0, "assistant", response,
             usage=getattr(self.llm, "last_usage", None),
+            telemetry=_llm_telemetry_dict(self.llm),
         )
 
         # Stage 1 rev 6 (2026-04-18): auto-discover Maestro design
@@ -821,26 +1035,27 @@ class CircuitAgent:
                 # blocked-word check; an underscore-prefixed testbench
                 # variable would otherwise pass discovery and then
                 # crash ``run_ocean_sim`` on the first iteration.
+                #
+                # Rev 18 (2026-06-08): do not filter to the LLM-editable
+                # active set here. OCEAN design() does not inherit every
+                # Maestro Design Variable value from the GUI; required
+                # stimulus/fixed vars such as Vctrl, Vicm, and AC source
+                # magnitudes must still be sent as desVar() baselines.
+                # The LLM contract is enforced separately by
+                # _validate_response_contract(), so discovering a variable
+                # here does not make it editable by the model.
                 filtered_out: list[str] = []
-                active_seed_names = (
-                    self.valid_design_var_names | self.fixed_design_var_names
-                )
                 for entry in discovered:
                     name = entry["name"]
-                    if (
-                        self.bridge._is_allowed_param_name(name)
-                        and name in active_seed_names
-                    ):
+                    if self.bridge._is_allowed_param_name(name):
                         baseline_vars[name] = entry["default"]
                     else:
                         filtered_out.append(name)
                 if filtered_out:
                     logger.warning(
-                        "Filtered %d discovered variable(s) not on the "
-                        "active spec/fixed whitelist or SafeBridge param "
-                        "allow-list: %s (won't be sent to OCEAN; their "
-                        "Maestro defaults still apply via the testbench "
-                        "netlist).",
+                        "Filtered %d discovered variable(s) rejected by "
+                        "the SafeBridge param allow-list: %s (won't be "
+                        "sent to OCEAN).",
                         len(filtered_out), sorted(filtered_out),
                     )
                 logger.info(
@@ -1039,6 +1254,31 @@ class CircuitAgent:
             )
             repair_attempts = 0
             while repair_reason and repair_attempts < _CONTRACT_REPAIR_MAX:
+                _, parsed_json_dict = _loads_first_json_dict(
+                    response
+                )
+                compact_json_rescue = (
+                    not parsed_json_dict
+                    and _llm_last_response_token_exhausted(self.llm)
+                )
+                protocol_violations["contract_violations"] += 1
+                protocol_violations["repair_attempts"] += 1
+                protocol_violations["max_bad_response_chars"] = max(
+                    protocol_violations["max_bad_response_chars"],
+                    len(response or ""),
+                )
+                if not parsed_json_dict:
+                    protocol_violations["json_parse_failures"] += 1
+                if compact_json_rescue:
+                    protocol_violations["compact_json_rescues"] += 1
+                if messages and messages[-1].get("role") == "assistant":
+                    messages[-1] = {
+                        "role": "assistant",
+                        "content": _compact_invalid_assistant_response(
+                            response, repair_reason
+                        ),
+                    }
+                    protocol_violations["context_compactions"] += 1
                 repair_attempts += 1
                 logger.warning(
                     "Contract violation (iter %d, attempt %d/%d): "
@@ -1046,17 +1286,35 @@ class CircuitAgent:
                     i + 1, repair_attempts, _CONTRACT_REPAIR_MAX,
                     repair_reason,
                 )
-                # response is already the last assistant message in
-                # messages (appended by the previous iteration or the
-                # initial chat). Only append the repair user message.
-                repair_msg = (
-                    f"Your previous response violated HARD CONSTRAINTS: "
-                    f"{repair_reason}. Please re-emit using EXACTLY the "
-                    f"keys and variable names from HARD CONSTRAINTS."
-                )
+                # response was the last assistant message, but it may
+                # be long non-JSON prose. It was compacted above before
+                # adding this repair prompt so the next provider call is
+                # anchored on the protocol instead of the bad response.
+                if compact_json_rescue:
+                    logger.warning(
+                        "LLM output was token-exhausted with no visible JSON; "
+                        "using isolated compact JSON rescue prompt."
+                    )
+                    repair_msg = _make_compact_json_rescue_prompt(
+                        repair_reason,
+                        self.valid_design_var_names,
+                        accumulated_vars,
+                        last_measurements,
+                        last_pass_fail,
+                    )
+                    repair_call_messages = [
+                        {"role": "user", "content": repair_msg},
+                    ]
+                else:
+                    repair_msg = _make_contract_repair_prompt(
+                        repair_reason,
+                        self.valid_design_var_names,
+                    )
+                    repair_call_messages = messages
                 messages.append({"role": "user", "content": repair_msg})
+                _append_transcript(i + 1, "user", repair_msg)
                 try:
-                    response = self.llm.chat(messages)
+                    response = self.llm.chat(repair_call_messages)
                 except Exception as exc:  # noqa: BLE001 - fail gracefully
                     safe_exc = scrub(f"{type(exc).__name__}: {exc}")
                     logger.error(
@@ -1068,6 +1326,11 @@ class CircuitAgent:
                     abort_reason = "llm_error"
                     break
                 messages.append({"role": "assistant", "content": response})
+                _append_transcript(
+                    i + 1, "assistant", response,
+                    usage=getattr(self.llm, "last_usage", None),
+                    telemetry=_llm_telemetry_dict(self.llm),
+                )
                 parsed = self._parse_llm_response(response)
                 self._strip_llm_setup_blocks_if_derived(parsed, iter_idx=i)
                 repair_reason = self._check_contract_violation(
@@ -1715,6 +1978,10 @@ class CircuitAgent:
                 _format_op_point_summary(op_point),
                 context="op-point feedback",
             )
+            stage_diagnosis = _guard_llm_feedback(
+                format_stage_diagnostics(topology_intent, op_point),
+                context="stage-level op-point diagnostics",
+            )
             history_brief = self._format_history_brief()
             # Plan ★ (2026-04-19): merge cached topology with current
             # accumulated_vars so Kimi sees which physical instance each
@@ -1729,6 +1996,19 @@ class CircuitAgent:
                 f"## Topology (instances × live desVars)\n{topology_section}\n\n"
                 if topology_section else ""
             )
+            topology_intent_section = _guard_llm_feedback(
+                render_topology_intent_markdown(topology_intent),
+                context="topology intent feedback",
+            )
+            topology_intent_block = (
+                "## Topology Intent (PDK-safe hypothesis)\n"
+                f"{topology_intent_section}\n\n"
+                if topology_intent_section else ""
+            )
+            stage_block = (
+                f"## Stage-Level OP Diagnosis\n{stage_diagnosis}\n\n"
+                if stage_diagnosis else ""
+            )
             if self.eval_block is not None:
                 eval_summary = _guard_llm_feedback(
                     _format_eval_summary(
@@ -1742,12 +2022,14 @@ class CircuitAgent:
                 ) if last_tuning_pass_fail else ""
                 next_prompt = (
                     f"{topology_block}"
+                    f"{topology_intent_block}"
                     f"## Iteration {i + 1} measurements (platform-computed)\n"
                     f"{eval_summary}\n\n"
                     f"{tuning_section}"
                     f"{last_curve_summary_md}"
                     f"## Per-device DC operating point\n"
                     f"{op_point_summary}\n\n"
+                    f"{stage_block}"
                     f"## OCEAN run meta\n{sim_summary}\n\n"
                     f"## History\n{history_brief}\n\n"
                     "Emit the next JSON block. `measurements` and "
@@ -1767,9 +2049,11 @@ class CircuitAgent:
             else:
                 next_prompt = (
                     f"{topology_block}"
+                    f"{topology_intent_block}"
                     f"## Iteration {i + 1} OCEAN result\n{sim_summary}\n\n"
                     f"## Per-device DC operating point\n"
                     f"{op_point_summary}\n\n"
+                    f"{stage_block}"
                     f"## History\n{history_brief}\n\n"
                     "Emit the next JSON block. If every pass_fail entry was "
                     "PASS, repeat the same design_vars and mark all PASS — "
@@ -1810,6 +2094,7 @@ class CircuitAgent:
             _append_transcript(
                 i + 1, "assistant", response,
                 usage=getattr(self.llm, "last_usage", None),
+                telemetry=_llm_telemetry_dict(self.llm),
             )
         else:
             if topology_streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT:
@@ -1889,6 +2174,8 @@ class CircuitAgent:
             # legacy runs so downstream code can treat them uniformly.
             "tuning_measurements": last_tuning_measurements,
             "tuning_pass_fail": last_tuning_pass_fail,
+            "protocol_violations": protocol_violations,
+            "last_llm_telemetry": _llm_telemetry_dict(self.llm),
         }
 
     # ------------------------------------------------------------------ #
@@ -1900,30 +2187,11 @@ class CircuitAgent:
         """Extract the first well-formed JSON block from the LLM response.
 
         Tries fenced blocks first (```json ...``` or ``` ... ```), then
-        falls back to a best-effort bare-JSON match. Returns {} if nothing
+        falls back to balanced bare-JSON objects. Returns {} if nothing
         parses cleanly — the caller decides whether empty means abort.
         """
-        for match in re.finditer(
-            r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL
-        ):
-            try:
-                data = json.loads(match.group(1))
-            except json.JSONDecodeError:
-                continue
-            if isinstance(data, dict):
-                return data
-
-        # Fallback: bare JSON object at top level.
-        first_brace = response.find("{")
-        last_brace = response.rfind("}")
-        if 0 <= first_brace < last_brace:
-            try:
-                data = json.loads(response[first_brace : last_brace + 1])
-            except json.JSONDecodeError:
-                return {}
-            if isinstance(data, dict):
-                return data
-        return {}
+        data, _parsed_json_dict = _loads_first_json_dict(response)
+        return data
 
     @staticmethod
     def _check_contract_violation(
@@ -3912,6 +4180,7 @@ class HspiceAgent:
             role: str,
             content: str,
             usage: dict[str, Any] | None = None,
+            telemetry: dict[str, Any] | None = None,
         ) -> None:
             if transcript_file is None:
                 return
@@ -3927,6 +4196,8 @@ class HspiceAgent:
                 # and break json.dumps.
                 if isinstance(usage, dict):
                     entry["usage"] = usage
+                if isinstance(telemetry, dict):
+                    entry["llm_telemetry"] = telemetry
                 with transcript_file.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             except OSError as exc:
@@ -3945,6 +4216,7 @@ class HspiceAgent:
         _append_transcript(
             0, "assistant", response,
             usage=getattr(self.llm, "last_usage", None),
+            telemetry=_llm_telemetry_dict(self.llm),
         )
 
         accumulated_vars: dict[str, Any] = {}
@@ -3964,10 +4236,16 @@ class HspiceAgent:
                     "Contract violation (iter %d): %s -- sending repair prompt",
                     i + 1, repair_reason,
                 )
-                repair_msg = (
-                    f"Your previous response violated HARD CONSTRAINTS: "
-                    f"{repair_reason}. Please re-emit using EXACTLY the "
-                    f"keys and variable names from HARD CONSTRAINTS."
+                if messages and messages[-1].get("role") == "assistant":
+                    messages[-1] = {
+                        "role": "assistant",
+                        "content": _compact_invalid_assistant_response(
+                            response, repair_reason
+                        ),
+                    }
+                repair_msg = _make_contract_repair_prompt(
+                    repair_reason,
+                    self.whitelist,
                 )
                 messages.append({"role": "user", "content": repair_msg})
                 _append_transcript(i + 1, "user", repair_msg)
@@ -3976,6 +4254,7 @@ class HspiceAgent:
                 _append_transcript(
                     i + 1, "assistant", response,
                     usage=getattr(self.llm, "last_usage", None),
+                    telemetry=_llm_telemetry_dict(self.llm),
                 )
                 parsed = CircuitAgent._parse_llm_response(response)
                 if self._check_contract_violation(parsed):
@@ -4102,6 +4381,7 @@ class HspiceAgent:
             _append_transcript(
                 i + 1, "assistant", response,
                 usage=getattr(self.llm, "last_usage", None),
+                telemetry=_llm_telemetry_dict(self.llm),
             )
         else:
             if topology_streak >= TOPOLOGY_SANITY_VIOLATION_LIMIT:
@@ -4126,6 +4406,7 @@ class HspiceAgent:
             "design_vars": accumulated_vars,
             "converged": converged,
             "abort_reason": abort_reason,
+            "last_llm_telemetry": _llm_telemetry_dict(self.llm),
         }
 
     # ------------------------------------------------------------------ #

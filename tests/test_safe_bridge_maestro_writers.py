@@ -14,6 +14,7 @@ built at runtime so the source file itself stays P0-clean.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1167,6 +1168,27 @@ class TestDryRunRunsValidators:
             with pytest.raises(ValueError, match="disallowed function"):
                 cli_module.main()
 
+    def test_dry_run_rejects_ac_output_using_tran_probe(
+        self, cli_module, tmp_path
+    ):
+        recipe = tmp_path / "bad_ac_dc.yaml"
+        recipe.write_text(
+            "outputs:\n"
+            "  - name: gain\n"
+            "    analysis: ac\n"
+            "    expr: 'rms(VT(/Vout))'\n",
+            encoding="utf-8",
+        )
+        pdk = self._write_pdk_map(tmp_path)
+        with patch.object(sys, "argv", [
+            "configure_maestro_outputs",
+            "--lib", "mylib", "--cell", "MYCELL", "--tb-cell", "MYTB",
+            "--yaml", str(recipe), "--pdk-map", str(pdk),
+            "--dry-run",
+        ]):
+            with pytest.raises(ValueError, match="analysis='ac'.*VT"):
+                cli_module.main()
+
     def test_dry_run_rejects_non_bool_enable(self, cli_module, tmp_path):
         recipe = tmp_path / "bad_enable.yaml"
         recipe.write_text(
@@ -1202,9 +1224,12 @@ class TestDryRunRunsValidators:
             "    points_per_dec: '100'\n"
             "outputs:\n"
             "  - name: vout\n"
+            "    analysis: dc\n"
             "    signal_name: '/Vout'\n"
             "    spec:\n"
-            "      gt: '0.5'\n",
+            "      gt: '0.5'\n"
+            "delete_outputs:\n"
+            "  - old_vout\n",
             encoding="utf-8",
         )
         pdk = self._write_pdk_map(tmp_path)
@@ -1215,6 +1240,33 @@ class TestDryRunRunsValidators:
             "--dry-run", "--verify",
         ]):
             assert cli_module.main() == 0
+
+    def test_skip_design_vars_leaves_recipe_vars_unapplied(
+        self, cli_module, tmp_path
+    ):
+        recipe = tmp_path / "setup.yaml"
+        report = tmp_path / "report.json"
+        recipe.write_text(
+            "design_vars:\n"
+            "  w: '1u'\n"
+            "outputs:\n"
+            "  - name: vout\n"
+            "    signal_name: '/Vout'\n",
+            encoding="utf-8",
+        )
+        pdk = self._write_pdk_map(tmp_path)
+        with patch.object(sys, "argv", [
+            "configure_maestro_outputs",
+            "--lib", "mylib", "--cell", "MYCELL", "--tb-cell", "MYTB",
+            "--yaml", str(recipe), "--pdk-map", str(pdk),
+            "--dry-run", "--skip-design-vars",
+            "--report-json", str(report),
+        ]):
+            assert cli_module.main() == 0
+
+        data = json.loads(report.read_text(encoding="utf-8"))
+        assert data["applied"]["design_vars"] == 0
+        assert data["writeback"] is None
 
     def test_analysis_preset_expands_to_ac_dec(self, cli_module):
         name, enable, options = cli_module._analysis_from_entry({

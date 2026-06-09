@@ -11,7 +11,9 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from .safe_bridge import scrub
 
@@ -48,7 +50,7 @@ def _normalize_usage(
         # OpenAI-compatible usage shape; Moonshot / MiniMax / OpenAI /
         # Xiaomi-MiMo / DeepSeek all surface reasoning_tokens via
         # completion_tokens_details on their reasoning models
-        # (Kimi k2.5 / MiniMax M2.7 / GPT-5.x / MiMo V2.5 pro /
+        # (Kimi k2.5 / MiniMax M3 / GPT-5.x / MiMo V2.5 pro /
         # DeepSeek V4 thinking mode — confirmed by primary docs at
         # api-docs.deepseek.com).
         prompt = getattr(usage_obj, "prompt_tokens", None)
@@ -87,7 +89,132 @@ def _normalize_usage(
 # own backoff is exhausted.
 _LLM_MAX_RATE_LIMIT_RETRIES = 2          # on top of SDK's own retries
 _LLM_RATE_LIMIT_BACKOFF_S = (30, 90)     # seconds before attempt 1, 2
+_LLM_TRANSIENT_BACKOFF_S = (10, 30)      # timeout/connection/5xx backoff
 _OPENAI_COMPAT_TIMEOUT_S = 300.0
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _round_seconds(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(value, 3)
+
+
+@dataclass
+class LlmCallTelemetry:
+    """Provider-neutral observability for one logical LLM call.
+
+    This intentionally records only transport/protocol facts and scrubbed
+    error summaries. It does not store prompts, completions, API keys, URLs,
+    headers, or provider-specific request bodies.
+    """
+
+    provider: str
+    model: str
+    transport_mode: str
+    timeout_s: float | None = None
+    max_tokens: int | None = None
+    started_at: str = field(default_factory=_utc_now_iso)
+    ended_at: str | None = None
+    duration_s: float | None = None
+    first_event_latency_s: float | None = None
+    last_event_age_s: float | None = None
+    event_count: int = 0
+    visible_chars: int = 0
+    reasoning_chars: int = 0
+    finish_reason: str | None = None
+    status: str = "running"
+    timeout_kind: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    retry_attempts: int = 0
+    _started_mono: float = field(default_factory=time.monotonic, repr=False)
+    _first_event_mono: float | None = field(default=None, repr=False)
+    _last_event_mono: float | None = field(default=None, repr=False)
+
+    def mark_event(
+        self,
+        *,
+        visible: str = "",
+        reasoning: str = "",
+        finish_reason: str | None = None,
+    ) -> None:
+        now = time.monotonic()
+        if self._first_event_mono is None:
+            self._first_event_mono = now
+            self.first_event_latency_s = _round_seconds(now - self._started_mono)
+        self._last_event_mono = now
+        self.last_event_age_s = 0.0
+        self.event_count += 1
+        self.visible_chars += len(visible or "")
+        self.reasoning_chars += len(reasoning or "")
+        if finish_reason is not None:
+            self.finish_reason = str(finish_reason)
+
+    def mark_ok(self, *, finish_reason: str | None = None) -> None:
+        self.status = "ok"
+        if finish_reason is not None:
+            self.finish_reason = str(finish_reason)
+        self._finish()
+
+    def mark_error(
+        self,
+        exc: Exception,
+        *,
+        timeout_kind: str | None = None,
+    ) -> None:
+        self.status = "error"
+        self.timeout_kind = timeout_kind or _classify_timeout_kind(exc)
+        self.error_type = type(exc).__name__
+        self.error_message = scrub(str(exc))[:240]
+        self._finish()
+
+    def _finish(self) -> None:
+        end = time.monotonic()
+        self.ended_at = _utc_now_iso()
+        self.duration_s = _round_seconds(end - self._started_mono)
+        if self._last_event_mono is not None:
+            self.last_event_age_s = _round_seconds(end - self._last_event_mono)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "transport_mode": self.transport_mode,
+            "timeout_s": self.timeout_s,
+            "max_tokens": self.max_tokens,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "duration_s": self.duration_s,
+            "first_event_latency_s": self.first_event_latency_s,
+            "last_event_age_s": self.last_event_age_s,
+            "event_count": self.event_count,
+            "visible_chars": self.visible_chars,
+            "reasoning_chars": self.reasoning_chars,
+            "finish_reason": self.finish_reason,
+            "status": self.status,
+            "timeout_kind": self.timeout_kind,
+            "error_type": self.error_type,
+            "error_message": self.error_message,
+            "retry_attempts": self.retry_attempts,
+        }
+
+
+@dataclass
+class _OpenAICompatChatResult:
+    content: str
+    usage: dict[str, Any] | None
+
+
+def _classify_timeout_kind(exc: Exception) -> str | None:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "timeout" in name or "timed out" in text or "timeout" in text:
+        return "http_timeout"
+    return None
 
 
 def _positive_float_env(
@@ -157,6 +284,74 @@ def _nonnegative_int_env(*names: str, default: int) -> int:
     return default
 
 
+def _positive_int_env(*names: str, default: int) -> int:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid %s=%r; using default=%d",
+                name, raw, default,
+            )
+            return default
+        if value > 0:
+            return value
+        logger.warning(
+            "Ignoring non-positive %s=%r; using default=%d",
+            name, raw, default,
+        )
+        return default
+    return default
+
+
+def _env_bool(*names: str, default: bool) -> bool:
+    for name in names:
+        raw = os.environ.get(name)
+        if raw is None or raw == "":
+            continue
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        logger.warning(
+            "Ignoring invalid %s=%r; using default=%s",
+            name, raw, default,
+        )
+        return default
+    return default
+
+
+def _llm_max_tokens(
+    provider_env_prefix: str,
+    *,
+    default: int = 16384,
+) -> int:
+    """Completion token budget shared by all providers.
+
+    Provider-specific env wins so a single flaky endpoint can be tuned
+    without changing the benchmark grid. ``LLM_MAX_TOKENS`` is the
+    provider-neutral fallback.
+    """
+    return _positive_int_env(
+        f"{provider_env_prefix}_MAX_TOKENS",
+        "LLM_MAX_TOKENS",
+        default=default,
+    )
+
+
+def _llm_streaming_enabled(provider_env_prefix: str) -> bool:
+    """Whether OpenAI-compatible clients should request stream chunks."""
+    return _env_bool(
+        f"{provider_env_prefix}_STREAMING",
+        "LLM_STREAMING",
+        default=True,
+    )
+
+
 def _openai_compat_max_retries(
     provider_env_prefix: str,
     *,
@@ -172,6 +367,305 @@ def _openai_compat_max_retries(
         "LLM_SDK_MAX_RETRIES",
         default=default,
     )
+
+
+def _looks_like_streaming_unsupported(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "stream" in text
+        and any(word in text for word in ("unsupported", "not support", "invalid"))
+    )
+
+
+def _is_transient_openai_compat_error(exc: Exception) -> bool:
+    """Return True for provider failures worth retrying once or twice.
+
+    OpenAI-compatible endpoints use different exception classes for the
+    same operational failure: OpenAI raises ``APITimeoutError`` /
+    ``APIConnectionError`` while some proxies surface plain ``TimeoutError``
+    or 5xx ``APIStatusError``. Keep the classifier provider-neutral and
+    deliberately avoid retrying auth/schema/user errors.
+    """
+    if _classify_timeout_kind(exc):
+        return True
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code >= 500:
+        return True
+
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    transient_name_markers = (
+        "apiconnectionerror",
+        "connectionerror",
+        "serviceunavailable",
+        "internalservererror",
+    )
+    if any(marker in name for marker in transient_name_markers):
+        return True
+    transient_text_markers = (
+        "connection reset",
+        "connection aborted",
+        "server disconnected",
+        "temporarily unavailable",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "internal server error",
+    )
+    return any(marker in text for marker in transient_text_markers)
+
+
+def _choice_finish_reason(choice: Any) -> str | None:
+    reason = getattr(choice, "finish_reason", None)
+    return str(reason) if reason is not None else None
+
+
+def _extract_openai_compat_text(
+    msg: Any,
+    *,
+    provider_label: str,
+    finish_reason: str | None,
+) -> str:
+    content = (getattr(msg, "content", None) or "").strip()
+    if content:
+        return content
+
+    # Reasoning models across OpenAI-compatible endpoints can park the
+    # answer in provider-extension fields when visible content is empty.
+    # Scrub before returning because this string becomes assistant-history
+    # content and will be replayed to the provider next turn.
+    reasoning = (
+        getattr(msg, "reasoning_content", None)
+        or getattr(msg, "reasoning", None)
+        or ""
+    )
+    reasoning = reasoning.strip()
+    if reasoning:
+        return scrub(reasoning)
+    raise RuntimeError(
+        f"{provider_label} returned empty content and no reasoning_content "
+        f"(finish_reason={finish_reason!r}). Likely max_tokens exhausted "
+        f"before model produced output."
+    )
+
+
+def _consume_openai_compat_response(
+    response: Any,
+    *,
+    telemetry: LlmCallTelemetry,
+    provider: str,
+    provider_label: str,
+    model: str,
+) -> _OpenAICompatChatResult:
+    """Consume either a blocking ChatCompletion or a streaming iterator."""
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        choice = choices[0]
+        msg = choice.message
+        finish_reason = _choice_finish_reason(choice)
+        visible = (getattr(msg, "content", None) or "").strip()
+        reasoning = (
+            getattr(msg, "reasoning_content", None)
+            or getattr(msg, "reasoning", None)
+            or ""
+        ).strip()
+        telemetry.mark_event(
+            visible=visible,
+            reasoning=reasoning,
+            finish_reason=finish_reason,
+        )
+        return _OpenAICompatChatResult(
+            content=_extract_openai_compat_text(
+                msg,
+                provider_label=provider_label,
+                finish_reason=finish_reason,
+            ),
+            usage=_normalize_usage(getattr(response, "usage", None), provider, model),
+        )
+
+    visible_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    usage_obj: Any = None
+    finish_reason: str | None = None
+    saw_chunk = False
+    for chunk in response:
+        saw_chunk = True
+        usage_obj = getattr(chunk, "usage", None) or usage_obj
+        chunk_choices = getattr(chunk, "choices", None) or []
+        if not chunk_choices:
+            telemetry.mark_event()
+            continue
+        choice = chunk_choices[0]
+        delta = getattr(choice, "delta", None)
+        chunk_visible = (
+            getattr(delta, "content", None)
+            if delta is not None else None
+        ) or ""
+        chunk_reasoning = (
+            getattr(delta, "reasoning_content", None)
+            or getattr(delta, "reasoning", None)
+            if delta is not None else ""
+        ) or ""
+        if chunk_visible:
+            visible_parts.append(str(chunk_visible))
+        if chunk_reasoning:
+            reasoning_parts.append(str(chunk_reasoning))
+        finish_reason = _choice_finish_reason(choice) or finish_reason
+        telemetry.mark_event(
+            visible=str(chunk_visible),
+            reasoning=str(chunk_reasoning),
+            finish_reason=finish_reason,
+        )
+
+    if not saw_chunk:
+        raise RuntimeError(f"{provider_label} stream produced no chunks")
+
+    visible_text = "".join(visible_parts).strip()
+    if visible_text:
+        return _OpenAICompatChatResult(
+            content=visible_text,
+            usage=_normalize_usage(usage_obj, provider, model),
+        )
+    reasoning_text = "".join(reasoning_parts).strip()
+    if reasoning_text:
+        return _OpenAICompatChatResult(
+            content=scrub(reasoning_text),
+            usage=_normalize_usage(usage_obj, provider, model),
+        )
+    raise RuntimeError(
+        f"{provider_label} returned empty stream content and no "
+        f"reasoning_content (finish_reason={finish_reason!r})."
+    )
+
+
+def _openai_compat_chat(
+    *,
+    client: Any,
+    provider: str,
+    provider_label: str,
+    provider_env_prefix: str,
+    model: str,
+    messages: list[dict[str, str]],
+    token_kw: str = "max_tokens",
+    default_max_tokens: int = 16384,
+    timeout_s: float | None,
+    max_retries: int,
+    rate_limit_error_cls: type[Exception],
+    telemetry_sink: Callable[[LlmCallTelemetry], None] | None = None,
+) -> _OpenAICompatChatResult:
+    full_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *messages,
+    ]
+    max_tokens = _llm_max_tokens(
+        provider_env_prefix,
+        default=default_max_tokens,
+    )
+    streaming = _llm_streaming_enabled(provider_env_prefix)
+    base_kwargs = {
+        "model": model,
+        "messages": full_messages,
+        token_kw: max_tokens,
+    }
+    call_modes = ["streaming", "blocking_fallback"] if streaming else ["blocking"]
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        retry_reason: str | None = None
+        for mode in call_modes:
+            telemetry = LlmCallTelemetry(
+                provider=provider,
+                model=model,
+                transport_mode=mode,
+                timeout_s=timeout_s,
+                max_tokens=max_tokens,
+            )
+            telemetry.retry_attempts = attempt
+            if telemetry_sink is not None:
+                telemetry_sink(telemetry)
+            kwargs = dict(base_kwargs)
+            if mode == "streaming":
+                kwargs["stream"] = True
+            try:
+                response = client.chat.completions.create(**kwargs)
+                result = _consume_openai_compat_response(
+                    response,
+                    telemetry=telemetry,
+                    provider=provider,
+                    provider_label=provider_label,
+                    model=model,
+                )
+                telemetry.mark_ok(finish_reason=telemetry.finish_reason)
+                return result
+            except rate_limit_error_cls as exc:
+                last_exc = exc
+                telemetry.mark_error(exc)
+                retry_reason = "rate_limit"
+                break
+            except Exception as exc:
+                last_exc = exc
+                telemetry.mark_error(exc)
+                if mode == "streaming" and _looks_like_streaming_unsupported(exc):
+                    logger.warning(
+                        "%s streaming unsupported; retrying this attempt "
+                        "with blocking response mode.",
+                        provider_label,
+                    )
+                    continue
+                if (
+                    mode == "streaming"
+                    and "blocking_fallback" in call_modes
+                    and _is_transient_openai_compat_error(exc)
+                ):
+                    logger.warning(
+                        "%s streaming call hit transient %s; retrying this "
+                        "attempt with blocking response mode.",
+                        provider_label, type(exc).__name__,
+                    )
+                    continue
+                if _is_transient_openai_compat_error(exc):
+                    retry_reason = "transient"
+                    break
+                raise
+        if retry_reason is None:
+            continue
+        if attempt >= max_retries:
+            if retry_reason == "rate_limit":
+                logger.error(
+                    "%s 429: exhausted %d outer retries; raising.",
+                    provider_label, max_retries,
+                )
+            else:
+                logger.error(
+                    "%s transient LLM error: exhausted %d outer retries; "
+                    "raising.",
+                    provider_label, max_retries,
+                )
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError(f"{provider_label} chat: no response")
+        if retry_reason == "rate_limit":
+            sleep_s = _LLM_RATE_LIMIT_BACKOFF_S[
+                min(attempt, len(_LLM_RATE_LIMIT_BACKOFF_S) - 1)
+            ]
+            logger.warning(
+                "%s 429 (attempt %d/%d); sleeping %ds before retry.",
+                provider_label, attempt + 1, max_retries + 1, sleep_s,
+            )
+        else:
+            sleep_s = _LLM_TRANSIENT_BACKOFF_S[
+                min(attempt, len(_LLM_TRANSIENT_BACKOFF_S) - 1)
+            ]
+            logger.warning(
+                "%s transient LLM error (attempt %d/%d): %s; sleeping %ds "
+                "before retry.",
+                provider_label, attempt + 1, max_retries + 1,
+                type(last_exc).__name__ if last_exc is not None else "?",
+                sleep_s,
+            )
+        time.sleep(sleep_s)
+    raise RuntimeError(f"{provider_label} chat: unreachable") from last_exc
 
 SYSTEM_PROMPT = """\
 You are an expert analog circuit designer. You analyze circuit topologies, \
@@ -200,6 +694,9 @@ Key design principles:
 
 class LLMClient(ABC):
     """Abstract base class for LLM providers."""
+
+    last_usage: dict[str, Any] | None = None
+    last_telemetry: LlmCallTelemetry | None = None
 
     @abstractmethod
     def chat(self, messages: list[dict[str, str]]) -> str:
@@ -237,23 +734,34 @@ class ClaudeClient(LLMClient):
         )
         self.model = model
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         import anthropic
 
         self.last_usage = None
+        max_tokens = _llm_max_tokens("CLAUDE", default=4096)
+        telemetry = LlmCallTelemetry(
+            provider="claude",
+            model=self.model,
+            transport_mode="blocking",
+            max_tokens=max_tokens,
+        )
+        self.last_telemetry = telemetry
         last_exc: Exception | None = None
         for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
             try:
                 response = self.client.messages.create(
                     model=self.model,
-                    max_tokens=4096,
+                    max_tokens=max_tokens,
                     system=SYSTEM_PROMPT,
                     messages=messages,
                 )
             except anthropic.RateLimitError as exc:
                 last_exc = exc
+                telemetry.retry_attempts = attempt + 1
                 if attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
+                    telemetry.mark_error(exc)
                     logger.error(
                         "Claude 429: exhausted %d outer retries; raising.",
                         _LLM_MAX_RATE_LIMIT_RETRIES,
@@ -269,6 +777,7 @@ class ClaudeClient(LLMClient):
                 time.sleep(sleep_s)
                 continue
             except anthropic.APIStatusError as exc:
+                telemetry.mark_error(exc)
                 logger.error(
                     "Claude API status %s: %s",
                     getattr(exc, "status_code", "?"), str(exc)[:200],
@@ -282,7 +791,10 @@ class ClaudeClient(LLMClient):
             self.last_usage = _normalize_usage(
                 getattr(response, "usage", None), "claude", self.model,
             )
-            return "".join(text_blocks)
+            content = "".join(text_blocks)
+            telemetry.mark_event(visible=content)
+            telemetry.mark_ok()
+            return content
         # Unreachable — loop either returns or raises.
         raise RuntimeError("Claude chat: unreachable") from last_exc
 
@@ -307,12 +819,21 @@ class GeminiClient(LLMClient):
             system_instruction=SYSTEM_PROMPT,
         )
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         if not messages:
             raise ValueError("messages must not be empty")
 
         self.last_usage = None
+        max_tokens = _llm_max_tokens("GEMINI", default=4096)
+        telemetry = LlmCallTelemetry(
+            provider="gemini",
+            model=self._model_name,
+            transport_mode="blocking",
+            max_tokens=max_tokens,
+        )
+        self.last_telemetry = telemetry
         history = [
             {
                 "role": "user" if msg["role"] == "user" else "model",
@@ -321,18 +842,51 @@ class GeminiClient(LLMClient):
             for msg in messages[:-1]
         ]
         chat = self.model.start_chat(history=history)
-        response = chat.send_message(messages[-1]["content"])
-        self.last_usage = _normalize_usage(
-            getattr(response, "usage_metadata", None), "gemini", self._model_name,
-        )
-        return response.text
+        try:
+            response = chat.send_message(
+                messages[-1]["content"],
+                generation_config={"max_output_tokens": max_tokens},
+            )
+            self.last_usage = _normalize_usage(
+                getattr(response, "usage_metadata", None),
+                "gemini",
+                self._model_name,
+            )
+            text = response.text
+            telemetry.mark_event(visible=text)
+            telemetry.mark_ok()
+            return text
+        except Exception as exc:
+            telemetry.mark_error(exc)
+            raise
 
     def ask(self, prompt: str) -> str:
-        response = self.model.generate_content(prompt)
-        self.last_usage = _normalize_usage(
-            getattr(response, "usage_metadata", None), "gemini", self._model_name,
+        self.last_usage = None
+        max_tokens = _llm_max_tokens("GEMINI", default=4096)
+        telemetry = LlmCallTelemetry(
+            provider="gemini",
+            model=self._model_name,
+            transport_mode="blocking",
+            max_tokens=max_tokens,
         )
-        return response.text
+        self.last_telemetry = telemetry
+        try:
+            response = self.model.generate_content(
+                prompt,
+                generation_config={"max_output_tokens": max_tokens},
+            )
+            self.last_usage = _normalize_usage(
+                getattr(response, "usage_metadata", None),
+                "gemini",
+                self._model_name,
+            )
+            text = response.text
+            telemetry.mark_event(visible=text)
+            telemetry.mark_ok()
+            return text
+        except Exception as exc:
+            telemetry.mark_error(exc)
+            raise
 
 
 class KimiClient(LLMClient):
@@ -368,72 +922,29 @@ class KimiClient(LLMClient):
         )
         self.model = model
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         import openai
 
         self.last_usage = None
-        full_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *messages,
-        ]
-        last_exc: Exception | None = None
-        response = None
-        for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=full_messages,
-                    max_tokens=16384,
-                )
-                break
-            except openai.RateLimitError as exc:
-                last_exc = exc
-                if attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
-                    logger.error(
-                        "Kimi 429: exhausted %d outer retries; raising.",
-                        _LLM_MAX_RATE_LIMIT_RETRIES,
-                    )
-                    raise
-                sleep_s = _LLM_RATE_LIMIT_BACKOFF_S[
-                    min(attempt, len(_LLM_RATE_LIMIT_BACKOFF_S) - 1)
-                ]
-                logger.warning(
-                    "Kimi 429 (attempt %d/%d); sleeping %ds before retry.",
-                    attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES + 1, sleep_s,
-                )
-                time.sleep(sleep_s)
-                continue
-        if response is None:
-            raise RuntimeError("Kimi chat: no response") from last_exc
-        self.last_usage = _normalize_usage(
-            getattr(response, "usage", None), "kimi", self.model,
+        self.last_telemetry = None
+        result = _openai_compat_chat(
+            client=self.client,
+            provider="kimi",
+            provider_label="Kimi",
+            provider_env_prefix="KIMI",
+            model=self.model,
+            messages=messages,
+            token_kw="max_tokens",
+            default_max_tokens=16384,
+            timeout_s=self.timeout,
+            max_retries=_LLM_MAX_RATE_LIMIT_RETRIES,
+            rate_limit_error_cls=openai.RateLimitError,
+            telemetry_sink=lambda t: setattr(self, "last_telemetry", t),
         )
-        choice = response.choices[0]
-        msg = choice.message
-        content = (msg.content or "").strip()
-        if not content:
-            # Kimi k2.5 is a reasoning model: when tokens are spent in
-            # thinking, `content` can come back empty with the full reply
-            # sitting in the Moonshot-extension `reasoning_content` field.
-            # Using it preserves the turn (and prevents the downstream
-            # "assistant message must not be empty" 400 when we replay the
-            # history on the next iteration). The reasoning trace is the
-            # only LLM-visible path that does not flow through
-            # safe_bridge._scrub on the way out of Cadence (tool results
-            # are scrubbed at source); replay would re-leak any residual
-            # foundry/path token quoted in the trace, so scrub here before
-            # the string becomes assistant-history content.
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            reasoning = reasoning.strip()
-            if reasoning:
-                return scrub(reasoning)
-            raise RuntimeError(
-                f"Kimi returned empty content and no reasoning_content "
-                f"(finish_reason={choice.finish_reason!r}). Likely "
-                f"max_tokens exhausted before model produced output."
-            )
-        return content
+        self.last_usage = result.usage
+        return result.content
 
     def ask(self, prompt: str) -> str:
         return self.chat([{"role": "user", "content": prompt}])
@@ -444,7 +955,7 @@ class MinimaxClient(LLMClient):
 
     Default base_url points at ``api.minimaxi.com`` (domestic China);
     override MINIMAX_BASE_URL for the overseas endpoint. Default model
-    is ``MiniMax-M2.7``; override via MINIMAX_MODEL env or ``--model``.
+    is ``MiniMax-M3``; override via MINIMAX_MODEL env or ``--model``.
     """
 
     def __init__(
@@ -469,69 +980,31 @@ class MinimaxClient(LLMClient):
             max_retries=self.max_retries,
             timeout=self.timeout,
         )
-        self.model = model or os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
+        self.model = model or os.environ.get("MINIMAX_MODEL", "MiniMax-M3")
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         import openai
 
         self.last_usage = None
-        full_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *messages,
-        ]
-        last_exc: Exception | None = None
-        response = None
-        for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=full_messages,
-                    max_tokens=16384,
-                )
-                break
-            except openai.RateLimitError as exc:
-                last_exc = exc
-                if attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
-                    logger.error(
-                        "MiniMax 429: exhausted %d outer retries; raising.",
-                        _LLM_MAX_RATE_LIMIT_RETRIES,
-                    )
-                    raise
-                sleep_s = _LLM_RATE_LIMIT_BACKOFF_S[
-                    min(attempt, len(_LLM_RATE_LIMIT_BACKOFF_S) - 1)
-                ]
-                logger.warning(
-                    "MiniMax 429 (attempt %d/%d); sleeping %ds before retry.",
-                    attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES + 1, sleep_s,
-                )
-                time.sleep(sleep_s)
-                continue
-        if response is None:
-            raise RuntimeError("MiniMax chat: no response") from last_exc
-        self.last_usage = _normalize_usage(
-            getattr(response, "usage", None), "minimax", self.model,
+        self.last_telemetry = None
+        result = _openai_compat_chat(
+            client=self.client,
+            provider="minimax",
+            provider_label="MiniMax",
+            provider_env_prefix="MINIMAX",
+            model=self.model,
+            messages=messages,
+            token_kw="max_tokens",
+            default_max_tokens=16384,
+            timeout_s=self.timeout,
+            max_retries=_LLM_MAX_RATE_LIMIT_RETRIES,
+            rate_limit_error_cls=openai.RateLimitError,
+            telemetry_sink=lambda t: setattr(self, "last_telemetry", t),
         )
-        choice = response.choices[0]
-        msg = choice.message
-        content = (msg.content or "").strip()
-        if not content:
-            # MiniMax-M2.7 is a reasoning model and may return the full
-            # reply in `reasoning_content` when the visible content is
-            # consumed by thinking tokens. Scrub before returning — same
-            # rationale as the Kimi reasoning path: the reasoning trace
-            # bypasses the normal tool-result scrub on its way back into
-            # conversation history.
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            reasoning = reasoning.strip()
-            if reasoning:
-                return scrub(reasoning)
-            raise RuntimeError(
-                f"MiniMax returned empty content and no reasoning_content "
-                f"(finish_reason={choice.finish_reason!r}). Likely "
-                f"max_tokens exhausted before model produced output."
-            )
-        return content
+        self.last_usage = result.usage
+        return result.content
 
     def ask(self, prompt: str) -> str:
         return self.chat([{"role": "user", "content": prompt}])
@@ -575,71 +1048,34 @@ class OpenAIClient(LLMClient):
         )
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-5.5")
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         import openai
 
         self.last_usage = None
-        full_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *messages,
-        ]
-        last_exc: Exception | None = None
-        response = None
-        for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                # GPT-5.x is reasoning-class; OpenAI docs flag `max_tokens`
-                # as incompatible with o-series/reasoning models and
-                # `max_completion_tokens` as the field that budgets
-                # visible + reasoning tokens together. Kimi/MiniMax
-                # OpenAI-compat endpoints still want `max_tokens`, so
-                # this asymmetry is intentional, not a bug.
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=full_messages,
-                    max_completion_tokens=16384,
-                )
-                break
-            except openai.RateLimitError as exc:
-                last_exc = exc
-                if attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
-                    logger.error(
-                        "OpenAI 429: exhausted %d outer retries; raising.",
-                        _LLM_MAX_RATE_LIMIT_RETRIES,
-                    )
-                    raise
-                sleep_s = _LLM_RATE_LIMIT_BACKOFF_S[
-                    min(attempt, len(_LLM_RATE_LIMIT_BACKOFF_S) - 1)
-                ]
-                logger.warning(
-                    "OpenAI 429 (attempt %d/%d); sleeping %ds before retry.",
-                    attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES + 1, sleep_s,
-                )
-                time.sleep(sleep_s)
-                continue
-        if response is None:
-            raise RuntimeError("OpenAI chat: no response") from last_exc
-        self.last_usage = _normalize_usage(
-            getattr(response, "usage", None), "openai", self.model,
+        self.last_telemetry = None
+        # GPT-5.x is reasoning-class; OpenAI docs flag `max_tokens` as
+        # incompatible with o-series/reasoning models and
+        # `max_completion_tokens` as the field that budgets visible +
+        # reasoning tokens together. Third-party OpenAI-compatible
+        # endpoints below still want `max_tokens`.
+        result = _openai_compat_chat(
+            client=self.client,
+            provider="openai",
+            provider_label="OpenAI",
+            provider_env_prefix="OPENAI",
+            model=self.model,
+            messages=messages,
+            token_kw="max_completion_tokens",
+            default_max_tokens=16384,
+            timeout_s=self.timeout,
+            max_retries=_LLM_MAX_RATE_LIMIT_RETRIES,
+            rate_limit_error_cls=openai.RateLimitError,
+            telemetry_sink=lambda t: setattr(self, "last_telemetry", t),
         )
-        choice = response.choices[0]
-        msg = choice.message
-        content = (msg.content or "").strip()
-        if not content:
-            # GPT-5.x reasoning path: content empty, reply on
-            # reasoning_content. Scrub before returning — the reasoning
-            # trace bypasses the tool-result scrub on its way back into
-            # conversation history (same rationale as Kimi/MiniMax).
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            reasoning = reasoning.strip()
-            if reasoning:
-                return scrub(reasoning)
-            raise RuntimeError(
-                f"OpenAI returned empty content and no reasoning_content "
-                f"(finish_reason={choice.finish_reason!r}). Likely "
-                f"max_tokens exhausted before model produced output."
-            )
-        return content
+        self.last_usage = result.usage
+        return result.content
 
     def ask(self, prompt: str) -> str:
         return self.chat([{"role": "user", "content": prompt}])
@@ -691,67 +1127,29 @@ class MimoClient(LLMClient):
         )
         self.model = model or os.environ.get("MIMO_MODEL", "mimo-v2.5-pro")
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         import openai
 
         self.last_usage = None
-        full_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *messages,
-        ]
-        last_exc: Exception | None = None
-        response = None
-        for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=full_messages,
-                    max_tokens=16384,
-                )
-                break
-            except openai.RateLimitError as exc:
-                last_exc = exc
-                if attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
-                    logger.error(
-                        "MiMo 429: exhausted %d outer retries; raising.",
-                        _LLM_MAX_RATE_LIMIT_RETRIES,
-                    )
-                    raise
-                sleep_s = _LLM_RATE_LIMIT_BACKOFF_S[
-                    min(attempt, len(_LLM_RATE_LIMIT_BACKOFF_S) - 1)
-                ]
-                logger.warning(
-                    "MiMo 429 (attempt %d/%d); sleeping %ds before retry.",
-                    attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES + 1, sleep_s,
-                )
-                time.sleep(sleep_s)
-                continue
-        if response is None:
-            raise RuntimeError("MiMo chat: no response") from last_exc
-        self.last_usage = _normalize_usage(
-            getattr(response, "usage", None), "mimo", self.model,
+        self.last_telemetry = None
+        result = _openai_compat_chat(
+            client=self.client,
+            provider="mimo",
+            provider_label="MiMo",
+            provider_env_prefix="MIMO",
+            model=self.model,
+            messages=messages,
+            token_kw="max_tokens",
+            default_max_tokens=16384,
+            timeout_s=self.timeout,
+            max_retries=_LLM_MAX_RATE_LIMIT_RETRIES,
+            rate_limit_error_cls=openai.RateLimitError,
+            telemetry_sink=lambda t: setattr(self, "last_telemetry", t),
         )
-        choice = response.choices[0]
-        msg = choice.message
-        content = (msg.content or "").strip()
-        if not content:
-            # MiMo V2.5-pro is reasoning-class: when output tokens are
-            # consumed by thinking, visible reply lands on
-            # `reasoning_content` (same shape as Kimi/MiniMax). Scrub
-            # before returning — the reasoning trace bypasses the tool-
-            # result scrub path on its way back into conversation
-            # history (e750189c-class threat).
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            reasoning = reasoning.strip()
-            if reasoning:
-                return scrub(reasoning)
-            raise RuntimeError(
-                f"MiMo returned empty content and no reasoning_content "
-                f"(finish_reason={choice.finish_reason!r}). Likely "
-                f"max_tokens exhausted before model produced output."
-            )
-        return content
+        self.last_usage = result.usage
+        return result.content
 
     def ask(self, prompt: str) -> str:
         return self.chat([{"role": "user", "content": prompt}])
@@ -804,66 +1202,29 @@ class DeepSeekClient(LLMClient):
             "DEEPSEEK_MODEL", "deepseek-v4-pro"
         )
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         import openai
 
         self.last_usage = None
-        full_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *messages,
-        ]
-        last_exc: Exception | None = None
-        response = None
-        for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=full_messages,
-                    max_tokens=16384,
-                )
-                break
-            except openai.RateLimitError as exc:
-                last_exc = exc
-                if attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
-                    logger.error(
-                        "DeepSeek 429: exhausted %d outer retries; raising.",
-                        _LLM_MAX_RATE_LIMIT_RETRIES,
-                    )
-                    raise
-                sleep_s = _LLM_RATE_LIMIT_BACKOFF_S[
-                    min(attempt, len(_LLM_RATE_LIMIT_BACKOFF_S) - 1)
-                ]
-                logger.warning(
-                    "DeepSeek 429 (attempt %d/%d); sleeping %ds before retry.",
-                    attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES + 1, sleep_s,
-                )
-                time.sleep(sleep_s)
-                continue
-        if response is None:
-            raise RuntimeError("DeepSeek chat: no response") from last_exc
-        self.last_usage = _normalize_usage(
-            getattr(response, "usage", None), "deepseek", self.model,
+        self.last_telemetry = None
+        result = _openai_compat_chat(
+            client=self.client,
+            provider="deepseek",
+            provider_label="DeepSeek",
+            provider_env_prefix="DEEPSEEK",
+            model=self.model,
+            messages=messages,
+            token_kw="max_tokens",
+            default_max_tokens=16384,
+            timeout_s=self.timeout,
+            max_retries=_LLM_MAX_RATE_LIMIT_RETRIES,
+            rate_limit_error_cls=openai.RateLimitError,
+            telemetry_sink=lambda t: setattr(self, "last_telemetry", t),
         )
-        choice = response.choices[0]
-        msg = choice.message
-        content = (msg.content or "").strip()
-        if not content:
-            # DeepSeek V4 thinking mode: visible reply lands on
-            # `reasoning_content` (vendor docs confirm field name).
-            # Scrub before returning — the reasoning trace bypasses the
-            # tool-result scrub path on its way back into conversation
-            # history (e750189c-class threat).
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            reasoning = reasoning.strip()
-            if reasoning:
-                return scrub(reasoning)
-            raise RuntimeError(
-                f"DeepSeek returned empty content and no reasoning_content "
-                f"(finish_reason={choice.finish_reason!r}). Likely "
-                f"max_tokens exhausted before model produced output."
-            )
-        return content
+        self.last_usage = result.usage
+        return result.content
 
     def ask(self, prompt: str) -> str:
         return self.chat([{"role": "user", "content": prompt}])
@@ -893,9 +1254,19 @@ class OllamaClient(LLMClient):
         self._urllib = urllib.request
         self._json = _json
         self.last_usage: dict[str, Any] | None = None
+        self.last_telemetry: LlmCallTelemetry | None = None
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         self.last_usage = None
+        max_tokens = _llm_max_tokens("OLLAMA", default=4096)
+        telemetry = LlmCallTelemetry(
+            provider="ollama",
+            model=self.model,
+            transport_mode="blocking",
+            timeout_s=float(self.timeout),
+            max_tokens=max_tokens,
+        )
+        self.last_telemetry = telemetry
         full_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *messages,
@@ -904,6 +1275,7 @@ class OllamaClient(LLMClient):
             "model": self.model,
             "messages": full_messages,
             "stream": False,
+            "options": {"num_predict": max_tokens},
         }).encode()
 
         req = self._urllib.Request(
@@ -911,33 +1283,43 @@ class OllamaClient(LLMClient):
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        with self._urllib.urlopen(req, timeout=self.timeout) as resp:
-            data = self._json.loads(resp.read())
-        self.last_usage = _normalize_usage(data, "ollama", self.model)
-        msg = data["message"]
-        content = msg.get("content", "").strip()
-        thinking = msg.get("thinking", "").strip()
-        if content:
+        try:
+            with self._urllib.urlopen(req, timeout=self.timeout) as resp:
+                data = self._json.loads(resp.read())
+            self.last_usage = _normalize_usage(data, "ollama", self.model)
+            msg = data["message"]
+            content = msg.get("content", "").strip()
+            thinking = msg.get("thinking", "").strip()
+            telemetry.mark_event(visible=content, reasoning=thinking)
+            if content:
+                if thinking:
+                    # Scrub before logging — `thinking` carries the same
+                    # PDK-leak risk as the empty-content fallback below.
+                    # The transcript-replay path is already safe (we return
+                    # `content`, not `thinking`), but the debug log is
+                    # itself an unsanitized sink that the curious-but-passive
+                    # provider model in §4 does not cover.
+                    logger.debug(
+                        "Ollama reasoning (thinking): %s", scrub(thinking)
+                    )
+                telemetry.mark_ok()
+                return content
             if thinking:
-                # Scrub before logging — `thinking` carries the same
-                # PDK-leak risk as the empty-content fallback below.
-                # The transcript-replay path is already safe (we return
-                # `content`, not `thinking`), but the debug log is
-                # itself an unsanitized sink that the curious-but-passive
-                # provider model in §4 does not cover.
-                logger.debug("Ollama reasoning (thinking): %s", scrub(thinking))
-            return content
-        if thinking:
-            # Scrub before returning — Ollama `thinking` is the same
-            # threat class as Kimi/MiniMax `reasoning_content`: it
-            # becomes assistant-history content and is replayed on the
-            # next iteration without going through the tool-result
-            # scrub path.
-            return scrub(thinking)
-        raise RuntimeError(
-            "Ollama returned empty message (both content and thinking "
-            "fields blank)"
-        )
+                # Scrub before returning — Ollama `thinking` is the same
+                # threat class as Kimi/MiniMax `reasoning_content`: it
+                # becomes assistant-history content and is replayed on the
+                # next iteration without going through the tool-result
+                # scrub path.
+                telemetry.mark_ok()
+                return scrub(thinking)
+            raise RuntimeError(
+                "Ollama returned empty message (both content and thinking "
+                "fields blank)"
+            )
+        except Exception as exc:
+            if telemetry.status == "running":
+                telemetry.mark_error(exc)
+            raise
 
     def ask(self, prompt: str) -> str:
         return self.chat([{"role": "user", "content": prompt}])

@@ -1,0 +1,13 @@
+model_name,outcome,n_iter,wall_clock_s,A0_diff_db,UGB_MHz,fail_reason,writeback_status,transcript_path
+claude-opus-4-8,PASS,1,74.4,52.2041,1707.79,,ok,projects/opamp_pll/logs/agent/transcript_20260607_234227.jsonl
+claude-sonnet-4-6,FAIL,15,1598.2,47.1833,276.74,max_iter,ok,projects/opamp_pll/logs/agent/transcript_20260607_234349.jsonl
+claude-haiku-4-5,FAIL,15,1073.0,-62.944,,max_iter,ok,projects/opamp_pll/logs/agent/transcript_20260608_001035.jsonl
+gpt-5.5,PASS,4,450.6,51.5844,212.0,,ok,projects/opamp_pll/logs/agent/transcript_20260608_002836.jsonl
+gpt-5.4-mini,FAIL,15,917.1,-76.8111,,max_iter,ok,projects/opamp_pll/logs/agent/transcript_20260608_003615.jsonl
+kimi-k2.5,PASS,3,835.4,50.1141,1543.39,,ok,projects/opamp_pll/logs/agent/transcript_20260608_005139.jsonl
+minimax-m2.7,FAIL,15,1503.7,16.9016,3864.13,max_iter,ok,projects/opamp_pll/logs/agent/transcript_20260608_010543.jsonl
+minimax-m3,FAIL,1,1156.4,-67.3442,,contract_violation,ok,projects/opamp_pll/logs/agent/transcript_20260608_013055.jsonl
+mimo-v2.5-pro,PASS,4,1386.5,50.9377,121.13,,ok,projects/opamp_pll/logs/agent/transcript_20260608_015020.jsonl
+deepseek-v4-pro,PASS,2,322.7,50.8762,841.37,,ok,projects/opamp_pll/logs/agent/transcript_20260608_021334.jsonl
+deepseek-v4-flash,PASS,15,1412.3,52.7269,896.32,,ok,projects/opamp_pll/logs/agent/transcript_20260608_021905.jsonl
+gemini-2.5-pro,FAIL,1,173.9,-24.2299,4645.97,llm_error,ok,projects/opamp_pll/logs/agent/transcript_20260608_024246.jsonl

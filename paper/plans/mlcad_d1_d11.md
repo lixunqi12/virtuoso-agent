@@ -34,15 +34,16 @@
 
 | # | Vendor    | Country | Checkpoint   | Client status (D1)              |
 |---|-----------|---------|--------------|---------------------------------|
-| 1 | Anthropic | US      | Opus 4.7     | ✅ existing (ClaudeClient + `--model claude-opus-4-7`) |
+| 1 | Anthropic | US      | Opus 4.8     | ✅ existing (ClaudeClient + `--model claude-opus-4-8`) |
 | 2 | Anthropic | US      | Sonnet 4.6   | ✅ existing (default of ClaudeClient) |
 | 3 | Anthropic | US      | Haiku 4.5    | ✅ existing (`--model claude-haiku-4-5-20251001`) |
 | 4 | OpenAI    | US      | GPT-5.5      | ❌ **need new client (D1-D2)**  |
 | 5 | OpenAI    | US      | GPT-5.4-mini | ❌ same client as #4, `--model` differs |
 | 6 | Moonshot  | China   | Kimi K2.5    | ✅ existing (default of KimiClient) |
-| 7 | MiniMax   | China   | M2.7         | ✅ existing (default of MinimaxClient) |
-| 8 | Xiaomi    | China   | MiMo 2.5     | ❌ **need new client (D2-D3)**  |
-| 9 | Google    | US      | Gemini 2.x   | ✅ existing — *user optional 9th* |
+| 7 | MiniMax   | China   | M2.7         | ✅ existing (`--model MiniMax-M2.7`) |
+| 8 | MiniMax   | China   | M3           | ✅ existing (default of MinimaxClient, `--model MiniMax-M3`) |
+| 9 | Xiaomi    | China   | MiMo 2.5     | ❌ **need new client (D2-D3)**  |
+| 10 | Google   | US      | Gemini 2.x   | ✅ existing — *user optional 10th* |
 
 ---
 
@@ -178,7 +179,7 @@ runner halts and waits for new directive in that case.
 
 1. User submits abstract reg. Runner stands by for any title/abstract
    late-changes.
-2. Runner action: **launch Anthropic-tier benchmark runs** (Opus 4.7 /
+2. Runner action: **launch Anthropic-tier benchmark runs** (Opus 4.8 /
    Sonnet 4.6 / Haiku 4.5 × LC_VCO_20G × 10 iter × 3 seed = 90 runs ≈
    45 min API-bound). Paste commands to main channel for user/Claude Code
    to fire.
@@ -195,7 +196,7 @@ runner halts and waits for new directive in that case.
 
 ### D7 — 2026-05-18
 
-1. **China-tier runs**: Kimi K2.5 / MiniMax M2.7 / Xiaomi MiMo 2.5 ×
+1. **China-tier runs**: Kimi K2.5 / MiniMax M2.7 / MiniMax M3 / Xiaomi MiMo 2.5 ×
    LC_VCO_20G × 10 iter × 3 seed = 90 runs.
 2. Watch for reasoning_content-replay regressions on the new MiMo client
    (D3 review caught any path, but live data is the only true witness);

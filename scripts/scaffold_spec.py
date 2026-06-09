@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -34,8 +35,9 @@ for _stream in (sys.stdout, sys.stderr):
 
 from virtuoso_bridge import VirtuosoClient  # noqa: E402
 
-from src.safe_bridge import SafeBridge  # noqa: E402
+from src.safe_bridge import SafeBridge, scrub  # noqa: E402
 from src.spec_scaffold import render_spec_scaffold  # noqa: E402
+from src.topology_intent import infer_topology_intent  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +84,30 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Overwrite --out if it already exists.",
+    )
+    parser.add_argument(
+        "--infer-topology",
+        dest="infer_topology",
+        action="store_true",
+        default=True,
+        help=(
+            "Read the DUT schematic and embed a PDK-safe topology intent "
+            "hypothesis in the scaffold (default)."
+        ),
+    )
+    parser.add_argument(
+        "--no-infer-topology",
+        dest="infer_topology",
+        action="store_false",
+        help="Keep the legacy TODO-only topology section.",
+    )
+    parser.add_argument(
+        "--topology-intent-json",
+        default=None,
+        help=(
+            "Optional path to write the inferred topology intent JSON. "
+            "Useful for review and reuse by other tools."
+        ),
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose logging"
@@ -143,11 +169,40 @@ def main() -> int:
         tb_cell=args.tb_cell,
         scs_path=args.scs_path,
     )
+    topology_intent = None
+    if args.infer_topology:
+        try:
+            circuit = bridge.read_circuit(args.lib, args.cell)
+            topology_intent = infer_topology_intent(
+                circuit.get("instances") if isinstance(circuit, dict) else [],
+                design_vars=scaffold.get("design_vars") or [],
+                dut_pins=(scaffold.get("dut") or {}).get("pins") or [],
+            )
+            scaffold["topology_intent"] = topology_intent
+            logger.info(
+                "Inferred topology intent: class=%s confidence=%s",
+                topology_intent.get("circuit_class"),
+                topology_intent.get("confidence"),
+            )
+        except Exception as exc:  # noqa: BLE001 - scaffold should degrade
+            logger.warning(
+                "Topology inference failed (%s: %s); scaffold will keep "
+                "manual TODO topology placeholders.",
+                type(exc).__name__, scrub(str(exc)),
+            )
 
-    markdown = render_spec_scaffold(scaffold)
+    markdown = render_spec_scaffold(scaffold, topology_intent)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(markdown, encoding="utf-8")
+    if topology_intent and args.topology_intent_json:
+        intent_path = Path(args.topology_intent_json)
+        intent_path.parent.mkdir(parents=True, exist_ok=True)
+        intent_path.write_text(
+            json.dumps(topology_intent, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        logger.info("Wrote topology intent JSON to %s", intent_path)
     logger.info(
         "Wrote scaffold (%d chars, %d pins DUT + %d pins TB, "
         "%d desVars, %d analyses) to %s",

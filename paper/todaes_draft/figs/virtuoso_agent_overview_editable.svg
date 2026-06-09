@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, Helvetica, sans-serif; fill: #111827; }
+      .h1 { font: 700 24px Arial, Helvetica, sans-serif; fill: #111827; }
+      .h2 { font: 700 18px Arial, Helvetica, sans-serif; fill: #111827; }
+      .body { font: 15px Arial, Helvetica, sans-serif; fill: #1f2937; }
+      .small { font: 13px Arial, Helvetica, sans-serif; fill: #374151; }
+      .mono { font: 14px Consolas, "Courier New", monospace; fill: #111827; }
+      .box { fill: #ffffff; stroke: #1f2937; stroke-width: 2; rx: 14; }
+      .blue { fill: #eef6ff; stroke: #2563eb; }
+      .green { fill: #eefaf1; stroke: #16a34a; }
+      .purple { fill: #f3efff; stroke: #7c3aed; }
+      .yellow { fill: #fff8db; stroke: #d97706; }
+      .red { fill: #fff1f2; stroke: #dc2626; }
+      .arrow { stroke: #2563eb; stroke-width: 4; fill: none; marker-end: url(#arrowBlue); }
+      .return { stroke: #7c3aed; stroke-width: 4; fill: none; marker-end: url(#arrowPurple); }
+      .guard { stroke: #15803d; stroke-width: 5; fill: none; marker-end: url(#arrowGreen); }
+      .dash { fill: none; stroke: #dc2626; stroke-width: 4; stroke-dasharray: 14 12; rx: 24; }
+    </style>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="900" fill="#ffffff"/>
+  <text x="60" y="60" class="title">Virtuoso-Agent: NDA-Safe Closed-Loop Analog Sizing</text>
+
+  <!-- LLM cloud -->
+  <path d="M130 380 C80 375 60 338 76 304 C45 285 51 236 92 222 C102 174 154 151 197 178 C231 143 291 157 307 205 C352 211 380 250 362 291 C402 314 394 367 350 382 Z"
+        fill="#eef6ff" stroke="#2563eb" stroke-width="4"/>
+  <text x="210" y="254" text-anchor="middle" class="h1">Cloud LLM</text>
+  <text x="210" y="282" text-anchor="middle" class="body">reasoning + proposals</text>
+  <text x="210" y="307" text-anchor="middle" class="small">no PDK, no raw paths</text>
+  <text x="210" y="332" text-anchor="middle" class="mono">JSON actions</text>
+
+  <!-- Agent -->
+  <rect x="450" y="250" width="180" height="140" class="box blue"/>
+  <text x="540" y="292" text-anchor="middle" class="h2">Agent</text>
+  <text x="540" y="320" text-anchor="middle" class="body">planning loop</text>
+  <text x="540" y="345" text-anchor="middle" class="body">contract repair</text>
+  <text x="540" y="370" text-anchor="middle" class="body">best-so-far</text>
+
+  <!-- SafeBridge -->
+  <rect x="700" y="165" width="290" height="320" class="box green"/>
+  <text x="845" y="205" text-anchor="middle" class="h1">SafeBridge</text>
+  <text x="845" y="232" text-anchor="middle" class="body">guarded interface</text>
+  <rect x="730" y="255" width="230" height="48" class="box" fill="#ffffff"/>
+  <text x="845" y="285" text-anchor="middle" class="body">whitelist design vars</text>
+  <rect x="730" y="315" width="230" height="48" class="box" fill="#ffffff"/>
+  <text x="845" y="345" text-anchor="middle" class="body">scrub paths/models</text>
+  <rect x="730" y="375" width="230" height="48" class="box" fill="#ffffff"/>
+  <text x="845" y="405" text-anchor="middle" class="body">audit transcripts</text>
+  <rect x="730" y="435" width="230" height="36" class="box" fill="#ffffff"/>
+  <text x="845" y="459" text-anchor="middle" class="body">scoped write APIs</text>
+
+  <!-- NDA boundary -->
+  <rect x="1080" y="105" width="430" height="600" class="dash"/>
+  <text x="1295" y="90" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="26" fill="#dc2626">
+    NDA / PDK Safety Boundary
+  </text>
+
+  <!-- Cadence / Maestro -->
+  <rect x="1130" y="145" width="320" height="160" class="box blue"/>
+  <text x="1290" y="182" text-anchor="middle" class="h1">Virtuoso / Maestro</text>
+  <rect x="1155" y="205" width="82" height="70" class="box" fill="#ffffff"/>
+  <text x="1196" y="245" text-anchor="middle" class="small">schematic</text>
+  <rect x="1250" y="205" width="82" height="70" class="box" fill="#ffffff"/>
+  <text x="1291" y="245" text-anchor="middle" class="small">setup</text>
+  <rect x="1345" y="205" width="82" height="70" class="box" fill="#ffffff"/>
+  <text x="1386" y="245" text-anchor="middle" class="small">vars</text>
+
+  <!-- Spectre -->
+  <rect x="1130" y="365" width="320" height="110" class="box purple"/>
+  <text x="1290" y="405" text-anchor="middle" class="h1">Spectre / OCEAN</text>
+  <text x="1290" y="435" text-anchor="middle" class="body">simulation + result readback</text>
+
+  <!-- PDK -->
+  <rect x="1210" y="555" width="160" height="105" class="box red"/>
+  <text x="1290" y="590" text-anchor="middle" class="h2">PDK / Models</text>
+  <text x="1290" y="618" text-anchor="middle" class="body">confidential</text>
+  <text x="1290" y="644" text-anchor="middle" class="small">not serialized</text>
+
+  <!-- Results -->
+  <rect x="1020" y="560" width="135" height="95" class="box yellow"/>
+  <text x="1087" y="596" text-anchor="middle" class="h2">Metrics</text>
+  <text x="1087" y="623" text-anchor="middle" class="small">AC / DC / sweep</text>
+  <text x="1087" y="646" text-anchor="middle" class="small">OP scalars</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M365 315 L445 315"/>
+  <path class="arrow" d="M630 315 L695 315"/>
+  <path class="guard" d="M990 315 L1122 245"/>
+  <path class="guard" d="M990 350 L1122 410"/>
+  <path class="return" d="M1130 575 C1000 600 970 555 930 490"/>
+  <path class="return" d="M730 490 C585 600 345 615 230 385"/>
+  <path class="arrow" d="M1290 305 L1290 360"/>
+  <path class="arrow" d="M1290 475 L1290 550"/>
+  <path class="return" d="M1130 475 L1095 555"/>
+
+  <!-- Legend -->
+  <rect x="60" y="760" width="1480" height="90" fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" rx="10"/>
+  <line x1="100" y1="805" x2="170" y2="805" class="arrow"/>
+  <text x="190" y="811" class="body">validated actions</text>
+  <line x1="360" y1="805" x2="430" y2="805" class="return"/>
+  <text x="450" y="811" class="body">scrubbed observations</text>
+  <line x1="660" y1="805" x2="730" y2="805" class="guard"/>
+  <text x="750" y="811" class="body">guarded channel</text>
+  <line x1="965" y1="805" x2="1040" y2="805" stroke="#dc2626" stroke-width="4" stroke-dasharray="14 12"/>
+  <text x="1060" y="811" class="body">NDA / PDK boundary</text>
+</svg>

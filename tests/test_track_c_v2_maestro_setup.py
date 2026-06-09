@@ -146,9 +146,30 @@ class TestSchemaValidator:
             {"name": "x", "signal_name": "/V", "expr": "rms(VT(/V))"},
         ]})
         assert err is not None and "exactly one" in err
-        # Neither present — error.
         err = validate_maestro_setup_block({"outputs": [{"name": "x"}]})
         assert err is not None and "exactly one" in err
+
+    def test_output_analysis_tag_accepts_matching_probe_family(self):
+        assert validate_maestro_setup_block({"outputs": [
+            {"name": "gain", "analysis": "ac", "expr": "db20(mag(VF(/V)))"},
+            {"name": "vp_dc", "analysis": "dc", "signal_name": "/Vp"},
+        ]}) is None
+
+    def test_output_analysis_tag_rejects_ac_dc_probe_mixups(self):
+        err = validate_maestro_setup_block({"outputs": [
+            {"name": "gain", "analysis": "ac", "expr": "rms(VT(/V))"},
+        ]})
+        assert err is not None
+        assert "analysis='ac'" in err
+        assert "VT()/IT()" in err
+
+        err = validate_maestro_setup_block({"outputs": [
+            {"name": "vcm", "analysis": "dc", "expr": "average(VT(/V))"},
+        ]})
+        assert err is not None
+        assert "analysis='dc'" in err
+        assert "waveform probes" in err
+        # Neither present — error.
 
     @pytest.mark.parametrize("block,value", [
         ("tests",    "not a list"),

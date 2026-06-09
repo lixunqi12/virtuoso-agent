@@ -63,6 +63,54 @@ def agent():
     )
 
 
+def test_transcript_records_llm_telemetry(agent, tmp_path):
+    import json as _json
+
+    payload = {
+        "iteration": 1,
+        "design_vars": {"C": "1.5f"},
+        "measurements": {"f_osc_GHz": 20.0},
+        "pass_fail": {"f_osc_GHz": "PASS"},
+        "reasoning": "mock",
+    }
+    agent.llm.chat.return_value = _json.dumps(payload)
+    agent.llm.last_usage = {"provider": "mock", "total_tokens": 7}
+    agent.llm.last_telemetry = {
+        "provider": "mock",
+        "model": "unit-test",
+        "status": "ok",
+        "event_count": 1,
+    }
+    agent.bridge.run_ocean_sim.return_value = {
+        "ok": True,
+        "measurements": {"f_osc_GHz": 20.0, "amp_hold_ratio": 0.95},
+    }
+    agent.bridge.read_circuit.return_value = {"instances": []}
+    agent.bridge._scope_lib = "pll"
+    agent.bridge._scope_tb_cell = "LC_VCO_tb"
+    agent.bridge._scope_session = None
+
+    transcript = tmp_path / "telemetry.jsonl"
+    result = agent.run(
+        "pll",
+        "LC_VCO",
+        "LC_VCO_tb",
+        max_iter=1,
+        transcript_path=transcript,
+        writeback_enabled=False,
+    )
+
+    assert result["last_llm_telemetry"]["provider"] == "mock"
+    entries = [
+        _json.loads(line)
+        for line in transcript.read_text(encoding="utf-8").splitlines()
+    ]
+    assistant_entries = [e for e in entries if e["role"] == "assistant"]
+    assert assistant_entries
+    assert assistant_entries[0]["llm_telemetry"]["model"] == "unit-test"
+    assert assistant_entries[0]["usage"]["total_tokens"] == 7
+
+
 # ---------------------------------------------------------------- #
 #  _all_pass Ã¢â‚¬â€ convergence predicate
 # ---------------------------------------------------------------- #
@@ -782,6 +830,14 @@ class TestParseLlmResponse:
         data = CircuitAgent._parse_llm_response(text)
         assert data == {"design_vars": {"C0": "50f"}}
 
+    def test_bare_json_fallback_skips_invalid_earlier_object(self):
+        text = (
+            'analysis {"design_vars": } then '
+            '{"design_vars": {"C0": "50f"}} trailing'
+        )
+        data = CircuitAgent._parse_llm_response(text)
+        assert data == {"design_vars": {"C0": "50f"}}
+
     def test_no_json_returns_empty_dict(self):
         data = CircuitAgent._parse_llm_response("no json here, sorry")
         assert data == {}
@@ -856,6 +912,8 @@ class TestSpecEmbedding:
         assert "G=Vin_p" in prompt
         assert "D=net3" in prompt
         assert "fingers=nfin_n" in prompt
+        assert "## Topology Intent (PDK-safe hypothesis)" in prompt
+        assert "Topology hypothesis" in prompt
         agent.bridge.read_circuit.assert_called_once_with("pll", "opamp")
 
 
@@ -1371,6 +1429,190 @@ class TestRepairFlowE2E:
             m for m in repair_call_msgs if m["role"] == "user"
         ]
         assert any("HARD CONSTRAINTS" in m["content"] for m in repair_user_msgs)
+        assert any("Return ONLY one fenced JSON block" in m["content"]
+                   for m in repair_user_msgs)
+        assert result["protocol_violations"]["contract_violations"] == 1
+        assert result["protocol_violations"]["repair_attempts"] == 1
+        assert result["protocol_violations"]["context_compactions"] == 1
+        assert result["protocol_violations"]["json_parse_failures"] == 0
+        assert (
+            result["protocol_violations"]["max_bad_response_chars"]
+            >= len(bad_resp)
+        )
+
+    def test_discovered_fixed_stimulus_vars_are_sent_to_ocean(
+        self, tmp_path
+    ):
+        """Non-editable safe desVars still seed OCEAN desVar baselines."""
+        import json
+
+        resp = json.dumps({
+            "iteration": 1,
+            "design_vars": {"C": "2f"},
+            "measurements": {"f_osc_GHz": 20.0},
+            "pass_fail": {"f_osc_GHz": "PASS"},
+            "reasoning": "tuned editable cap only",
+        })
+        llm = MagicMock()
+        llm.chat.return_value = resp
+
+        bridge = MagicMock()
+        bridge._scope_lib = "pll"
+        bridge._scope_tb_cell = "LC_VCO_tb"
+        bridge.list_design_vars.return_value = [
+            {"name": "C", "default": "1f"},
+            {"name": "Vctrl", "default": "0.4"},
+        ]
+        bridge.list_analyses.return_value = [{"name": "tran", "kwargs": []}]
+        bridge.run_ocean_sim.return_value = {
+            "ok": True,
+            "resultsDir": "/tmp",
+            "varsApplied": 2,
+            "analyses": ["tran"],
+            "measurements": {"f_osc_GHz": 20.0},
+        }
+        bridge._is_allowed_param_name.return_value = True
+        bridge.read_circuit.return_value = {"instances": []}
+        bridge.last_results_dir = "/sim/out"
+        bridge.read_dc_op_point_from_results.return_value = {}
+
+        agent = CircuitAgent(
+            bridge=bridge,
+            llm=llm,
+            spec={"f_osc": "19.5"},
+            analysis_type="tran",
+            ocean_worker=MagicMock(),
+            valid_design_vars=("C",),
+        )
+        agent.eval_block = None
+
+        agent.run(
+            "pll", "LC_VCO", "LC_VCO_tb",
+            max_iter=1,
+            scs_path="/fake/input.scs",
+            transcript_path=str(tmp_path / "t.jsonl"),
+            writeback_enabled=False,
+        )
+
+        sent = bridge.run_ocean_sim.call_args.kwargs["design_vars"]
+        assert sent["C"] == "2f"
+        assert sent["Vctrl"] == "0.4"
+
+    def test_non_json_response_is_compacted_before_repair(self, tmp_path):
+        """Huge prose replies stay in transcript but not repair context."""
+        import json
+
+        bad_resp = "Let me analyze the circuit.\n" + ("not-json " * 2000)
+        good_resp = json.dumps({
+            "iteration": 1,
+            "design_vars": {"C": "1.5f"},
+            "measurements": {"f_osc_GHz": 20.0},
+            "pass_fail": {"f_osc_GHz": "PASS"},
+            "reasoning": "tuned C",
+        })
+        agent, llm = self._make_agent_with_responses(
+            bad_resp,
+            good_resp,
+            good_resp,
+        )
+        transcript = tmp_path / "t.jsonl"
+        result = agent.run(
+            "pll", "LC_VCO", "LC_VCO_tb",
+            max_iter=1,
+            scs_path="/fake/input.scs",
+            transcript_path=str(transcript),
+        )
+
+        repair_call_msgs = llm.chat.call_args_list[1][0][0]
+        assistant_msgs = [
+            m for m in repair_call_msgs if m["role"] == "assistant"
+        ]
+        assert assistant_msgs
+        assert bad_resp not in [m["content"] for m in assistant_msgs]
+        assert any(
+            "Previous assistant response omitted from chat context"
+            in m["content"]
+            for m in assistant_msgs
+        )
+        assert all(len(m["content"]) < 1800 for m in assistant_msgs)
+        transcript_entries = [
+            json.loads(line)
+            for line in transcript.read_text(encoding="utf-8").splitlines()
+        ]
+        assert any(
+            entry["role"] == "assistant" and entry["content"] == bad_resp
+            for entry in transcript_entries
+        )
+        assert result["protocol_violations"]["contract_violations"] == 1
+        assert result["protocol_violations"]["repair_attempts"] == 1
+        assert result["protocol_violations"]["context_compactions"] == 1
+        assert result["protocol_violations"]["json_parse_failures"] == 1
+
+    def test_token_exhausted_non_json_uses_compact_rescue(self, tmp_path):
+        """Reasoning-model length exhaustion gets an isolated JSON rescue."""
+        import json
+
+        class _Telemetry:
+            def __init__(self, data):
+                self._data = data
+
+            def to_dict(self):
+                return self._data
+
+        bad_resp = "Let me analyze the circuit.\n" + ("reasoning " * 3000)
+        good_resp = json.dumps({
+            "iteration": 1,
+            "design_vars": {"C": "1.5f"},
+            "measurements": {"f_osc_GHz": 20.0},
+            "pass_fail": {"f_osc_GHz": "PASS"},
+            "reasoning": "compact repair",
+        })
+        agent, llm = self._make_agent_with_responses()
+        responses = [
+            (
+                bad_resp,
+                {
+                    "status": "ok",
+                    "finish_reason": "length",
+                    "visible_chars": 0,
+                    "reasoning_chars": len(bad_resp),
+                },
+            ),
+            (
+                good_resp,
+                {
+                    "status": "ok",
+                    "finish_reason": "stop",
+                    "visible_chars": len(good_resp),
+                    "reasoning_chars": 0,
+                },
+            ),
+        ]
+
+        def _chat(messages):
+            response, telemetry = responses.pop(0)
+            llm.last_telemetry = _Telemetry(telemetry)
+            return response
+
+        llm.chat.side_effect = _chat
+        transcript = tmp_path / "t.jsonl"
+
+        result = agent.run(
+            "pll", "LC_VCO", "LC_VCO_tb",
+            max_iter=1,
+            scs_path="/fake/input.scs",
+            transcript_path=str(transcript),
+        )
+
+        assert result["abort_reason"] is None
+        assert result["protocol_violations"]["compact_json_rescues"] == 1
+        assert result["protocol_violations"]["json_parse_failures"] == 1
+        repair_call_msgs = llm.chat.call_args_list[1][0][0]
+        assert len(repair_call_msgs) == 1
+        rescue_prompt = repair_call_msgs[0]["content"]
+        assert "Protocol rescue" in rescue_prompt
+        assert "Current design_vars baseline" in rescue_prompt
+        assert bad_resp not in rescue_prompt
 
     def test_writeback_can_be_disabled(self, tmp_path):
         """Benchmark ablations can suppress final Maestro persistence."""
@@ -2137,6 +2379,54 @@ class TestTopologyClassifierHspice:
         result = agent.run(max_iter=5)
         assert result["abort_reason"] is None
         assert result["converged"] is True
+
+    def test_hspice_repair_compacts_non_json_context(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+
+        agent, mod, EvaluationResult = self._build_agent(monkeypatch)
+        bad_resp = "Let me analyze the HSpice result.\n" + ("not-json " * 2000)
+        good_resp = self._llm_response({"nfin_cc": 12})
+        agent.llm.chat.side_effect = [bad_resp, good_resp]
+
+        pass_eval = EvaluationResult(
+            measurements={"f_osc": [19.9]},
+            pass_fail={"f_osc": "PASS"},
+            per_row_verdicts={"f_osc": ["PASS"]},
+        )
+        monkeypatch.setattr(
+            mod, "evaluate_hspice", lambda mt, m: pass_eval,
+        )
+
+        transcript = tmp_path / "hspice.jsonl"
+        result = agent.run(max_iter=1, transcript_path=transcript)
+        assert result["converged"] is True
+
+        repair_call_msgs = agent.llm.chat.call_args_list[1][0][0]
+        assistant_msgs = [
+            m for m in repair_call_msgs if m["role"] == "assistant"
+        ]
+        assert assistant_msgs
+        assert bad_resp not in [m["content"] for m in assistant_msgs]
+        assert any(
+            "Previous assistant response omitted from chat context"
+            in m["content"]
+            for m in assistant_msgs
+        )
+        repair_user_msgs = [
+            m for m in repair_call_msgs if m["role"] == "user"
+        ]
+        assert any("Return ONLY one fenced JSON block" in m["content"]
+                   for m in repair_user_msgs)
+        transcript_entries = [
+            json.loads(line)
+            for line in transcript.read_text(encoding="utf-8").splitlines()
+        ]
+        assert any(
+            entry["role"] == "assistant" and entry["content"] == bad_resp
+            for entry in transcript_entries
+        )
 
 
 # ---------------------------------------------------------------- #

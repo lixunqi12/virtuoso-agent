@@ -35,10 +35,12 @@ keeps running unchanged at agent startup.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from .safe_bridge import (
     SafeBridge,
+    _MAESTRO_ALLOWED_ANALYSES,
     _MAESTRO_RF_ANALYSIS_OPTIONS,
     _MAESTRO_RF_REQUIRED_OPTIONS,
     _format_maestro_analysis_option_value,
@@ -66,7 +68,7 @@ _OUTPUT_REQUIRED = frozenset({"name"})
 # optional (defaults to scoped tb_cell). ``output_type`` may be empty.
 # ``pass`` is the optional pass/fail bound (list/tuple of [lo, hi]).
 _OUTPUT_OPTIONAL = frozenset({
-    "test", "output_type", "signal_name", "expr", "pass",
+    "test", "analysis", "output_type", "signal_name", "expr", "pass",
 })
 _CORNER_REQUIRED = frozenset({"name"})
 _CORNER_OPTIONAL = frozenset({"model_file", "model_section", "variables"})
@@ -227,6 +229,9 @@ def _validate_entry(block: str, idx: int, entry: dict) -> str | None:
                 f"'signal_name' or 'expr' "
                 f"(got signal_name={has_signal}, expr={has_expr})"
             )
+        analysis_err = _validate_output_analysis_affinity(idx, entry)
+        if analysis_err is not None:
+            return analysis_err
         # ``pass`` (optional) — must be length-2 of [int|float|None].
         if "pass" in entry:
             pass_err = _validate_pass_bounds(
@@ -249,6 +254,56 @@ def _validate_entry(block: str, idx: int, entry: dict) -> str | None:
                 return var_err
         return None
     return None  # unreachable: MAESTRO_SETUP_KEYS already filters
+
+
+_OUTPUT_TRAN_PROBE_RE = re.compile(r"\b[VI]T\s*\(")
+_OUTPUT_AC_PROBE_RE = re.compile(r"\b[VI]F\s*\(")
+
+
+def _validate_output_analysis_affinity(idx: int, entry: dict) -> str | None:
+    """Validate optional ``outputs[].analysis`` metadata.
+
+    The current Maestro writer does not create truly analysis-scoped output
+    rows, but recipe authors can tag the intended domain. The tag lets the
+    contract layer catch the common AC/DC mixup where a DC-looking row uses
+    ``VT()`` or an AC row accidentally uses a transient-domain probe.
+    """
+    analysis = entry.get("analysis")
+    if analysis is None:
+        return None
+    if not isinstance(analysis, str):
+        return (
+            f"'outputs[{idx}].analysis' must be a string; "
+            f"got {type(analysis).__name__}"
+        )
+    if analysis not in _MAESTRO_ALLOWED_ANALYSES:
+        return (
+            f"'outputs[{idx}].analysis' must be one of "
+            f"{sorted(_MAESTRO_ALLOWED_ANALYSES)}; got {analysis!r}"
+        )
+    expr = entry.get("expr")
+    if not isinstance(expr, str) or not expr:
+        # signal_name rows are analysis-neutral at the writer layer.
+        return None
+    has_tran_probe = bool(_OUTPUT_TRAN_PROBE_RE.search(expr))
+    has_ac_probe = bool(_OUTPUT_AC_PROBE_RE.search(expr))
+    if analysis == "ac" and has_tran_probe:
+        return (
+            f"'outputs[{idx}]' is tagged analysis='ac' but uses VT()/IT(); "
+            "use VF()/IF() or retag it as tran."
+        )
+    if analysis == "tran" and has_ac_probe:
+        return (
+            f"'outputs[{idx}]' is tagged analysis='tran' but uses VF()/IF(); "
+            "use VT()/IT() or retag it as ac."
+        )
+    if analysis == "dc" and (has_tran_probe or has_ac_probe):
+        return (
+            f"'outputs[{idx}]' is tagged analysis='dc' but uses waveform "
+            "probes VT()/IT()/VF()/IF(); use signal_name or a DC/OP-specific "
+            "expression instead."
+        )
+    return None
 
 
 def _validate_scalar_dict(value: Any, label: str) -> str | None:

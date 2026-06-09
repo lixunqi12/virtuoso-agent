@@ -50,10 +50,10 @@ from scripts.run_benchmark import (  # noqa: E402
 # ====================================================================== #
 
 class TestGridConfig:
-    def test_eleven_checkpoints(self):
-        """User-approved 10+1 expansion: 3 Anthropic + 2 OpenAI + 4
-        China-domestic + 1 Gemini + 1 DeepSeek-flash = 11."""
-        assert len(CHECKPOINTS) == 11
+    def test_twelve_checkpoints(self):
+        """User-approved expansion: 3 Anthropic + 2 OpenAI + 6
+        China-domestic + 1 Gemini = 12."""
+        assert len(CHECKPOINTS) == 12
 
     def test_three_seeds(self):
         assert SEEDS == [1, 2, 3]
@@ -78,6 +78,13 @@ class TestGridConfig:
         assert "deepseek-v4-pro" in names
         assert "deepseek-v4-flash" in names
 
+    def test_current_requested_model_updates_present(self):
+        by_name = {c["name"]: c for c in CHECKPOINTS}
+        assert "claude-opus-4-7" not in by_name
+        assert by_name["claude-opus-4-8"]["model"] == "claude-opus-4-8"
+        assert by_name["minimax-m3"]["llm"] == "minimax"
+        assert by_name["minimax-m3"]["model"] == "MiniMax-M3"
+
 
 # ====================================================================== #
 #  State file                                                            #
@@ -95,9 +102,9 @@ class TestStateFile:
     def test_save_load_roundtrip(self, tmp_path):
         state_path = tmp_path / "state.json"
         results = {
-            "claude-opus-4-7::seed1": CellResult(
-                cell_key="claude-opus-4-7::seed1",
-                ckpt_name="claude-opus-4-7",
+            "claude-opus-4-8::seed1": CellResult(
+                cell_key="claude-opus-4-8::seed1",
+                ckpt_name="claude-opus-4-8",
                 seed=1,
                 timestamp="20260512_120000",
                 transcript_path="/tmp/t.jsonl",
@@ -111,9 +118,9 @@ class TestStateFile:
         }
         save_state(state_path, results)
         loaded = load_state(state_path)
-        assert "claude-opus-4-7::seed1" in loaded
-        assert loaded["claude-opus-4-7::seed1"].outcome == "PASS"
-        assert loaded["claude-opus-4-7::seed1"].wall_clock_s == 42.0
+        assert "claude-opus-4-8::seed1" in loaded
+        assert loaded["claude-opus-4-8::seed1"].outcome == "PASS"
+        assert loaded["claude-opus-4-8::seed1"].wall_clock_s == 42.0
 
     def test_save_state_atomic_rename(self, tmp_path):
         """Atomic write: write to .tmp then rename. Verifies the tmp
@@ -131,7 +138,7 @@ class TestStateFile:
 class TestEnumerateCells:
     def test_full_grid(self):
         cells = enumerate_cells(CHECKPOINTS, SEEDS, None, None)
-        assert len(cells) == len(CHECKPOINTS) * len(SEEDS) == 33
+        assert len(cells) == len(CHECKPOINTS) * len(SEEDS) == 36
 
     def test_ckpt_filter(self):
         cells = enumerate_cells(
@@ -247,7 +254,7 @@ class TestDryRun:
         """Dry-run must NOT invoke subprocess — protects against
         accidental API spend. Patches subprocess.run with a sentinel
         that explodes if called."""
-        cell = Cell(ckpt_name="claude-opus-4-7", seed=1)
+        cell = Cell(ckpt_name="claude-opus-4-8", seed=1)
         ckpt = CHECKPOINTS[0]
         with patch("scripts.run_benchmark.subprocess.run") as mock_run:
             result = execute_cell(
@@ -255,7 +262,7 @@ class TestDryRun:
             )
         mock_run.assert_not_called()
         assert result.outcome == "DRY_RUN"
-        assert result.cell_key == "claude-opus-4-7::seed1"
+        assert result.cell_key == "claude-opus-4-8::seed1"
 
     def test_run_grid_dry_run_marks_all_dry(self, tmp_path):
         state = tmp_path / "state.json"
@@ -315,8 +322,8 @@ class TestResume:
     def test_resume_skips_pass(self, tmp_path):
         state = tmp_path / "state.json"
         prior = {
-            "claude-opus-4-7::seed1": self._make_result(
-                "claude-opus-4-7", 1, "PASS",
+            "claude-opus-4-8::seed1": self._make_result(
+                "claude-opus-4-8", 1, "PASS",
             ),
         }
         save_state(state, prior)
@@ -412,8 +419,8 @@ class TestResume:
     def test_no_resume_replays_everything(self, tmp_path):
         state = tmp_path / "state.json"
         prior = {
-            "claude-opus-4-7::seed1": self._make_result(
-                "claude-opus-4-7", 1, "PASS",
+            "claude-opus-4-8::seed1": self._make_result(
+                "claude-opus-4-8", 1, "PASS",
             ),
         }
         save_state(state, prior)

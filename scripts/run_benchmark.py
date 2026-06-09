@@ -5,8 +5,8 @@ Scaffold-only: by default this prints the planned execution grid and
 exits WITHOUT firing any LLM call. Live execution requires --execute
 AND a non-empty .env with the relevant *_API_KEY values populated.
 
-Grid (11 checkpoints x 3 seeds x 1 spec = 33 runs):
-    11 LLM checkpoints     -- see CHECKPOINTS below
+Grid (12 checkpoints x 3 seeds x 1 spec = 36 runs):
+    12 LLM checkpoints     -- see CHECKPOINTS below
     3  seed replicates     -- seeds [1, 2, 3]; treated as replicate
                               labels, NOT determinism guarantees (most
                               reasoning-LLM vendor APIs don't honor
@@ -88,20 +88,21 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Grid configuration                                                     #
 # ---------------------------------------------------------------------- #
 
-# 11 LLM checkpoints. `name` is the filename slug (no spaces/colons).
+# 12 LLM checkpoints. `name` is the filename slug (no spaces/colons).
 # `llm` is the factory key (matches src.llm_client.create_llm_client).
 # `model` is the vendor model_id string (overrides the env default).
 CHECKPOINTS: list[dict[str, str]] = [
     # Anthropic — 3 tiers
-    {"name": "claude-opus-4-7",   "llm": "claude",   "model": "claude-opus-4-7"},
+    {"name": "claude-opus-4-8",   "llm": "claude",   "model": "claude-opus-4-8"},
     {"name": "claude-sonnet-4-6", "llm": "claude",   "model": "claude-sonnet-4-6"},
     {"name": "claude-haiku-4-5",  "llm": "claude",   "model": "claude-haiku-4-5-20251001"},
     # OpenAI — 2 tiers
     {"name": "gpt-5.5",           "llm": "openai",   "model": "gpt-5.5"},
     {"name": "gpt-5.4-mini",      "llm": "openai",   "model": "gpt-5.4-mini"},
-    # China-domestic — 4 tiers (SP4)
+    # China-domestic — 6 tiers (SP4)
     {"name": "kimi-k2.5",         "llm": "kimi",     "model": "kimi-k2.5"},
     {"name": "minimax-m2.7",      "llm": "minimax",  "model": "MiniMax-M2.7"},
+    {"name": "minimax-m3",        "llm": "minimax",  "model": "MiniMax-M3"},
     {"name": "mimo-v2.5-pro",     "llm": "mimo",     "model": "mimo-v2.5-pro"},
     {"name": "deepseek-v4-pro",   "llm": "deepseek", "model": "deepseek-v4-pro"},
     {"name": "deepseek-v4-flash", "llm": "deepseek", "model": "deepseek-v4-flash"},

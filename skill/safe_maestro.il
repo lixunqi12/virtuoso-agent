@@ -353,6 +353,51 @@ procedure(safeMaeWriteAndSave(libName cellName varList)
 
 
 ;;; ----------------------------------------------------------------
+;;; safeMaeSaveSetup -- save the already-open Maestro setup without
+;;; changing design variables.  Used after analyses / outputs / specs
+;;; edits so recipe-driven setup changes persist without resetting the
+;;; current optimized variable values.
+;;; ----------------------------------------------------------------
+procedure(safeMaeSaveSetup(libName cellName)
+    prog((session result)
+        unless(safeSetParam_validateName(libName "lib")
+            return("{\"ok\":false,\"error\":\"Invalid library name\"}")
+        )
+        unless(safeSetParam_validateName(cellName "cell")
+            return("{\"ok\":false,\"error\":\"Invalid cell name\"}")
+        )
+
+        session = safeMaestro_findSessionForScope(libName cellName)
+        unless(session
+            return(strcat(
+                "{\"ok\":false,\"error\":\""
+                "No open Maestro session for scope -- open Maestro for the "
+                "scoped testbench cell in ADE before retrying."
+                "\"}"
+            ))
+        )
+
+        result = nil
+        unless(errset(result = maeSaveSetup(?lib libName
+                                            ?cell cellName
+                                            ?view "maestro"
+                                            ?session session))
+            return("{\"ok\":false,\"error\":\"maeSaveSetup raised\"}")
+        )
+        unless(result
+            return("{\"ok\":false,\"error\":\"maeSaveSetup returned nil\"}")
+        )
+        return(strcat(
+            "{\"ok\":true,"
+            "\"saved\":true,"
+            "\"session\":\"" safeHelpers_jsonEscape(session) "\""
+            "}"
+        ))
+    )
+)
+
+
+;;; ----------------------------------------------------------------
 ;;; safeMaeSetupSummary -- read-only bounded setup summary.
 ;;;
 ;;; Returns only safe setup metadata needed by PC-side verification:
