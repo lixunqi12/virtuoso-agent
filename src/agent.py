@@ -1013,7 +1013,7 @@ class CircuitAgent:
             }
         messages.append({"role": "assistant", "content": response})
         _append_transcript(
-            0, "assistant", response,
+            0, "assistant", scrub(response),
             usage=getattr(self.llm, "last_usage", None),
             telemetry=_llm_telemetry_dict(self.llm),
         )
@@ -1149,7 +1149,11 @@ class CircuitAgent:
                 maestro_test=maestro_test,
             )
 
-        if self.eval_block is not None and maestro_setup_test is not None:
+        if (
+            self.eval_block is not None
+            and maestro_setup_test is not None
+            and self.allow_llm_maestro_setup
+        ):
             try:
                 sync_summary = sync_spec_metrics_to_maestro(
                     self.bridge, self.eval_block,
@@ -1310,9 +1314,13 @@ class CircuitAgent:
                         repair_reason,
                         self.valid_design_var_names,
                     )
-                    repair_call_messages = messages
+                    repair_call_messages = None
                 messages.append({"role": "user", "content": repair_msg})
                 _append_transcript(i + 1, "user", repair_msg)
+                if repair_call_messages is None:
+                    # Window AFTER the append so the repair prompt is
+                    # part of the provider call.
+                    repair_call_messages = _windowed_messages(messages)
                 try:
                     response = self.llm.chat(repair_call_messages)
                 except Exception as exc:  # noqa: BLE001 - fail gracefully
@@ -1327,7 +1335,7 @@ class CircuitAgent:
                     break
                 messages.append({"role": "assistant", "content": response})
                 _append_transcript(
-                    i + 1, "assistant", response,
+                    i + 1, "assistant", scrub(response),
                     usage=getattr(self.llm, "last_usage", None),
                     telemetry=_llm_telemetry_dict(self.llm),
                 )
@@ -1381,7 +1389,7 @@ class CircuitAgent:
             # of leaving the testbench Outputs Setup empty for the rest
             # of the run (R2 P3 NIT 3).
             setup_payload: dict | None = None
-            if self.eval_block is not None:
+            if self.eval_block is not None and self.allow_llm_maestro_setup:
                 if not self._maestro_setup_applied and maestro_setup_test is not None:
                     setup_payload = self._derive_maestro_setup_from_spec(
                         maestro_setup_test,
@@ -1410,6 +1418,7 @@ class CircuitAgent:
                         i + 1, type(exc).__name__, exc,
                     )
 
+            forced_perturb_block = ""
             new_vars = parsed.get("design_vars", {}) or {}
             llm_measurements = parsed.get("measurements", {}) or {}
             llm_pass_fail = parsed.get("pass_fail", {}) or {}
@@ -1467,6 +1476,40 @@ class CircuitAgent:
                     perturb_ok, perturb_keys = _auto_perturb_ibias(
                         accumulated_vars, factor=2.0,
                     )
+                    # R1c (2026-06-14): the perturbation above silently
+                    # mutates accumulated_vars, but the model never learns
+                    # it happened and overwrites it next turn -- so forced
+                    # exploration was a no-op. Surface it in the next prompt
+                    # so the model keeps the perturbed point (or pivots to
+                    # other variables when the knob is already capped).
+                    if perturb_ok and perturb_keys:
+                        _pk = perturb_keys[0]
+                        _old = proposed_vars_snapshot.get(_pk)
+                        _new = accumulated_vars.get(_pk)
+                        if str(_old) != str(_new):
+                            forced_perturb_block = (
+                                "## Forced exploration (anti-stall)\n"
+                                "You repeated an identical design vector "
+                                "while metrics still failed. To break the "
+                                "stall the platform forcibly changed "
+                                f"{_pk} from {_old} to {_new} this "
+                                "iteration; this value was set by the "
+                                "platform, not by you. Do NOT revert it -- "
+                                "keep exploring from this new point and "
+                                "change other variables to close the "
+                                "remaining metrics.\n\n"
+                            )
+                        else:
+                            forced_perturb_block = (
+                                "## Forced exploration (anti-stall)\n"
+                                "You repeated an identical design vector and "
+                                f"{_pk} is already at its ceiling "
+                                f"({_new}); it cannot be raised further. "
+                                "Stop adjusting it and change OTHER variables "
+                                "(device sizing, tank C/L, mirror ratios) to "
+                                "move the operating point and the K_VCO "
+                                "profile.\n\n"
+                            )
                     # R1b: observability — write guard event to JSONL
                     # transcript so post-hoc debugging doesn't require
                     # cross-referencing loggers.
@@ -1983,6 +2026,14 @@ class CircuitAgent:
                 context="stage-level op-point diagnostics",
             )
             history_brief = self._format_history_brief()
+            tried_points_table = self._format_tried_points_table()
+            tried_points_block = (
+                "## All evaluated design points (full-run memory)\n"
+                "Re-proposing any vector below returns identical results "
+                "and wastes an iteration; always move to a new point.\n"
+                f"{tried_points_table}\n\n"
+                if tried_points_table else ""
+            )
             # Plan ★ (2026-04-19): merge cached topology with current
             # accumulated_vars so Kimi sees which physical instance each
             # desVar drives and its live value this iteration. Empty
@@ -2021,6 +2072,7 @@ class CircuitAgent:
                     last_tuning_measurements, last_tuning_pass_fail,
                 ) if last_tuning_pass_fail else ""
                 next_prompt = (
+                    f"{forced_perturb_block}"
                     f"{topology_block}"
                     f"{topology_intent_block}"
                     f"## Iteration {i + 1} measurements (platform-computed)\n"
@@ -2032,6 +2084,7 @@ class CircuitAgent:
                     f"{stage_block}"
                     f"## OCEAN run meta\n{sim_summary}\n\n"
                     f"## History\n{history_brief}\n\n"
+                    f"{tried_points_block}"
                     "Emit the next JSON block. `measurements` and "
                     "`pass_fail` you emit are advisory only — the "
                     "platform recomputes them from the dump next turn. "
@@ -2048,6 +2101,7 @@ class CircuitAgent:
                 )
             else:
                 next_prompt = (
+                    f"{forced_perturb_block}"
                     f"{topology_block}"
                     f"{topology_intent_block}"
                     f"## Iteration {i + 1} OCEAN result\n{sim_summary}\n\n"
@@ -2055,6 +2109,7 @@ class CircuitAgent:
                     f"{op_point_summary}\n\n"
                     f"{stage_block}"
                     f"## History\n{history_brief}\n\n"
+                    f"{tried_points_block}"
                     "Emit the next JSON block. If every pass_fail entry was "
                     "PASS, repeat the same design_vars and mark all PASS — "
                     "the agent will stop on its own."
@@ -2080,7 +2135,7 @@ class CircuitAgent:
             messages.append({"role": "user", "content": next_prompt})
             _append_transcript(i + 1, "user", next_prompt)
             try:
-                response = self.llm.chat(messages)
+                response = self.llm.chat(_windowed_messages(messages))
             except Exception as exc:  # noqa: BLE001 - provider outage
                 safe_exc = scrub(f"{type(exc).__name__}: {exc}")
                 logger.error(
@@ -2092,7 +2147,7 @@ class CircuitAgent:
                 break
             messages.append({"role": "assistant", "content": response})
             _append_transcript(
-                i + 1, "assistant", response,
+                i + 1, "assistant", scrub(response),
                 usage=getattr(self.llm, "last_usage", None),
                 telemetry=_llm_telemetry_dict(self.llm),
             )
@@ -3123,6 +3178,34 @@ class CircuitAgent:
             )
         return "\n".join(lines)
 
+    def _format_tried_points_table(self) -> str:
+        """Compact full-run memory: one line per evaluated design point.
+
+        ``_format_history_brief`` carries detail for only the last five
+        iterations, so on long runs earlier points fall out of view and
+        the LLM can re-propose them. This table is one short line per
+        iteration and is regenerated every turn, keeping every evaluated
+        vector visible for the whole run.
+        """
+        if not self.history:
+            return ""
+        lines = []
+        for rec in self.history:
+            verdicts = list(rec.pass_fail.values())
+            n_pass = sum(
+                1 for v in verdicts
+                if isinstance(v, str) and v.startswith("PASS")
+            )
+            status = (
+                "MET" if rec.meets_spec
+                else f"{n_pass}/{len(verdicts)} pass"
+            )
+            vars_compact = " ".join(
+                f"{k}={v}" for k, v in sorted(rec.design_vars.items())
+            )
+            lines.append(f"- iter {rec.iteration} [{status}] {vars_compact}")
+        return "\n".join(lines)
+
     def get_optimization_report(self) -> str:
         """Generate a full optimization history report."""
         lines = ["# Optimization Report", ""]
@@ -3142,6 +3225,38 @@ class CircuitAgent:
 
 # ---------------------------------------------------------------------- #
 #  Module-level helpers
+
+
+def _llm_history_window_pairs() -> int:
+    """Sliding-window size (user/assistant pairs) for provider calls.
+
+    ``LLM_HISTORY_WINDOW_PAIRS`` <= 0 disables windowing (full replay).
+    """
+    raw = os.environ.get("LLM_HISTORY_WINDOW_PAIRS", "6")
+    try:
+        return int(raw)
+    except ValueError:
+        return 6
+
+
+def _windowed_messages(
+    messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Bounded conversation replay: first message + last N exchanges.
+
+    The first user message pins the contract, spec, and topology; each
+    iteration's feedback message is self-contained (metrics, op-point
+    table, history brief, tried-points table), so dropping middle turns
+    loses no evidence while keeping the provider-call context flat on
+    long runs. The slice length is even, so the kept tail starts with an
+    assistant message and user/assistant alternation is preserved. The
+    caller's ``messages`` list itself is never mutated — transcripts and
+    repair logic still see the full conversation.
+    """
+    pairs = _llm_history_window_pairs()
+    if pairs <= 0 or len(messages) <= 1 + 2 * pairs:
+        return messages
+    return [messages[0]] + messages[-2 * pairs:]
 # ---------------------------------------------------------------------- #
 
 
@@ -4214,7 +4329,7 @@ class HspiceAgent:
         response = self.llm.chat(messages)
         messages.append({"role": "assistant", "content": response})
         _append_transcript(
-            0, "assistant", response,
+            0, "assistant", scrub(response),
             usage=getattr(self.llm, "last_usage", None),
             telemetry=_llm_telemetry_dict(self.llm),
         )
@@ -4249,10 +4364,10 @@ class HspiceAgent:
                 )
                 messages.append({"role": "user", "content": repair_msg})
                 _append_transcript(i + 1, "user", repair_msg)
-                response = self.llm.chat(messages)
+                response = self.llm.chat(_windowed_messages(messages))
                 messages.append({"role": "assistant", "content": response})
                 _append_transcript(
-                    i + 1, "assistant", response,
+                    i + 1, "assistant", scrub(response),
                     usage=getattr(self.llm, "last_usage", None),
                     telemetry=_llm_telemetry_dict(self.llm),
                 )
@@ -4376,10 +4491,10 @@ class HspiceAgent:
             )
             messages.append({"role": "user", "content": next_prompt})
             _append_transcript(i + 1, "user", next_prompt)
-            response = self.llm.chat(messages)
+            response = self.llm.chat(_windowed_messages(messages))
             messages.append({"role": "assistant", "content": response})
             _append_transcript(
-                i + 1, "assistant", response,
+                i + 1, "assistant", scrub(response),
                 usage=getattr(self.llm, "last_usage", None),
                 telemetry=_llm_telemetry_dict(self.llm),
             )

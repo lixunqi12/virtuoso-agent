@@ -796,6 +796,43 @@ def test_write_sweep_manifest_accepts_int_vctrl(bridge, monkeypatch):
     assert n == 1
 
 
+def test_clear_sweep_results_invokes_safe_entrypoint(bridge, monkeypatch):
+    seen_exprs: list[str] = []
+
+    def fake_exec(expr):
+        seen_exprs.append(expr)
+        return {
+            "ok": True,
+            "cleared": True,
+            "archive": "/home/u/sim/Interactive.0.stale_001",
+        }
+
+    monkeypatch.setattr(bridge, "_execute_skill_json", fake_exec)
+    out = bridge.clear_sweep_results("/home/u/sim/Interactive.0")
+    assert out["ok"] is True
+    assert seen_exprs == ['safeClearSweepResults("/home/u/sim/Interactive.0")']
+
+
+def test_clear_sweep_results_rejects_bad_root(bridge, monkeypatch):
+    monkeypatch.setattr(
+        bridge, "_execute_skill_json",
+        lambda expr: pytest.fail("should not reach SKILL"),
+    )
+    with pytest.raises(ValueError):
+        bridge.clear_sweep_results("/home/u/sim/Interactive.0/../../x")
+
+
+def test_clear_sweep_results_requires_skill_loaded(
+    mock_client, pdk_map_file, tmp_path,
+):
+    b = SafeBridge(
+        mock_client, pdk_map_file, skill_dir=tmp_path / "no_skill",
+    )
+    assert b._skill_loaded is False
+    with pytest.raises(RuntimeError, match=r"(?i)remote-side skill"):
+        b.clear_sweep_results("/home/u/sim/Interactive.0")
+
+
 def test_read_sweep_manifest_rejects_float_point(bridge, monkeypatch):
     """Read side parity: hand-edited manifest with ``"point": 1.9``
     must hard-fail, not silently round."""

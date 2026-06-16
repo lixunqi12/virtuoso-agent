@@ -199,6 +199,10 @@ _ALLOWED_SKILL_ENTRYPOINTS = frozenset({
     # spec.md §6.1 `sweep:` and writes them out before the read side
     # runs — Maestro itself never creates the file.
     "safeWriteSweepManifest",
+    # 2026-06-13: clear stale per-point sweep results under a validated
+    # Interactive.<N> root before a fresh benchmark run. This prevents
+    # curve-search/readback from consuming a previous model's PSF payload.
+    "safeClearSweepResults",
     # Stage 1 rev 6 (2026-04-18): generic design-variable auto-discovery.
     # Parses Maestro's input.scs to learn testbench desVars â€“ enables
     # the agent to pick up Maestro defaults instead of hardcoding names.
@@ -3238,6 +3242,31 @@ class SafeBridge:
             )
         return count
 
+    def clear_sweep_results(self, sweep_root: str) -> dict[str, Any]:
+        """Clear stale sweep artifacts below a validated ``Interactive.<N>``.
+
+        The remote helper is intentionally narrow: the only accepted target is
+        a Maestro sweep root that passes the same ``_validate_sweep_root`` gate
+        used by manifest read/write, and the SKILL side moves the old root out
+        of the way before recreating an empty root. This is used by benchmark
+        harnesses immediately after resetting Maestro and before the first
+        curve-searcher sweep, so a model cannot read another model's stale PSF
+        directories from a fixed ``Interactive.0`` path.
+        """
+        if not self._skill_loaded:
+            raise RuntimeError(
+                "clear_sweep_results requires the remote-side SKILL helpers."
+            )
+        self._validate_sweep_root(sweep_root)
+        expr = f'safeClearSweepResults("{sweep_root}")'
+        result_json = self._execute_skill_json(expr)
+        if not result_json.get("ok", False):
+            raise RuntimeError(
+                "safeClearSweepResults failed: "
+                f"{_scrub(str(result_json.get('error', 'unknown')))}"
+            )
+        return _scrub(result_json)
+
     def run_ocean_dump_all_swept(
         self,
         signals: list[tuple[str, str, list[str]]],
@@ -4774,8 +4803,12 @@ class SafeBridge:
         # mentioning a blocked token (e.g. safe_ocean.il:87 has "evalstring("
         # in a comparative comment) doesn't bounce the real file back to the
         # legacy load() path — which is the exact remote-staleness the inline
-        # upload was introduced to avoid. The original content (comments
-        # intact) is what we actually send to SKILL.
+        # upload was introduced to avoid. The uploaded text preserves the
+        # original structure but normalizes non-ASCII comment glyphs to spaces;
+        # the bridge transport has historically failed on non-ASCII payloads.
+        upload_content = "".join(
+            ch if ord(ch) < 128 else " " for ch in content
+        )
         lint_view = re.sub(r";[^\n]*", "", content)
         match = _SKILL_INLINE_FORBIDDEN_RE.search(lint_view)
         if match:
@@ -4783,7 +4816,16 @@ class SafeBridge:
                 "Inline SKILL upload rejected: forbidden primitive "
                 f"{_scrub(repr(match.group(1)))} in {path.name}"
             )
-        self.client.execute_skill(f"progn({content})")
+        result = self.client.execute_skill(f"progn({upload_content})")
+        ok = getattr(result, "ok", True)
+        output = getattr(result, "output", "") or ""
+        if not ok or "*Error*" in output:
+            errors = getattr(result, "errors", None)
+            detail = errors if errors else output[-500:]
+            raise RuntimeError(
+                "Inline SKILL upload failed for "
+                f"{path.name}: {_scrub(str(detail))}"
+            )
 
     def _load_skill_helpers(self) -> None:
         """Load SKILL safety scripts on the remote host server.

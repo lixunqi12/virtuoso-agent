@@ -270,6 +270,7 @@ def _best_effort_cleanup(cfg: HspiceWorkerConfig, pidfile: str) -> None:
     try:
         subprocess.run(
             cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=cfg.ssh_connect_timeout_s + 10,
         )
     except Exception:  # noqa: BLE001
@@ -333,6 +334,7 @@ def display_waveform(
     try:
         stat = subprocess.run(
             test_cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=cfg.ssh_connect_timeout_s + 10,
         )
     except subprocess.TimeoutExpired:
@@ -399,6 +401,7 @@ def display_waveform(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8", errors="replace",
     )
 
     # Poll the remote side for the pidfile. We cannot trust Popen's
@@ -432,6 +435,7 @@ def display_waveform(
         try:
             stat_probe = subprocess.run(
                 stat_cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=cfg.ssh_connect_timeout_s + 5,
             )
         except subprocess.TimeoutExpired:
@@ -498,6 +502,7 @@ def close_waveform(
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=cfg.ssh_connect_timeout_s + 10,
         )
         logger.info(

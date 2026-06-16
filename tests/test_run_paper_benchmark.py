@@ -112,6 +112,72 @@ def test_lc_vco_without_sweep_root_is_skipped_before_subprocess():
     assert "sweep" in (rec.fail_reason or "")
 
 
+def test_lc_vco_clears_sweep_root_after_reset_before_agent(monkeypatch):
+    events: list[str] = []
+    completed = MagicMock(spec=subprocess.CompletedProcess)
+    completed.returncode = 0
+
+    def fake_reset(*args, **kwargs):
+        events.append("reset")
+        return "ok", None
+
+    def fake_clear(root):
+        events.append(f"clear:{root}")
+        return {"ok": True, "cleared": True, "archive": "/home/u/Interactive.0.old"}
+
+    def fake_run(cmd, cwd, stdout, stderr, timeout, check):
+        events.append("agent")
+        stdout.write(
+            "FINAL RESULTS\n"
+            "  f_osc_GHz: 20.0\n"
+            "  converged        : True\n"
+            "  writeback_status : ok\n"
+        )
+        return completed
+
+    with patch("scripts.run_paper_benchmark.run_reset", fake_reset), patch(
+        "scripts.run_paper_benchmark.clear_sweep_results_root", fake_clear,
+    ), patch(
+        "scripts.run_paper_benchmark.subprocess.run", fake_run,
+    ), patch(
+        "scripts.run_paper_benchmark.discover_transcript", return_value=None,
+    ):
+        rec = run_cell(
+            Cell("lc_vco", "mimo-v2.5-pro"),
+            max_iter=1,
+            timeout_s=10,
+            reset_timeout_s=10,
+            dry_run=False,
+            no_reset=False,
+            sweep_results_root="/home/u/sim/Interactive.0",
+        )
+
+    assert events == ["reset", "clear:/home/u/sim/Interactive.0", "agent"]
+    assert rec.outcome == "PASS"
+    assert rec.writeback_status == "ok"
+
+
+def test_lc_vco_cleanup_failure_does_not_start_agent():
+    with patch("scripts.run_paper_benchmark.run_reset", return_value=("ok", None)), patch(
+        "scripts.run_paper_benchmark.clear_sweep_results_root",
+        side_effect=RuntimeError("cleanup failed"),
+    ), patch("scripts.run_paper_benchmark.subprocess.run") as mock_run:
+        rec = run_cell(
+            Cell("lc_vco", "mimo-v2.5-pro"),
+            max_iter=1,
+            timeout_s=10,
+            reset_timeout_s=10,
+            dry_run=False,
+            no_reset=False,
+            sweep_results_root="/home/u/sim/Interactive.0",
+        )
+
+    mock_run.assert_not_called()
+    assert rec.outcome == "RESET_FAIL"
+    assert rec.reset_status == "sweep_cleanup_failed"
+    assert "sweep cleanup failed" in (rec.fail_reason or "")
+
+
 def test_preflight_reports_only_enabled_missing_env(monkeypatch):
     for ckpt in CHECKPOINTS.values():
         monkeypatch.delenv(ckpt.env_var, raising=False)

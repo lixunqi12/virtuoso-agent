@@ -306,7 +306,8 @@ class OceanWorker:
         )
         proc = subprocess.run(
             cmd, input=body, capture_output=True,
-            text=True, timeout=self.cfg.ssh_connect_timeout_s + 10,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=self.cfg.ssh_connect_timeout_s + 10,
         )
         if proc.returncode != 0:
             raise OceanWorkerSpawnError(
@@ -367,6 +368,7 @@ class OceanWorker:
             proc = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=budget_s,
             )
         except subprocess.TimeoutExpired as exc:
@@ -428,6 +430,7 @@ class OceanWorker:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 10,
             )
         except subprocess.TimeoutExpired as exc:
@@ -470,6 +473,7 @@ class OceanWorker:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 10,
             )
             logger.info(
@@ -496,6 +500,7 @@ class OceanWorker:
         try:
             subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 5,
             )
         except Exception:  # noqa: BLE001

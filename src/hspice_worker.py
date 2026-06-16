@@ -376,6 +376,7 @@ class HspiceWorker:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8", errors="replace",
         )
 
         t0 = time.monotonic()
@@ -566,6 +567,7 @@ class HspiceWorker:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 5,
             )
         except subprocess.TimeoutExpired:
@@ -601,6 +603,7 @@ class HspiceWorker:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 60,
             )
         except subprocess.TimeoutExpired:
@@ -653,6 +656,7 @@ class HspiceWorker:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 10,
             )
         except subprocess.TimeoutExpired as exc:
@@ -690,6 +694,7 @@ class HspiceWorker:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 # .lis can be a few MB; give it more headroom than the
                 # tiny control-plane calls.
                 timeout=self.cfg.ssh_connect_timeout_s + 60,
@@ -734,6 +739,7 @@ class HspiceWorker:
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 10,
             )
             logger.info(
@@ -759,6 +765,7 @@ class HspiceWorker:
         try:
             subprocess.run(
                 cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.cfg.ssh_connect_timeout_s + 5,
             )
         except Exception:  # noqa: BLE001

@@ -1592,6 +1592,54 @@ procedure(safeWriteSweepManifest(sweepRoot entries)
     )
 )
 
+;;; ----------------------------------------------------------------
+;;; safeClearSweepResults(sweepRoot) — 2026-06-13
+;;;
+;;; Move an existing Interactive.<N> sweep root out of the way and recreate
+;;; an empty root before a fresh benchmark run. This avoids stale point PSFs
+;;; under fixed Maestro sweep paths being consumed by curve-search readback.
+;;; The root validator is the same one used by read/write manifest, so this
+;;; cannot be used as a generic filesystem primitive.
+;;;
+;;; Returns:
+;;;   {"ok":true,"cleared":t|nil,"archive":"..."}
+;;;   {"ok":false,"error":"..."}
+;;; ----------------------------------------------------------------
+procedure(safeClearSweepResults(sweepRoot)
+    prog((archive idx renamed made)
+        unless(stringp(sweepRoot) && safeOcean_validSweepRoot(sweepRoot)
+            return("{\"ok\":false,\"error\":\"Bad sweep root\"}")
+        )
+
+        archive = ""
+        renamed = nil
+        when(isDir(sweepRoot)
+            idx = 1
+            while(idx <= 100 && not(renamed)
+                archive = sprintf(nil "%s.stale_%03d" sweepRoot idx)
+                unless(isDir(archive) || isFile(archive)
+                    errset(renamed = renameFile(sweepRoot archive))
+                )
+                idx = idx + 1
+            )
+            unless(renamed
+                return("{\"ok\":false,\"error\":\"Could not archive old sweep root\"}")
+            )
+        )
+
+        made = nil
+        errset(made = createDir(sweepRoot))
+        unless(isDir(sweepRoot)
+            return("{\"ok\":false,\"error\":\"Could not recreate sweep root\"}")
+        )
+        return(strcat(
+            "{\"ok\":true,\"cleared\":"
+            if(renamed "true" "false")
+            ",\"archive\":\"" safeHelpers_jsonEscape(archive) "\"}"
+        ))
+    )
+)
+
 procedure(safeOceanTCross(signalKind signalPaths threshold
                          crossStart crossEnd
                          @optional (direction "rising") (useAbs nil))

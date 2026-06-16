@@ -67,6 +67,22 @@ paper/data/lc_vco_evidence_*.jsonl
 paper/data/lc_vco_evidence_*.csv
 paper/data/model_benchmark*.jsonl
 paper/data/model_benchmark*.log
+# Local benchmark run artifacts (full-run dumps / reset smokes / .log / .bak_before_*) — never publish
+paper/data/benchmark_state_full_*
+paper/data/benchmark_state_rerun*
+paper/data/model_benchmark_full_*
+paper/data/model_benchmark_lc_vco_rerun*
+paper/data/lc_vco_rerun*
+paper/data/lc_vco_reset_smoke*
+paper/data/*.err.log
+paper/data/*.bak_before_*
+# todaes_draft local-only archives / editable fig sources / overleaf bundles
+paper/todaes_draft/_archive/
+paper/todaes_draft/_figs_archive_*/
+paper/todaes_draft/figs/*.drawio
+paper/todaes_draft/*_overleaf.zip
+# Internal reviewer brief — not for public release
+docs/project_and_paper_reviewer_brief.md
 paper/repro/
 paper/opamp_schematic/
 paper/opamp_topology_papers/

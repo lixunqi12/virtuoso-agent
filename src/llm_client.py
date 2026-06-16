@@ -30,7 +30,7 @@ def _normalize_usage(
     Returns None when no usage info is reachable. Otherwise returns a
     dict with ``prompt_tokens`` / ``completion_tokens`` /
     ``reasoning_tokens`` (None when the provider does not surface it
-    separately, e.g. Anthropic / Gemini / Ollama) / ``total_tokens``
+    separately, e.g. Anthropic / Ollama) / ``total_tokens``
     plus ``provider`` and ``model`` labels.
 
     Schema is intentionally permissive: a field whose count is missing
@@ -63,6 +63,9 @@ def _normalize_usage(
         prompt = getattr(usage_obj, "prompt_token_count", None)
         completion = getattr(usage_obj, "candidates_token_count", None)
         total = getattr(usage_obj, "total_token_count", None)
+        # google-genai SDK (Gemini 2.5 thinking models) surfaces internal
+        # thought tokens separately; they bill at the output rate.
+        reasoning = getattr(usage_obj, "thoughts_token_count", None)
     elif provider == "ollama":
         # Ollama puts counts at the top level of the parsed response dict.
         if isinstance(usage_obj, dict):
@@ -728,9 +731,13 @@ class ClaudeClient(LLMClient):
     ):
         import anthropic
 
+        # Explicit request timeout: without it a hung endpoint blocks a
+        # benchmark cell forever (every other provider client is bounded).
+        timeout_s = _positive_float_env("CLAUDE_TIMEOUT_S", default=300.0)
         self.client = anthropic.Anthropic(
             api_key=api_key or os.environ["ANTHROPIC_API_KEY"],
             max_retries=max_retries,
+            timeout=timeout_s,
         )
         self.model = model
         self.last_usage: dict[str, Any] | None = None
@@ -803,30 +810,85 @@ class ClaudeClient(LLMClient):
 
 
 class GeminiClient(LLMClient):
-    """Google Gemini API client."""
+    """Google Gemini API client via the ``google-genai`` SDK.
+
+    Rev (2026-06-11): migrated off the deprecated ``google.generativeai``
+    package. Gemini 2.5 models emit internal "thought" tokens that count
+    against ``max_output_tokens``; the old SDK's ``response.text`` accessor
+    raised ``ValueError`` whenever the candidate carried no visible text
+    part (e.g. the budget was exhausted by thoughts), aborting benchmark
+    runs as ``llm_error`` before the first iteration. This client
+    (a) reserves an explicit thinking budget on top of the visible-token
+    budget, (b) extracts visible text defensively and never returns
+    thought parts, and (c) retries rate-limited / empty responses with the
+    same bounded loop the other clients use.
+    """
+
+    _RETRIABLE_CODES = (429, 500, 502, 503, 504)
 
     def __init__(
         self,
         api_key: str | None = None,
         model: str = "gemini-2.5-flash",
     ):
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types as genai_types
 
-        genai.configure(api_key=api_key or os.environ["GOOGLE_API_KEY"])
-        self._model_name = model
-        self.model = genai.GenerativeModel(
-            model_name=model,
-            system_instruction=SYSTEM_PROMPT,
+        self._genai_types = genai_types
+        # Explicit request timeout (HttpOptions.timeout is milliseconds);
+        # without it a hung endpoint blocks a benchmark cell forever.
+        timeout_s = _positive_float_env("GEMINI_TIMEOUT_S", default=300.0)
+        self.client = genai.Client(
+            api_key=api_key or os.environ["GOOGLE_API_KEY"],
+            http_options=genai_types.HttpOptions(
+                timeout=int(timeout_s * 1000),
+            ),
         )
+        self._model_name = model
         self.last_usage: dict[str, Any] | None = None
         self.last_telemetry: LlmCallTelemetry | None = None
+
+    @staticmethod
+    def _extract_visible_text(response: Any) -> str | None:
+        """Concatenate non-thought text parts; ``None`` if there are none."""
+        for cand in getattr(response, "candidates", None) or []:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) or []
+            texts = [
+                p.text for p in parts
+                if getattr(p, "text", None) and not getattr(p, "thought", False)
+            ]
+            if texts:
+                return "".join(texts)
+        return None
+
+    @staticmethod
+    def _diagnose_empty(response: Any) -> str:
+        candidates = getattr(response, "candidates", None) or []
+        finish = getattr(candidates[0], "finish_reason", None) if candidates \
+            else None
+        feedback = getattr(response, "prompt_feedback", None)
+        usage = getattr(response, "usage_metadata", None)
+        thoughts = getattr(usage, "thoughts_token_count", None)
+        fb_text = scrub(str(feedback))[:160] if feedback is not None else None
+        return (
+            f"Gemini returned no visible text part "
+            f"(finish_reason={finish}, thoughts_token_count={thoughts}, "
+            f"prompt_feedback={fb_text})"
+        )
 
     def chat(self, messages: list[dict[str, str]]) -> str:
         if not messages:
             raise ValueError("messages must not be empty")
+        from google.genai import errors as genai_errors
 
         self.last_usage = None
         max_tokens = _llm_max_tokens("GEMINI", default=4096)
+        # Gemini 2.5 counts internal thought tokens against
+        # max_output_tokens, and gemini-2.5-pro cannot disable thinking;
+        # without separate headroom a long prompt can spend the whole
+        # budget on thoughts and return zero visible text.
+        thinking_budget = int(os.environ.get("GEMINI_THINKING_BUDGET", "2048"))
         telemetry = LlmCallTelemetry(
             provider="gemini",
             model=self._model_name,
@@ -834,59 +896,71 @@ class GeminiClient(LLMClient):
             max_tokens=max_tokens,
         )
         self.last_telemetry = telemetry
-        history = [
+        contents = [
             {
                 "role": "user" if msg["role"] == "user" else "model",
-                "parts": [msg["content"]],
+                "parts": [{"text": msg["content"]}],
             }
-            for msg in messages[:-1]
+            for msg in messages
         ]
-        chat = self.model.start_chat(history=history)
-        try:
-            response = chat.send_message(
-                messages[-1]["content"],
-                generation_config={"max_output_tokens": max_tokens},
-            )
+        config = self._genai_types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=max_tokens + max(thinking_budget, 0),
+            thinking_config=self._genai_types.ThinkingConfig(
+                thinking_budget=thinking_budget,
+            ),
+        )
+        last_exc: Exception | None = None
+        for attempt in range(_LLM_MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self._model_name,
+                    contents=contents,
+                    config=config,
+                )
+            except genai_errors.APIError as exc:
+                last_exc = exc
+                code = getattr(exc, "code", None)
+                if code not in self._RETRIABLE_CODES or \
+                        attempt >= _LLM_MAX_RATE_LIMIT_RETRIES:
+                    telemetry.mark_error(exc)
+                    logger.error(
+                        "Gemini API error %s: %s",
+                        code, scrub(str(exc))[:200],
+                    )
+                    raise
+                sleep_s = 2.0 * (attempt + 1)
+                logger.warning(
+                    "Gemini API error %s; retry %d/%d in %.1fs",
+                    code, attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES, sleep_s,
+                )
+                time.sleep(sleep_s)
+                continue
             self.last_usage = _normalize_usage(
                 getattr(response, "usage_metadata", None),
                 "gemini",
                 self._model_name,
             )
-            text = response.text
+            text = self._extract_visible_text(response)
+            if text is None:
+                msg = self._diagnose_empty(response)
+                if attempt < _LLM_MAX_RATE_LIMIT_RETRIES:
+                    logger.warning(
+                        "%s; retry %d/%d",
+                        msg, attempt + 1, _LLM_MAX_RATE_LIMIT_RETRIES,
+                    )
+                    continue
+                exc = RuntimeError(msg)
+                telemetry.mark_error(exc)
+                raise exc
             telemetry.mark_event(visible=text)
             telemetry.mark_ok()
             return text
-        except Exception as exc:
-            telemetry.mark_error(exc)
-            raise
+        # Unreachable — loop either returns or raises.
+        raise RuntimeError("Gemini chat: unreachable") from last_exc
 
     def ask(self, prompt: str) -> str:
-        self.last_usage = None
-        max_tokens = _llm_max_tokens("GEMINI", default=4096)
-        telemetry = LlmCallTelemetry(
-            provider="gemini",
-            model=self._model_name,
-            transport_mode="blocking",
-            max_tokens=max_tokens,
-        )
-        self.last_telemetry = telemetry
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={"max_output_tokens": max_tokens},
-            )
-            self.last_usage = _normalize_usage(
-                getattr(response, "usage_metadata", None),
-                "gemini",
-                self._model_name,
-            )
-            text = response.text
-            telemetry.mark_event(visible=text)
-            telemetry.mark_ok()
-            return text
-        except Exception as exc:
-            telemetry.mark_error(exc)
-            raise
+        return self.chat([{"role": "user", "content": prompt}])
 
 
 class KimiClient(LLMClient):

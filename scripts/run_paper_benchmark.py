@@ -33,7 +33,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from dotenv import load_dotenv  # noqa: E402
 
-from src.safe_bridge import scrub as safe_scrub  # noqa: E402
+from src.safe_bridge import SafeBridge, scrub as safe_scrub  # noqa: E402
 
 
 PAPER_DATA_DIR = PROJECT_ROOT / "paper" / "data"
@@ -147,6 +147,7 @@ CIRCUITS: dict[str, Circuit] = {
         / "projects" / "lc_vco_base" / "maestro_setup" / "tran_tuning_allones.yaml",
         analysis="tran",
         run_agent_extra=(
+            "--ignore-llm-maestro-setup",
             "--auto-bias-ic",
             "--enable-curve-searcher",
             "--curve-searcher-max-candidates",
@@ -463,24 +464,43 @@ def load_terminal_records(state_path: Path) -> set[str]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if row.get("outcome") in {"PASS", "FAIL", "RESET_FAIL", "SKIPPED"}:
+        if row.get("outcome") in {"PASS", "FAIL", "RESET_FAIL", "ENV_FAIL", "SKIPPED"}:
             out.add(str(row.get("cell_key")))
     return out
 
 
 def run_reset(circuit: Circuit, report_path: Path, timeout_s: int) -> tuple[str, str | None]:
     cmd = build_reset_cmd(circuit, report_path)
-    proc = subprocess.run(
-        cmd,
-        cwd=str(PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_s,
-        check=False,
-    )
+    # A reset that times out (e.g. the Maestro GUI momentarily blocked by
+    # modal dialogs) must fail the CELL, not crash the whole campaign —
+    # an uncaught TimeoutExpired here killed a 22-cell run on 2026-06-11.
+    # Reset is idempotent, so retry once before giving up.
+    last_err: str | None = None
+    for attempt in range(2):
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            last_err = (
+                f"reset timed out after {timeout_s}s "
+                f"(attempt {attempt + 1}/2)"
+            )
+            print(f"[reset-retry] {circuit.name}: {last_err}", file=sys.stderr)
+            continue
+        except OSError as exc:
+            return "failed", f"reset OSError: {type(exc).__name__}: {exc}"
+        break
+    else:
+        return "failed", last_err
     report_path.parent.mkdir(parents=True, exist_ok=True)
     reset_log = report_path.with_suffix(".reset.log")
     reset_log.write_text(
@@ -506,6 +526,18 @@ def run_reset(circuit: Circuit, report_path: Path, timeout_s: int) -> tuple[str,
                 f"testScopedWritten={test_written} verify_ok={verify_ok}",
             )
     return "ok", None
+
+
+def clear_sweep_results_root(sweep_results_root: str) -> dict[str, Any]:
+    """Clear stale remote swept-results under a validated Interactive root."""
+    from virtuoso_bridge import VirtuosoClient
+
+    bridge = SafeBridge(
+        VirtuosoClient.from_env(),
+        str(PROJECT_ROOT / "config" / "pdk_map.yaml"),
+        remote_skill_dir=os.environ.get("VB_REMOTE_SKILL_DIR"),
+    )
+    return bridge.clear_sweep_results(sweep_results_root)
 
 
 def run_cell(
@@ -601,6 +633,39 @@ def run_cell(
                 fail_reason=reset_reason,
             )
 
+    if circuit.needs_sweep_root and sweep_results_root:
+        try:
+            cleanup = clear_sweep_results_root(sweep_results_root)
+            archive = cleanup.get("archive") if isinstance(cleanup, dict) else None
+            print(
+                f"[sweep-clean] {cell.key}: cleared={cleanup.get('cleared') if isinstance(cleanup, dict) else '?'} "
+                f"archive={safe_scrub(str(archive or '-'))}"
+            )
+        except Exception as exc:  # noqa: BLE001 - shared env failure
+            return RunRecord(
+                cell_key=cell.key,
+                circuit=cell.circuit,
+                model_name=ckpt.name,
+                llm=ckpt.llm,
+                model=ckpt.model,
+                variant=cell.variant,
+                seed=cell.seed,
+                timestamp=ts,
+                outcome="RESET_FAIL",
+                exit_code=None,
+                wall_clock_s=0.0,
+                reset_status="sweep_cleanup_failed",
+                reset_report_path=_rel(reset_report_path) if reset_report_path.exists() else None,
+                stdout_path=None,
+                stderr_path=None,
+                transcript_path=None,
+                command=command,
+                fail_reason=(
+                    "sweep cleanup failed: "
+                    f"{safe_scrub(type(exc).__name__ + ': ' + str(exc))}"
+                ),
+            )
+
     started_at = time.time()
     exit_code: int | None = None
     fail_reason: str | None = None
@@ -671,8 +736,17 @@ def run_cell(
 
 def append_record(record: RunRecord, state_path: Path) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = asdict(record)
+    if payload.get("command"):
+        # The recorded command can carry absolute local paths and remote
+        # roots (usernames) — e.g. a --sweep-results-root argument. Scrub
+        # the archived copy; the executed command is unaffected. Without
+        # this the state file fails the P0 leak gate.
+        payload["command"] = [
+            str(safe_scrub(str(part))) for part in payload["command"]
+        ]
     with state_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def rebuild_summary_csv(state_path: Path, csv_path: Path) -> None:
@@ -766,6 +840,95 @@ def preflight(cells: list[Cell], sweep_results_root: str | None) -> list[str]:
     return sorted(set(missing))
 
 
+def llm_endpoint_preflight(
+    cells: list[Cell],
+    *,
+    timeout_s: int,
+) -> dict[str, str]:
+    """Live one-prompt reachability probe per unique checkpoint.
+
+    Catches dead endpoints and broken client stacks before any Maestro
+    reset or Spectre time is spent; previously a dead endpoint cost a
+    full reset plus a run_agent launch per cell. Returns
+    ``{model_name: scrubbed_error}`` for failed endpoints; their cells
+    are recorded as FAIL without being run. Costs one tiny completion
+    per healthy model.
+    """
+    failures: dict[str, str] = {}
+    probe_code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(PROJECT_ROOT)!r})\n"
+        "from dotenv import load_dotenv\n"
+        f"load_dotenv({str(PROJECT_ROOT / 'config' / '.env')!r})\n"
+        "from src.llm_client import create_llm_client\n"
+        "client = create_llm_client(sys.argv[1], model=sys.argv[2])\n"
+        "reply = client.ask('Reply with exactly: OK')\n"
+        "if not (reply or '').strip():\n"
+        "    raise RuntimeError('empty preflight reply')\n"
+        "print('ok')\n"
+    )
+    for name in dict.fromkeys(cell.model_name for cell in cells):
+        ckpt = CHECKPOINTS.get(name)
+        if ckpt is None:
+            continue
+        try:
+            subprocess.run(
+                [sys.executable, "-c", probe_code, ckpt.llm, ckpt.model],
+                cwd=str(PROJECT_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
+                check=True,
+            )
+        except subprocess.TimeoutExpired:
+            failures[name] = f"endpoint probe timed out after {timeout_s}s"
+            print(
+                f"[preflight] {name}: FAIL {failures[name]}",
+                file=sys.stderr,
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure means skip
+            failures[name] = str(
+                safe_scrub(f"{type(exc).__name__}: {exc}")
+            )[:200]
+            print(
+                f"[preflight] {name}: FAIL {failures[name]}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[preflight] {name}: ok")
+    return failures
+
+
+def _endpoint_failure_record(cell: Cell, err: str) -> RunRecord:
+    ckpt = CHECKPOINTS[cell.model_name]
+    return RunRecord(
+        cell_key=cell.key,
+        circuit=cell.circuit,
+        model_name=ckpt.name,
+        llm=ckpt.llm,
+        model=ckpt.model,
+        variant=cell.variant,
+        seed=cell.seed,
+        timestamp=time.strftime("%Y%m%d_%H%M%S"),
+        outcome="FAIL",
+        exit_code=None,
+        wall_clock_s=0.0,
+        reset_status=None,
+        reset_report_path=None,
+        stdout_path=None,
+        stderr_path=None,
+        transcript_path=None,
+        command=[],
+        converged=False,
+        abort_reason="llm_error",
+        fail_reason=f"endpoint_preflight: {err}",
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
@@ -784,6 +947,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--reset-timeout", type=int, default=180)
     parser.add_argument("--no-reset", action="store_true")
+    parser.add_argument(
+        "--llm-endpoint-preflight",
+        action="store_true",
+        help=(
+            "Probe each requested LLM endpoint before running cells. Disabled "
+            "by default because some providers can stream slowly enough to "
+            "look like a hung benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--llm-endpoint-timeout",
+        type=int,
+        default=60,
+        help="Per-model timeout in seconds for --llm-endpoint-preflight.",
+    )
+    parser.add_argument(
+        "--continue-on-reset-fail",
+        action="store_true",
+        help=(
+            "Continue remaining cells after a Maestro reset/writeback failure. "
+            "Default is fail-fast because reset failures usually mean shared "
+            "Virtuoso/Maestro state is unhealthy, not a model-specific result."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--env-file", default=str(PROJECT_ROOT / "config" / ".env"))
     parser.add_argument("--state", default=str(STATE_JSONL))
@@ -818,10 +1005,35 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume:
         print(f"[paper_benchmark] resume terminal cells={len(completed)}")
 
+    endpoint_failures: dict[str, str] = {}
+    if not dry_run and args.llm_endpoint_preflight:
+        pending = [
+            c for c in cells
+            if not (args.resume and c.key in completed)
+        ]
+        if pending:
+            print("[paper_benchmark] LLM endpoint preflight ...")
+            endpoint_failures = llm_endpoint_preflight(
+                pending,
+                timeout_s=args.llm_endpoint_timeout,
+            )
+
     records: list[RunRecord] = []
     for cell in cells:
         if args.resume and cell.key in completed:
             print(f"[skip] {cell.key}")
+            continue
+        if cell.model_name in endpoint_failures:
+            record = _endpoint_failure_record(
+                cell, endpoint_failures[cell.model_name],
+            )
+            records.append(record)
+            if not dry_run:
+                append_record(record, state_path)
+            print(
+                f"[done] {record.cell_key} outcome=FAIL conv=False "
+                f"iter=None wall=0.0s reason={record.fail_reason}"
+            )
             continue
         print(f"[run] {cell.key}")
         record = run_cell(
@@ -841,6 +1053,19 @@ def main(argv: list[str] | None = None) -> int:
             f"conv={record.converged} iter={record.n_iter} "
             f"wall={record.wall_clock_s}s reason={record.fail_reason or '-'}"
         )
+        if (
+            not dry_run
+            and record.outcome == "RESET_FAIL"
+            and not args.continue_on_reset_fail
+        ):
+            print(
+                "[fatal] stopping benchmark after reset/writeback failure; "
+                "shared Maestro state may be unhealthy. Re-run with "
+                "--continue-on-reset-fail only when you intentionally want "
+                "per-cell RESET_FAIL records.",
+                file=sys.stderr,
+            )
+            break
 
     if not dry_run:
         rebuild_summary_csv(state_path, Path(args.summary_csv))
