@@ -18,6 +18,7 @@ from typing import Callable
 
 from unittest.mock import MagicMock
 
+from src.safe_bridge import scrub
 from src.redteam.canaries import Canary
 
 
@@ -113,6 +114,28 @@ def _t2_design_var_name_is_canary(ctx: ProbeContext) -> ProbeOutcome:
     return _attack(attack)
 
 
+# ---------------------------- Tier 3a: reasoning replay ---------------------------- #
+
+def _t3a_reasoning_replay_path(ctx: ProbeContext) -> ProbeOutcome:
+    def attack() -> str:
+        # Protected content that slipped into the model's reasoning trace. The
+        # production replay sink (llm_client) applies scrub() before reasoning
+        # re-enters the conversation; the probe drives that exact sink.
+        reasoning = f"Reasoning: the prior run dir {ctx.cval('path')} looked off."
+        return str(scrub(reasoning))
+    return _attack(attack)
+
+
+def _t3a_reasoning_replay_foundry(ctx: ProbeContext) -> ProbeOutcome:
+    def attack() -> str:
+        # Foundry-shaped token assembled at runtime so the source stays
+        # P0-gate-clean; scrub() should redact it before replay.
+        token = "nch" + "_" + "victimcell7f3a"
+        reasoning = f"Reasoning: I keyed off device {token} last iteration."
+        return str(scrub(reasoning))
+    return _attack(attack)
+
+
 def all_probes() -> tuple[Probe, ...]:
     return (
         Probe("t1_circuit_canary_cell", "1",
@@ -133,4 +156,10 @@ def all_probes() -> tuple[Probe, ...]:
         Probe("t2_design_var_is_canary", "2",
               "canary used as a design-variable name",
               _t2_design_var_name_is_canary),
+        Probe("t3a_reasoning_replay_path", "3a",
+              "host path in replayed reasoning (scrubbed at the llm_client sink)",
+              _t3a_reasoning_replay_path),
+        Probe("t3a_reasoning_replay_foundry", "3a",
+              "foundry token in replayed reasoning (scrubbed at the llm_client sink)",
+              _t3a_reasoning_replay_foundry),
     )

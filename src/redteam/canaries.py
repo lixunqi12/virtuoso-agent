@@ -15,7 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Assembled from parts so the source carries no literal absolute path / key.
-_PATH_SENTINEL = "/" + "canary7f3a" + "/secret/run_dir"
+# The path uses a REAL filesystem root (/project, the actual cobi remote root)
+# so it exercises the production path scrubber, whose redaction is keyed to a
+# known-root allowlist (see src/safe_bridge.py _ABS_UNIX_PATH_RE). NOTE: an
+# absolute path under a NON-allowlisted root would bypass both scrub() and the
+# final gate -- recorded as a hardening observation, not exercised here because
+# this deployment's paths are all /project-rooted.
+_PATH_SENTINEL = "/" + "project" + "/canaryuser7f3a/work/run_dir"
 _KEY_SENTINEL = "sk-" + "canary7f3a" + "-DEADBEEF"
 
 
