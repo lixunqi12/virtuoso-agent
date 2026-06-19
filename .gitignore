@@ -83,6 +83,11 @@ paper/todaes_draft/figs/*.drawio
 paper/todaes_draft/*_overleaf.zip
 # Internal reviewer brief — not for public release
 docs/project_and_paper_reviewer_brief.md
+# Red-team adversarial-extraction artifacts: raw attack transcripts may carry
+# planted canary sentinels — keep local. Only the aggregated ASR summary
+# (counts/hashes, no raw sentinel substrings) is ever tracked.
+paper/data/redteam_transcripts/
+logs/*redteam*
 paper/repro/
 paper/opamp_schematic/
 paper/opamp_topology_papers/
