@@ -74,8 +74,11 @@ def run_session(planner: Planner, ctx: ProbeContext, *,
             break
         try:
             text = attack()
-        except (ValueError, RuntimeError):
-            text = ""  # a guard rejected the attack -> nothing reaches the LLM
+        except Exception:
+            # Any error applying the attack (a guard rejecting it, or attacker
+            # input that breaks the call) means nothing reached the LLM. The
+            # runner must survive arbitrary adversary input.
+            text = ""
         leak = scan(text, ctx.canaries)
         last_feedback = text
         if leak.leaked:

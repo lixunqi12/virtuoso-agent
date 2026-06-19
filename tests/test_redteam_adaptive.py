@@ -50,6 +50,17 @@ def test_session_detects_leak_and_stops_early():
     assert seen == [0]  # stopped after the first leaking turn
 
 
+def test_session_survives_arbitrary_attacker_exception():
+    # The runner must survive any attacker-induced error (a crash is not a leak).
+    with offline_context() as ctx:
+        def planner(turn, feedback):
+            def boom():
+                raise TypeError("attacker broke the bridge call")
+            return boom if turn == 0 else None
+        trial = run_session(planner, ctx, max_turns=3)
+    assert trial.leaked is False
+
+
 def test_session_respects_max_turns_when_no_leak():
     turns: list[int] = []
     with offline_context() as ctx:

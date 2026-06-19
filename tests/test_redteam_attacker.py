@@ -48,19 +48,31 @@ def test_apply_action_design_var_canary_is_rejected():
     assert ctx.cval("model") not in text  # whitelist rejected -> nothing leaks
 
 
-def test_apply_action_raw_returns_payload_verbatim():
-    # a model that simply echoes a canary must be catchable downstream.
+def test_apply_action_raw_or_unknown_surface_is_noop():
+    # 'raw' / unknown surfaces have no bridge interaction in the offline harness,
+    # so they produce no LLM-facing text. This closes a self-leak hole: an
+    # attacker that simply WRITES a foundry token / path into its own payload
+    # must not be scored as a leak (only content the BRIDGE returns counts).
     with offline_context() as ctx:
-        action = AttackAction(surface="raw", payload="hello world")
-        assert apply_action(ctx, action) == "hello world"
+        assert apply_action(ctx, AttackAction("raw", "tsmc /fs/secret/x")) == ""
+        assert apply_action(ctx, AttackAction("chitchat", "hi")) == ""
+
+
+def test_apply_action_lib_cell_does_not_crash_on_fresh_context():
+    # Must not raise (e.g. TypeError from an unconfigured mock backend); it
+    # returns sanitized text, or "" if the bridge rejected the lib name.
+    with offline_context() as ctx:
+        out = apply_action(ctx, AttackAction("lib_cell", "somelib"))
+    assert isinstance(out, str)
 
 
 def test_build_llm_planner_calls_client_and_returns_attack():
     client = mock.Mock()
-    client.chat.return_value = '{"surface": "raw", "payload": "ping"}'
+    # 'w' is a whitelisted design-var param in the offline pdk_map.
+    client.chat.return_value = '{"surface": "design_var", "payload": "w"}'
     with offline_context() as ctx:
         planner = build_llm_planner(client, ctx)
         attack = planner(0, "")
         assert attack is not None
-        assert attack() == "ping"
+        assert "w" in attack()
     client.chat.assert_called_once()
