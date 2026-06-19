@@ -4566,9 +4566,8 @@ class HspiceAgent:
             for name in evaluation.pass_fail
         ]
         history_brief = self._format_history_brief()
-        return (
+        prompt = (
             f"## Iteration {iteration} HSpice results\n"
-            f"- run_dir: {run_result.run_dir_remote}\n"
             f"- hspice_rc: {run_result.returncode}\n"
             f"- mt_tables: {sorted(run_result.mt_files.keys())}\n\n"
             f"## Metrics\n" + "\n".join(verdict_lines) + "\n\n"
@@ -4579,6 +4578,13 @@ class HspiceAgent:
             "delta on a whitelisted variable that moves a FAIL metric "
             "toward its pass range. Repeat the same design_vars only if "
             "every metric already PASSes; the agent stops on its own."
+        )
+        # run_dir_remote is an absolute host path (a protected asset) and is
+        # never surfaced to the LLM. The final gate mirrors the Spectre loop
+        # (assert_llm_feedback_safe): any residual host path or foundry token
+        # is withheld rather than replayed into the prompt.
+        return _guard_llm_feedback(
+            prompt, context=f"HSpice iteration {iteration} feedback"
         )
 
     def _format_history_brief(self) -> str:
